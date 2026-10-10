@@ -237,6 +237,8 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.capture = {"running": False, "secs": 30, "left": 0, "frames": 0, "bytes": 0,
+                        "file": "", "msg": "", "ok": True, "files": []}
         self.smart = {"running": False, "stage": "", "devices": [], "ts": None, "counts": {}}
         self.reset_adapter()
 
@@ -509,6 +511,7 @@ class Backend:
         self.kick = threading.Event()
         self.sniffer = None
         self.sniff_gen = 0
+        self.sniff_iface = None         # what the sniffer is listening on; captures reuse it
         self.l2sock = None
         self.send_lock = threading.Lock()
         self.stops = {}
@@ -864,7 +867,7 @@ class Backend:
     def restart_sniffer(self):
         self.sniff_gen += 1
         old, oldsock = self.sniffer, self.l2sock
-        self.sniffer = self.l2sock = None
+        self.sniffer = self.l2sock = self.sniff_iface = None
         threading.Thread(target=self._sniff_start, args=(self.sniff_gen, old, oldsock),
                          daemon=True).start()
 
@@ -935,7 +938,7 @@ class Backend:
                 except Exception:  # noqa: BLE001
                     pass
             return
-        self.sniffer, self.l2sock = sn, sock
+        self.sniffer, self.l2sock, self.sniff_iface = sn, sock, iface
         self._set_sniff(gen, "listening")
 
     def send(self, frame):
@@ -1452,6 +1455,95 @@ class Backend:
                     d["label"] = label
         self.st.say(err or (f"Labelled: {label}" if label else "Label cleared"), 3)
 
+    # ---------------------------------------------------------- capture to file
+    CAPTURE_SECS = (30, 60, 300)
+    CAPTURE_MAX = 200 * 1024 * 1024         # stop early instead of filling the disk on a busy port
+
+    @staticmethod
+    def capture_dir():
+        return os.path.join(DATA_DIR, "captures")
+
+    def capture_refresh(self):
+        files = N.list_captures(self.capture_dir())
+        with self.st.lock:
+            self.st.capture["files"] = files
+
+    def capture_next_secs(self):
+        with self.st.lock:
+            c = self.st.capture
+            if not c["running"]:
+                opts = self.CAPTURE_SECS
+                c["secs"] = opts[(opts.index(c["secs"]) + 1) % len(opts)] if c["secs"] in opts else opts[0]
+
+    def capture_toggle(self):
+        with self.st.lock:
+            c = self.st.capture
+            running, secs, name = c["running"], c["secs"], self.st.sel
+            nb = N.merge_neighbors(self.st.nb)
+        if running:
+            self.stops["capture"].set()
+            return
+        iface = self.sniff_iface
+        if not name or self.sniffer is None or iface is None:
+            self.st.say("Capture isn't running on this adapter — see the L2 page", 5)
+            return
+        tag = "-".join(str(x) for x in (nb.get("name") or nb.get("chassis"), nb.get("port")) if x)
+        ev = self._new_stop("capture")
+        with self.st.lock:
+            self.st.capture.update(running=True, left=secs, frames=0, bytes=0, file="", msg="", ok=True)
+        threading.Thread(target=self._capture, args=(ev, iface, secs, tag), daemon=True).start()
+
+    def _capture(self, ev, iface, secs, tag):
+        """Record everything this adapter sees, unfiltered, for `secs` seconds."""
+        st = self.st
+
+        def finish(msg, ok):
+            with st.lock:
+                st.capture.update(running=False, left=0, msg=msg, ok=ok)
+            self.capture_refresh()
+
+        w = sn = None
+        try:
+            from scapy.all import AsyncSniffer
+            os.makedirs(self.capture_dir(), exist_ok=True)
+            path = os.path.join(self.capture_dir(), N.capture_name(time.time(), tag))
+            w = N.PcapWriter(path)
+            sn = AsyncSniffer(iface=iface, store=False,
+                              prn=lambda pkt: w.add(bytes(pkt), float(pkt.time)))
+            sn.start()
+        except Exception as e:  # noqa: BLE001
+            log_error("Capture to file failed to start")
+            if w is not None:
+                w.close()
+            finish(f"Couldn't start: {e}"[:80], False)
+            return
+        with st.lock:
+            st.capture["file"] = os.path.basename(path)
+        t0, why = time.time(), ""
+        while True:
+            left = secs - (time.time() - t0)
+            with st.lock:
+                st.capture.update(left=max(0.0, left), frames=w.frames, bytes=w.bytes)
+            if left <= 0:
+                break
+            if w.bytes >= self.CAPTURE_MAX:
+                why = " · stopped at the 200 MB limit"
+                break
+            if time.time() - t0 > 1 and not getattr(sn, "running", True):
+                why = " · the capture stopped early"
+                break
+            if ev.wait(0.25):
+                why = " · stopped"
+                break
+        try:
+            sn.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        w.close()
+        with st.lock:
+            st.capture.update(frames=w.frames, bytes=w.bytes)
+        finish(f"Saved {w.frames:,} frames · {N.fmt_bytes(w.bytes)}{why}", True)
+
     # ---------------------------------------------------------- port finder
     def blink_toggle(self):
         with self.st.lock:
@@ -1634,6 +1726,36 @@ class DemoBackend(Backend):
 
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
+
+    def capture_refresh(self):
+        with self.st.lock:
+            self.st.capture["files"] = [("capture-20261010-101502-SW-IDF2-03-Gi1_0_14.pcap", 4_812_330, 0),
+                                        ("capture-20261009-164455-SW-IDF2-03-Gi1_0_14.pcap", 918_204, 0)]
+
+    def capture_toggle(self):
+        with self.st.lock:
+            c = self.st.capture
+            if c["running"]:
+                self.stops["capture"].set()
+                return
+            secs = c["secs"]
+            c.update(running=True, left=secs, frames=0, bytes=24, msg="", ok=True,
+                     file="capture-demo.pcap")
+        ev = self._new_stop("capture")
+
+        def work():
+            t0 = time.time()
+            while not ev.wait(0.25) and time.time() - t0 < secs:
+                with self.st.lock:
+                    c = self.st.capture
+                    c["left"] = secs - (time.time() - t0)
+                    c["frames"] += random.randint(8, 40)
+                    c["bytes"] += random.randint(2_000, 30_000)
+            with self.st.lock:
+                c = self.st.capture
+                c.update(running=False, left=0, ok=True,
+                         msg=f"Saved {c['frames']:,} frames · {N.fmt_bytes(c['bytes'])} (demo: nothing written)")
+        threading.Thread(target=work, daemon=True).start()
 
     def smart_scan_toggle(self):
         def work():
@@ -2208,6 +2330,9 @@ class UI:
             "mdns": ToolView(self.body, self, "mDNS browser", [("Scan", self.be.mdns_scan),
                                                               ("Clear", self.be.mdns.reset)]),
             "blink": ToolView(self.body, self, "Port finder", [("Start", self.be.blink_toggle)]),
+            "capture": ToolView(self.body, self, "Capture", [("Start", self.be.capture_toggle),
+                                                           ("30 s", self.be.capture_next_secs),
+                                                           ("Folder", self.open_captures)]),
             "log": ToolView(self.body, self, "Port log", [("Open folder", self.open_data)]),
         }
         self.views.update(self.tools)
@@ -2348,11 +2473,12 @@ class UI:
         items = [("Ping", lambda: self.show("ping")), ("Traceroute", lambda: self.show("trace")),
                  ("Speed test", lambda: self.show("speed")), ("ARP table", self.open_arp),
                  ("ARP scan", lambda: self.show("arpscan")), ("mDNS browser", self.open_mdns),
-                 ("Port finder", lambda: self.show("blink")), ("Port log", lambda: self.show("log")),
-                 ("Re-run checks", self.be.rerun_checks), ("Settings", lambda: self.show("settings"))]
+                 ("Port finder", lambda: self.show("blink")), ("Capture", self.open_capture),
+                 ("Port log", lambda: self.show("log")), ("Re-run checks", self.be.rerun_checks),
+                 ("Settings", lambda: self.show("settings"))]
         for c in range(2):
             page.columnconfigure(c, weight=1, uniform="c")
-        for r in range(5):
+        for r in range((len(items) + 1) // 2):
             page.rowconfigure(r, weight=1, uniform="r")
         for i, (label, cmd) in enumerate(items):
             self.button(page, label, cmd, self.sz["toolbtn"]).grid(
@@ -2412,14 +2538,22 @@ class UI:
         if not self.be.mdns.snapshot()["last_scan"]:
             self.be.mdns_scan()
 
-    def open_data(self):
+    def open_capture(self):
+        self.show("capture")
+        self.be.capture_refresh()
+
+    def open_captures(self):
+        os.makedirs(self.be.capture_dir(), exist_ok=True)
+        self.open_data(self.be.capture_dir())
+
+    def open_data(self, folder=DATA_DIR):
         try:
             if IS_WIN:
-                os.startfile(DATA_DIR)  # noqa: S606
+                os.startfile(folder)  # noqa: S606
             elif IS_LINUX:
-                subprocess.Popen(["xdg-open", DATA_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                self.st.say(DATA_DIR, 4)
+                self.st.say(folder, 4)
         except OSError as e:
             self.st.say(str(e)[:60], 4)
 
@@ -2850,6 +2984,32 @@ class UI:
                           f"Multicast announcements seen: {mc} · replies: {m['unicast_replies']}")
         rows = [(t, HDR if k == "hdr" else FG, k) for t, k in N.mdns_rows(m)]
         v.list.set_rows(rows, "Tap Scan to browse Bonjour / mDNS services")
+
+    def render_capture(self, s, v, now):
+        c = s["capture"]
+        run = c["running"]
+        v.set_action(0, "Stop" if run else "Start", RED if run else BLUE)
+        v.set_action(1, "5 min" if c["secs"] >= 300 else f"{c['secs']} s", GREY if run else BLUE)
+        counts = f"{c['frames']:,} frames · {N.fmt_bytes(c['bytes'])}"
+        if run:
+            v.set_summary(f"Recording… {c['left']:.0f} s left", WARN, f"{counts}  →  {c['file'] or '…'}")
+        elif c["msg"]:
+            v.set_summary(c["msg"], OK if c["ok"] else BAD, c["file"])
+        else:
+            v.set_summary("Record this port to a .pcap", FG,
+                          "Tap Start. The button beside it sets how long. Open the file in Wireshark.")
+        rows = [("Saved captures", HDR, "hdr")]
+        rows += [(f"{name}   {N.fmt_bytes(size)}", FG, "mono") for name, size, _ in c["files"][:8]]
+        if not c["files"]:
+            rows.append(("None yet", DIM, "dim"))
+        rows += [
+            ("What you'll see", HDR, "hdr"),
+            ("On a normal switch port: this box's own traffic, plus the broadcast and multicast "
+             "the switch sends everyone. On a mirror (SPAN) port: everything the switch copies to it.",
+             FG, "row"),
+            (f"Saved in {self.be.capture_dir()}. A capture stops by itself at 200 MB.", DIM, "dim"),
+        ]
+        v.list.set_rows(rows)
 
     def render_blink(self, s, v, now):
         b = s["blink"]

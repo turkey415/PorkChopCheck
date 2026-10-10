@@ -1217,6 +1217,79 @@ HIST_FIELDS = ["time", "source"] + [f for f in LOG_FIELDS
                                     if f not in ("last_seen", "first_seen", "saves")]
 
 
+class PcapWriter:
+    """A classic .pcap file (libpcap 2.4, Ethernet, microsecond stamps) that Wireshark opens.
+    Written here and not with scapy so it works the same on every platform."""
+
+    SNAPLEN = 262144
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.frames = 0
+        self.bytes = 24
+        self.f = open(path, "wb")
+        self.f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, self.SNAPLEN, 1))
+
+    def add(self, raw, ts):
+        sec = int(ts)
+        cap = raw[:self.SNAPLEN]
+        with self.lock:
+            if self.f is None:
+                return
+            self.f.write(struct.pack("<IIII", sec & 0xFFFFFFFF, int((ts - sec) * 1_000_000),
+                                     len(cap), len(raw)) + cap)
+            self.frames += 1
+            self.bytes += 16 + len(cap)
+
+    def close(self):
+        with self.lock:
+            if self.f is not None:
+                self.f.close()
+                self.f = None
+
+
+def read_pcap(path):
+    """[(timestamp, frame bytes)] from a file PcapWriter made."""
+    out = []
+    with open(path, "rb") as f:
+        magic, _maj, _min, _tz, _sig, _snap, link = struct.unpack("<IHHiIII", f.read(24))
+        if magic != 0xA1B2C3D4 or link != 1:
+            raise ValueError("not an Ethernet .pcap file")
+        while True:
+            hdr = f.read(16)
+            if len(hdr) < 16:
+                return out
+            sec, usec, caplen, _orig = struct.unpack("<IIII", hdr)
+            out.append((sec + usec / 1_000_000, f.read(caplen)))
+
+
+def capture_name(now, tag=""):
+    """capture-20261010-015500-SW01-Gi1_0_14.pcap; the tag is cut down to safe characters."""
+    tag = re.sub(r"[^A-Za-z0-9.]+", "_", tag or "").strip("_.")[:40]
+    return time.strftime("capture-%Y%m%d-%H%M%S", time.localtime(now)) + (f"-{tag}" if tag else "") + ".pcap"
+
+
+def list_captures(folder, limit=20):
+    """[(name, size, mtime)] newest first."""
+    rows = []
+    try:
+        for n in os.listdir(folder):
+            if n.endswith(".pcap"):
+                st = os.stat(os.path.join(folder, n))
+                rows.append((n, st.st_size, st.st_mtime))
+    except OSError:
+        pass
+    return sorted(rows, key=lambda r: r[2], reverse=True)[:limit]
+
+
+def fmt_bytes(n):
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n} B"
+
+
 def csv_safe(row):
     """A copy of a row that is safe to open in Excel or LibreOffice. Names, labels and models
     come from whatever is on the network, and a cell that starts with = + - or @ is run as a

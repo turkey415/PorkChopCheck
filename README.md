@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -85,6 +85,14 @@ Good to know:
 - Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
 - Icons are generic device-type drawings, not brand logos.
 - Per-device throughput isn't shown. A normal switch port can't see other devices' traffic.
+
+## Capture to file
+
+**Tools › Capture** records everything the adapter sees to a `.pcap` you can open in Wireshark or attach to a ticket. Tap the time button to pick 30 seconds, 60 seconds or 5 minutes, then **Start**. **Stop** ends it early and keeps what was recorded.
+
+Files go in the `captures` folder inside the data folder, named with the time and, when CDP/LLDP has named them, the switch and port: `capture-20261010-101502-SW-IDF2-03-Gi1_0_14.pcap`. A capture stops by itself at 200 MB.
+
+On a normal switch port you get this box's own traffic plus the broadcast and multicast the switch sends everyone. Plug into a mirror (SPAN) port to record other devices' traffic. A capture holds whatever crossed the port, so treat the files like any other packet trace.
 
 ## Announcing itself
 
@@ -118,7 +126,7 @@ Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ## Coming soon
 
-The **multicast browser** (live groups, IGMP querier check, join test), **capture to .pcap**, a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, open ports on smart devices, new-device alerts, printable port reports, and a handful of quick checks.
+The **multicast browser** (live groups, IGMP querier check, join test), a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, open ports on smart devices, new-device alerts, printable port reports, and a handful of quick checks.
 
 See the full **[roadmap](ROADMAP.md)**. Ideas and pull requests welcome.
 

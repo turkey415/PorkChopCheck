@@ -1,4 +1,4 @@
-import os, sys, struct, socket, tempfile
+import os, re, sys, struct, socket, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import pc_net as N
 ok = 0
@@ -105,6 +105,29 @@ for name in ("ports.csv", "history.csv"):
     check(f"{name}: the text is kept, quoted", "'=HYPERLINK(\"http://x\",\"SW\")" in cells and "'@SUM(1+1)" in cells)
 check("csv_safe leaves ordinary values alone", N.csv_safe({"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"}) == {"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"})
 check("ports.json keeps the raw value", N.PortLog(tmp).label_for(evil) == "@SUM(1+1)")
+# capture to file: the .pcap writer
+cap_dir = os.path.join(tmp, "captures"); os.makedirs(cap_dir)
+cap = os.path.join(cap_dir, N.capture_name(1791612003.25, "SW-IDF2-03-Gi1/0/14"))
+check("capture name: stamped, tag made filename-safe", re.fullmatch(r"capture-\d{8}-\d{6}-SW_IDF2_03_Gi1_0_14\.pcap", os.path.basename(cap)), os.path.basename(cap))
+check("capture name: no tag", re.fullmatch(r"capture-\d{8}-\d{6}\.pcap", N.capture_name(1791612003)))
+check("capture name: a hostile tag can't leave the folder", "/" not in N.capture_name(1, "../../etc/passwd") and ".." not in N.capture_name(1, "../../etc/passwd"))
+w = N.PcapWriter(cap)
+f1 = bytes.fromhex("ffffffffffff0011223344550806") + b"\x00" * 46
+f2 = bytes.fromhex("01005e0000fb0011223344550800") + b"\x45" + b"\x00" * 99
+w.add(f1, 1791612003.250001); w.add(f2, 1791612004.5)
+check("pcap writer counts frames and bytes", w.frames == 2 and w.bytes == 24 + 16 + len(f1) + 16 + len(f2), (w.frames, w.bytes))
+w.close(); w.add(f1, 1791612005.0)
+check("pcap file size matches, nothing written after close", os.path.getsize(cap) == w.bytes and w.frames == 2)
+raw = open(cap, "rb").read()
+check("pcap global header: magic, v2.4, Ethernet", raw[:8] == bytes.fromhex("d4c3b2a102000400") and raw[20:24] == b"\x01\x00\x00\x00")
+back = N.read_pcap(cap)
+check("pcap reads back frame for frame", [b for _, b in back] == [f1, f2])
+check("pcap timestamps keep microseconds", abs(back[0][0] - 1791612003.250001) < 2e-6 and abs(back[1][0] - 1791612004.5) < 2e-6, back[0][0])
+open(os.path.join(cap_dir, "notes.txt"), "w").write("x")
+rows = N.list_captures(cap_dir)
+check("capture list: only .pcap files, with sizes", [r[0] for r in rows] == [os.path.basename(cap)] and rows[0][1] == w.bytes)
+check("capture list: a missing folder is just empty", N.list_captures(os.path.join(tmp, "nope")) == [])
+check("fmt_bytes", [N.fmt_bytes(n) for n in (0, 999, 1024, 1536, 5 << 20, 3 << 30)] == ["0 B", "999 B", "1.0 kB", "1.5 kB", "5.0 MB", "3.0 GB"])
 # public IP: Cloudflare trace reply
 TRACE = "fl=29f85\nh=1.1.1.1\nip=203.0.113.47\nts=1791612003.1\nvisit_scheme=https\nuag=PorkChopCheck\ncolo=DFW\nloc=US\ntls=TLSv1.3\n"
 check("trace: public IPv4", N.parse_trace_ip(TRACE) == "203.0.113.47")
