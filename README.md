@@ -2,16 +2,16 @@
 
 A great tool to check your network and ports on your network. CDP, LLDP, and so much more.
 
-*Working title. The app still calls itself PortCheck on screen.*
+Cooked up in a cast-iron dark theme with pork-pink accents. Status colors stay plain green, amber, and red, so a bad port never looks cute.
 
 
 Full-screen, big-text, touch-friendly switch-port tester for a small Windows 11 box.
 
-**Files:** `portcheck.py` (the app) and `pc_net.py` (the network engine) must sit in the same folder, for example `C:\PortCheck`.
+**Files:** `porkchopcheck.py` (the app) and `pc_net.py` (the network engine) must sit in the same folder, for example `C:\PorkChopCheck`.
 
 ## Starting it
 
-Double-click `portcheck.py` or `PortCheck.bat`. It asks for admin once through a UAC prompt, then opens fullscreen. Admin is needed for DHCP renew, link bounce, and the port finder.
+Double-click `porkchopcheck.py` or `PorkChopCheck.bat`. It asks for admin once through a UAC prompt, then opens fullscreen. Admin is needed for DHCP renew, link bounce, and the port finder.
 
 ## Pages
 
@@ -30,21 +30,21 @@ The banner turns red or amber for: no link, duplicate IP, 802.1X with no access,
 
 ## Port log
 
-Every time CDP/LLDP names the switch and port, PortCheck logs it automatically to `data\ports.csv`. That file keeps one row per switch+port and is updated to the latest result. Tap **SAVE** to add a label like "Room 204 jack B". Every save also goes to `data\history.csv`. Both open in Excel.
+Every time CDP/LLDP names the switch and port, PorkChopCheck logs it automatically to `data\ports.csv`. That file keeps one row per switch+port and is updated to the latest result. Tap **SAVE** to add a label like "Room 204 jack B". Every save also goes to `data\history.csv`. Both open in Excel.
 
 ## Announcing itself
 
-By default, PortCheck sends LLDP and CDP every 30 s, so `show cdp neighbors` or `show lldp neighbors` on the switch shows `PortCheck-<pcname>` on the right port. You can turn this off or rename it in Settings.
+By default, PorkChopCheck sends LLDP and CDP every 30 s, so `show cdp neighbors` or `show lldp neighbors` on the switch shows `PorkChopCheck-<pcname>` on the right port. You can turn this off or rename it in Settings.
 
 ## One-time setup
 
 1. Install Python 3.12 or newer.
 2. Install Npcap from npcap.org, keeping the defaults.
-3. In a terminal in `C:\PortCheck`, run `py -m pip install -r requirements.txt`.
-4. **Optional, for LAN speed tests:** download iperf3 for Windows and put `iperf3.exe` in `C:\PortCheck`. On another PC or server, run `iperf3 -s`. Then set that machine's address under Tools › Settings.
+3. In a terminal in `C:\PorkChopCheck`, run `py -m pip install -r requirements.txt`.
+4. **Optional, for LAN speed tests:** download iperf3 for Windows and put `iperf3.exe` in `C:\PorkChopCheck`. On another PC or server, run `iperf3 -s`. Then set that machine's address under Tools › Settings.
 5. **Optional, for MAC vendor names:** they download by themselves the first time the box has internet. You can also use Settings › Download MAC vendor list.
 
-To preview every screen with fake data, run `py portcheck.py --demo`. Demo mode uses its own `data_demo` folder.
+To preview every screen with fake data, run `py porkchopcheck.py --demo`. Demo mode uses its own `data_demo` folder.
 
 ## Notes
 
@@ -57,7 +57,7 @@ To preview every screen with fake data, run `py portcheck.py --demo`. Demo mode 
 
 ## Screenshots
 
-Demo-mode renders (`py portcheck.py --demo`). Fonts on a real Windows box are larger and smoother.
+Demo-mode renders (`py porkchopcheck.py --demo`). Fonts on a real Windows box are larger and smoother.
 
 ![Main pages](docs/screenshots/main-pages.png)
 ![Tools](docs/screenshots/tools.png)
@@ -71,7 +71,7 @@ Demo-mode renders (`py portcheck.py --demo`). Fonts on a real Windows box are la
 
 Pull requests are welcome! Good places to start:
 
-- **Linux port.** The packet engine (`pc_net.py`) is already cross-platform. The Windows-only pieces are the PowerShell queries, `ipconfig` renew, and `netsh` port finder in `portcheck.py`.
+- **Linux port.** The packet engine (`pc_net.py`) is already cross-platform. The Windows-only pieces are the PowerShell queries, `ipconfig` renew, and `netsh` port finder in `porkchopcheck.py`.
 - **More decoders.** Add them to `pc_net.classify()`, with a round-trip check in `tests/test_pc_net.py`.
 - **Bug reports from real switches.** A pcap of the frame that confused it is gold.
 

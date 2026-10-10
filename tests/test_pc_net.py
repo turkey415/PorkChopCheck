@@ -9,15 +9,15 @@ def check(name, cond, extra=""):
 
 MAC = "00:e0:4c:68:12:9a"
 # CDP round trip (our announce frame decodes)
-f = N.build_cdp(MAC, "PortCheck-BOX", "Ethernet", "10.20.30.147")
+f = N.build_cdp(MAC, "PorkChopCheck-BOX", "Ethernet", "10.20.30.147")
 ev = N.classify(f); k, d = ev[0]
-check("cdp build->parse", k == "CDP" and d["name"] == "PortCheck-BOX" and d["mgmt_ip"] == "10.20.30.147", d)
+check("cdp build->parse", k == "CDP" and d["name"] == "PorkChopCheck-BOX" and d["mgmt_ip"] == "10.20.30.147", d)
 cdp = f[22:22 + struct.unpack("!H", f[12:14])[0] - 8]
 check("cdp checksum valid", N.checksum(cdp) == 0)
 # LLDP round trip
-f = N.build_lldp(MAC, "Ethernet", "PortCheck-BOX", ip="10.20.30.147")
+f = N.build_lldp(MAC, "Ethernet", "PorkChopCheck-BOX", ip="10.20.30.147")
 k, d = N.classify(f)[0]
-check("lldp build->parse", k == "LLDP" and d["name"] == "PortCheck-BOX" and d["port"] == "Ethernet" and d["mgmt_ip"] == "10.20.30.147", d)
+check("lldp build->parse", k == "LLDP" and d["name"] == "PorkChopCheck-BOX" and d["port"] == "Ethernet" and d["mgmt_ip"] == "10.20.30.147", d)
 # EAPOL start + a switch EAP-Request/Identity
 k, d = N.classify(N.build_eapol_start(MAC))[0]
 check("eapol start", k == "EAPOL" and d["code"] == "Start")

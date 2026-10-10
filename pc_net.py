@@ -1,5 +1,5 @@
 """
-pc_net - the networking engine behind PortCheck.
+pc_net - the networking engine behind PorkChopCheck.
 
 Packet decoders / builders (CDP, LLDP, DTP, STP, EAPOL, ARP, DHCP, mDNS, IPv6 RA),
 ICMP ping + traceroute, iperf3 / HTTP speed tests, MAC vendor lookup, port log, settings.
@@ -288,8 +288,8 @@ def parse_cdp(p):
     return d
 
 
-def build_cdp(mac, device_id, port_id, ip=None, platform_name="PortCheck",
-              software="PortCheck switch-port tester"):
+def build_cdp(mac, device_id, port_id, ip=None, platform_name="PorkChopCheck",
+              software="PorkChopCheck switch-port tester"):
     def tlv(t, v):
         return struct.pack("!HH", t, len(v) + 4) + v
 
@@ -369,7 +369,7 @@ def parse_lldp(p):
     return d
 
 
-def build_lldp(mac, port_name, sysname, sysdesc="PortCheck switch-port tester", ip=None):
+def build_lldp(mac, port_name, sysname, sysdesc="PorkChopCheck switch-port tester", ip=None):
     def tl(t, v):
         return struct.pack("!H", (t << 9) | len(v)) + v
 
@@ -881,7 +881,7 @@ def _win_echo(dst, src, ttl, timeout_ms, size):
         _ipl = lib
     h = _ipl.IcmpCreateFile()
     try:
-        data = ctypes.create_string_buffer((b"PortCheck-ping-" * 8)[:size], size)
+        data = ctypes.create_string_buffer((b"PorkChopCheck-ping-" * 8)[:size], size)
         reply = ctypes.create_string_buffer(256 + size)
         opt = _IPOPT(ttl, 0, 0, 0, None)
         t = time.perf_counter()
@@ -1100,7 +1100,7 @@ class Oui:
         return " · ".join(bits)
 
     def download(self):
-        req = urllib.request.Request(self.URL, headers={"User-Agent": "PortCheck"})
+        req = urllib.request.Request(self.URL, headers={"User-Agent": "PorkChopCheck"})
         data = urllib.request.urlopen(req, timeout=30).read()
         tmp = self.path + ".tmp"
         with open(tmp, "wb") as f:
