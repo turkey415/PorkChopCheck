@@ -130,7 +130,8 @@ DEMO = "--demo" in sys.argv
 WINDOWED = ("--windowed" in sys.argv or (DEMO and not IS_WIN)
             or (IS_LINUX and "--fullscreen" not in sys.argv))
 ADMIN_HINT = "run ./install-linux.sh" if IS_LINUX else "needs admin"
-VERSION = "2.0"
+# The release workflow writes the real version here (tools/stamp_version.py).
+VERSION = "2.0.0-dev"
 
 
 def pick_data_dir():
@@ -2895,6 +2896,9 @@ def maybe_elevate():
 
 
 def main():
+    if "--version" in sys.argv:
+        print(f"PorkChopCheck {VERSION}")
+        return
     maybe_elevate()
     if IS_WIN:
         try:
