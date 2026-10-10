@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -91,6 +91,16 @@ Good to know:
 - Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
 - Icons are generic device-type drawings, not brand logos.
 - Per-device throughput isn't shown. A normal switch port can't see other devices' traffic.
+
+## Multicast browser
+
+**Tools › Multicast** shows what multicast is crossing the port, and helps explain why a stream is missing.
+
+- **Groups, busiest first.** Every IPv4 multicast group seen, with a friendly name where there is one (mDNS, SSDP, VRRP, HSRP, OSPF, PIM, PTP, Dante, sACN…), packets per second, bandwidth, who is sending, the UDP port, and which hosts have joined it.
+- **IGMP querier.** Shows the querier's address, its IGMP version and how often it asks. Queriers normally ask every 125 seconds, so tap **Querier** to prompt one straight away: the box joins a scratch group for a moment and leaves it, and a querier answers a leave within about a second. If none answers and none is heard for two minutes, the page says so. A missing querier is behind a lot of "AirPlay, mDNS or video works for five minutes, then dies" problems on switches with IGMP snooping.
+- **Join test.** Tap **Join…** and type a group such as `239.1.2.3`. The box joins it the way a receiver would, through the operating system, then shows whether the stream arrives and how fast. **Leave** ends the test.
+
+With IGMP snooping on, a port only receives the groups something on it has joined, plus `224.0.0.x` link-local traffic, so an empty list on a quiet port is normal. Leaving the page stops listening and leaves any joined group. IPv6 multicast (MLD) is not covered yet.
 
 ## Capture to file
 
@@ -132,7 +142,7 @@ Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ## Coming soon
 
-The **multicast browser** (live groups, IGMP querier check, join test), a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, new-device alerts, printable port reports, and a handful of quick checks.
+A **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, new-device alerts, printable port reports, and a handful of quick checks.
 
 See the full **[roadmap](ROADMAP.md)**. Ideas and pull requests welcome.
 

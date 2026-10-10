@@ -25,6 +25,7 @@ import copy
 import os
 import random
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -237,6 +238,8 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.mcast = {"running": False, "msg": "", "snap": None, "join": None, "probed": None,
+                      "last_join": "239."}
         self.capture = {"running": False, "secs": 30, "left": 0, "frames": 0, "bytes": 0,
                         "file": "", "msg": "", "ok": True, "files": []}
         self.smart = {"running": False, "stage": "", "devices": [], "ts": None, "counts": {}}
@@ -1485,6 +1488,129 @@ class Backend:
                         d["ports"], d["services_checked"] = ports, True
         self.st.say(err or f"{ip}: {len(ports)} of {len(S.ALL_PORTS)} common services answer", 4)
 
+    # ---------------------------------------------------------- multicast browser
+    MCAST_PROBE_GROUP = "239.192.137.251"       # joined for a moment to make a querier speak up
+
+    def mcast_toggle(self):
+        with self.st.lock:
+            running = self.st.mcast["running"]
+        if running:
+            self.mcast_stop()
+        else:
+            self.mcast_start()
+
+    def mcast_start(self):
+        with self.st.lock:
+            if self.st.mcast["running"]:
+                return
+            name = self.st.sel
+        iface = self.sniff_iface
+        if not name or self.sniffer is None or iface is None:
+            with self.st.lock:
+                self.st.mcast["msg"] = "Capture isn't running on this adapter — see the L2 page"
+            return
+        ev = self._new_stop("mcast")
+        with self.st.lock:
+            self.st.mcast.update(running=True, msg="", snap=None, probed=None)
+        threading.Thread(target=self._mcast_run, args=(ev, iface), daemon=True).start()
+
+    def mcast_stop(self):
+        ev = self.stops.get("mcast")
+        if ev:
+            ev.set()
+        self.mcast_leave(quiet=True)
+
+    def _mcast_run(self, ev, iface):
+        tr = N.McastTracker()
+        sn = None
+        try:
+            from scapy.all import AsyncSniffer
+            sn = AsyncSniffer(iface=iface, filter=N.MCAST_BPF, store=False,
+                              prn=lambda pkt: tr.feed(bytes(pkt), float(pkt.time)))
+            sn.start()
+        except Exception as e:  # noqa: BLE001
+            log_error("Multicast browser failed to start")
+            with self.st.lock:
+                self.st.mcast.update(running=False, msg=f"Couldn't start: {e}"[:80])
+            return
+        self._mcast_publish(ev, tr)
+        try:
+            sn.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mcast_publish(self, ev, tr):
+        """Once a second: work out the rates and hand the UI a fresh picture."""
+        while True:
+            now = time.time()
+            tr.tick(now)
+            snap = tr.snapshot(now)
+            with self.st.lock:
+                self.st.mcast["snap"] = snap
+            if ev.wait(1.0):
+                break
+        with self.st.lock:
+            self.st.mcast["running"] = False
+
+    def mcast_join(self, text):
+        target = N.parse_mcast_target(text)
+        with self.st.lock:
+            src = self.st.ipv4
+            self.st.mcast["last_join"] = (text or "").strip() or "239."
+        if not target:
+            self.st.say("Not a multicast group — try something like 239.1.2.3", 5)
+            return
+        if not src:
+            self.st.say("Need an IP address to join a group", 4)
+            return
+        self.mcast_leave(quiet=True)
+        group, port = target
+        try:
+            sock = N.mcast_join_socket(group, src)
+        except OSError as e:
+            self.st.say(f"Couldn't join {group}: {e}"[:70], 5)
+            return
+        self.mcast_sock = sock
+        with self.st.lock:
+            self.st.mcast["join"] = {"group": group, "port": port, "since": time.time()}
+        self.mcast_start()
+        self.st.say(f"Joined {group}", 3)
+
+    def mcast_leave(self, quiet=False):
+        sock, self.mcast_sock = getattr(self, "mcast_sock", None), None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        with self.st.lock:
+            j, self.st.mcast["join"] = self.st.mcast["join"], None
+        if j and not quiet:
+            self.st.say(f"Left {j['group']}", 3)
+
+    def mcast_probe(self):
+        """Join a scratch group for a moment and leave it. A querier answers a leave with a
+        group-specific query within about a second, which saves waiting two minutes for its
+        next general one."""
+        with self.st.lock:
+            src, running = self.st.ipv4, self.st.mcast["running"]
+        if not src or not running:
+            self.st.say("Start the browser first" if src else "Need an IP address", 3)
+            return
+
+        def work():
+            try:
+                s = N.mcast_join_socket(self.MCAST_PROBE_GROUP, src)
+                time.sleep(1.5)
+                s.close()
+            except OSError as e:
+                self.st.say(f"Couldn't send the probe: {e}"[:70], 5)
+                return
+            with self.st.lock:
+                self.st.mcast["probed"] = time.time()
+        self.st.say("Asking for a querier…", 3)
+        threading.Thread(target=work, daemon=True).start()
+
     # ---------------------------------------------------------- capture to file
     CAPTURE_SECS = (30, 60, 300)
     CAPTURE_MAX = 200 * 1024 * 1024         # stop early instead of filling the disk on a busy port
@@ -1756,6 +1882,60 @@ class DemoBackend(Backend):
 
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
+
+    def mcast_start(self):
+        with self.st.lock:
+            if self.st.mcast["running"]:
+                return
+            self.st.mcast.update(running=True, msg="", snap=None, probed=None)
+        ev = self._new_stop("mcast")
+        threading.Thread(target=self._mcast_run, args=(ev, None), daemon=True).start()
+
+    def _mcast_run(self, ev, iface):
+        tr = N.McastTracker()
+        mac, t0 = "70:db:98:1a:00:01", time.time()
+        F = N.mcast_frame
+        for ago in (250, 125, 0):
+            tr.feed(F(mac, "10.20.30.1", "224.0.0.1", 2, N.igmp_payload("query")), t0 - ago)
+        tr.feed(F(mac, "10.20.30.21", "224.0.0.22", 2, N.igmp_payload("report3", "239.1.1.10")), t0)
+        tr.feed(F(mac, "10.20.30.44", "224.0.0.22", 2, N.igmp_payload("report3", "239.69.12.7")), t0)
+
+        def feed():
+            udp = lambda port, n: struct.pack("!HHHH", 40000, port, 8 + n, 0) + bytes(n)  # noqa: E731
+            while not ev.wait(0.1):
+                now = time.time()
+                with self.st.lock:
+                    j = self.st.mcast["join"]
+                for _ in range(40):
+                    tr.feed(F(mac, "10.1.1.5", "239.1.1.10", 17, udp(5004, 1316), ttl=16), now)
+                for _ in range(10):
+                    tr.feed(F(mac, "10.20.30.44", "239.69.12.7", 17, udp(5004, 288), ttl=8), now)
+                if random.random() < 0.3:
+                    tr.feed(F(mac, f"10.20.30.{random.choice((15, 21, 70))}", "239.255.255.250", 17, udp(1900, 300)), now)
+                if random.random() < 0.5:
+                    tr.feed(F(mac, f"10.20.30.{random.choice((21, 34, 147))}", "224.0.0.251", 17, udp(5353, 120)), now)
+                if random.random() < 0.1:
+                    tr.feed(F(mac, "10.20.30.2", "224.0.0.18", 112, bytes(20)), now)
+                if j and now - j["since"] > 1.5:
+                    for _ in range(25):
+                        tr.feed(F(mac, "10.1.1.9", j["group"], 17, udp(j["port"] or 5004, 1316), ttl=16), now)
+        threading.Thread(target=feed, daemon=True).start()
+        self._mcast_publish(ev, tr)
+
+    def mcast_join(self, text):
+        target = N.parse_mcast_target(text)
+        if not target:
+            self.st.say("Not a multicast group — try something like 239.1.2.3", 5)
+            return
+        with self.st.lock:
+            self.st.mcast["join"] = {"group": target[0], "port": target[1], "since": time.time()}
+            self.st.mcast["last_join"] = text.strip()
+        self.mcast_start()
+
+    def mcast_probe(self):
+        with self.st.lock:
+            self.st.mcast["probed"] = time.time()
+        self.st.say("Asking for a querier…", 3)
 
     def _probe_device(self, ip, src):
         time.sleep(1.2)
@@ -2401,6 +2581,9 @@ class UI:
             "mdns": ToolView(self.body, self, "mDNS browser", [("Scan", self.be.mdns_scan),
                                                               ("Clear", self.be.mdns.reset)]),
             "blink": ToolView(self.body, self, "Port finder", [("Start", self.be.blink_toggle)]),
+            "mcast": ToolView(self.body, self, "Multicast", [("Stop", self.be.mcast_toggle),
+                                                           ("Join…", self.mcast_join_dialog),
+                                                           ("Querier", self.be.mcast_probe)]),
             "capture": ToolView(self.body, self, "Capture", [("Start", self.be.capture_toggle),
                                                            ("30 s", self.be.capture_next_secs),
                                                            ("Folder", self.open_captures)]),
@@ -2545,7 +2728,7 @@ class UI:
                  ("Speed test", lambda: self.show("speed")), ("ARP table", self.open_arp),
                  ("ARP scan", lambda: self.show("arpscan")), ("mDNS browser", self.open_mdns),
                  ("Port finder", lambda: self.show("blink")), ("Capture", self.open_capture),
-                 ("Port log", lambda: self.show("log")), ("Re-run checks", self.be.rerun_checks),
+                 ("Multicast", self.open_mcast), ("Port log", lambda: self.show("log")), ("Re-run checks", self.be.rerun_checks),
                  ("Settings", lambda: self.show("settings"))]
         for c in range(2):
             page.columnconfigure(c, weight=1, uniform="c")
@@ -2586,6 +2769,8 @@ class UI:
     def show(self, name):
         if self.cur == name:
             return
+        if self.cur == "mcast":
+            self.be.mcast_stop()          # stop listening, and leave any group, when the view closes
         if self.cur:
             self.views[self.cur].pack_forget()
         self.views[name].pack(fill="both", expand=True)
@@ -2609,6 +2794,20 @@ class UI:
         self.show("mdns")
         if not self.be.mdns.snapshot()["last_scan"]:
             self.be.mdns_scan()
+
+    def open_mcast(self):
+        self.show("mcast")
+        self.be.mcast_start()
+
+    def mcast_join_dialog(self):
+        with self.st.lock:
+            joined, last = self.st.mcast["join"], self.st.mcast["last_join"]
+        if joined:
+            self.be.mcast_leave()
+            return
+        Keyboard(self, "Multicast group to join", last, self.be.mcast_join,
+                 "e.g. 239.1.2.3. This box joins the group like a receiver would, then shows "
+                 "whether the stream arrives.")
 
     def open_capture(self):
         self.show("capture")
@@ -3057,6 +3256,61 @@ class UI:
                           f"Multicast announcements seen: {mc} · replies: {m['unicast_replies']}")
         rows = [(t, HDR if k == "hdr" else FG, k) for t, k in N.mdns_rows(m)]
         v.list.set_rows(rows, "Tap Scan to browse Bonjour / mDNS services")
+
+    def render_mcast(self, s, v, now):
+        m = s["mcast"]
+        snap, run, j = m["snap"], m["running"], m["join"]
+        v.set_action(0, "Stop" if run else "Start", RED if run else BLUE)
+        v.set_action(1, "Leave" if j else "Join…", RED if j else BLUE)
+        if not snap:
+            v.set_summary("Multicast browser", FG, m["msg"] or ("Listening…" if run else "Tap Start to listen"),
+                          WARN if m["msg"] else DIM)
+            v.list.set_rows([], "Nothing heard yet." if run else "")
+            return
+        groups = snap["groups"]
+        live = [g for g in groups if g["pkts"]]
+        qtext, level, qnote = N.querier_verdict(snap, probed=bool(m["probed"]) and now - m["probed"] > 3)
+        qcolor = {"ok": OK, "wait": DIM, "warn": WARN}[level]
+        v.set_summary(f"{len(live)} groups · {N.fmt_rate(snap['bps'])}" + ("" if run else "  (stopped)"),
+                      FG, qtext, qcolor)
+        rows = [("IGMP querier", HDR, "hdr"), (qtext, qcolor if level != "wait" else FG, "row"), (qnote, DIM, "dim")]
+        if j:
+            g = next((x for x in groups if x["group"] == j["group"]), None)
+            waited = now - j["since"]
+            rows.append(("Join test", HDR, "hdr"))
+            if g and g["pkts"] and g["pps"] > 0:
+                rows.append((f"{j['group']}: arriving at {N.fmt_rate(g['bps'])}, {g['pps']:.0f} packets/s"
+                             + (f" from {g['sources'][0]}" if g["sources"] else ""), OK, "row"))
+            elif g and g["pkts"]:
+                rows.append((f"{j['group']}: {g['pkts']:,} packets so far, none in the last second", WARN, "row"))
+            else:
+                rows.append((f"{j['group']}: joined {waited:.0f} s ago, nothing arriving",
+                             WARN if waited > 5 else FG, "row"))
+                if waited > 5:
+                    rows.append(("Is anything sending to this group, and is it routed to this VLAN?", DIM, "dim"))
+        rows.append(("Groups, busiest first", HDR, "hdr"))
+        for g in groups[:40]:
+            rows.append((f"{g['group']:<17}{g['name']}", FG if g["pkts"] else DIM, "mono"))
+            bits = []
+            if g["pkts"]:
+                bits.append(f"{g['pps']:.0f} packets/s · {N.fmt_rate(g['bps'])}")
+                if g["sources"]:
+                    more = len(g["sources"]) - 1
+                    bits.append(f"from {g['sources'][0]}" + (f" +{more}" if more else ""))
+                if g["port"]:
+                    bits.append(f"UDP {g['port']}")
+            else:
+                bits.append("no traffic seen")
+            if g["members"]:
+                bits.append(f"joined by {g['members'][0]}" + (f" +{len(g['members']) - 1}" if len(g["members"]) > 1 else ""))
+            if N.mcast_is_link_local(g["group"]):
+                bits.append("link-local")
+            rows.append(("   " + " · ".join(bits), DIM, "dim"))
+        if not groups:
+            rows.append(("Nothing heard yet.", DIM, "dim"))
+        rows.append(("With IGMP snooping on, a port only receives groups something on it has joined, plus "
+                     "224.0.0.x link-local traffic. Join a group to pull it to this port.", DIM, "dim"))
+        v.list.set_rows(rows)
 
     def render_capture(self, s, v, now):
         c = s["capture"]
