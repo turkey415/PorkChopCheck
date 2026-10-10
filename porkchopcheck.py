@@ -246,7 +246,7 @@ class State:
         self.blink = {"running": False, "cycles": 0}
         self.tick = {"running": False, "rate": 64, "span": 30, "msg": "", "target": "", "sum": None,
                      "cols": [], "t_end": 0.0, "normal": 0.0, "counters": {}, "pace": 0.0,
-                     "impacts": {}, "reflecting": False, "reflected": 0, "peers": []}
+                     "impacts": {}, "hold": None, "reflecting": False, "reflected": 0, "peers": []}
         self.events = collections.deque(maxlen=300)       # the timeline: link, STP, gateway, storms…
         self.bc_storm = False
         self.mcast = {"running": False, "msg": "", "snap": None, "join": None, "probed": None,
@@ -1785,6 +1785,7 @@ class Backend:
         recent = [x for x in samples if x[0] >= now - span]
         summ = N.tick_summary(recent, rate)
         c = buf.counters()
+        hold = dict(N.hold_summary(buf.holds(now - span), rate), mode=buf.hold_mode)
         msg = ""
         if c["sent"] > rate * 2 and c["recv"] == 0 and now - t0 > 2:
             msg = "No replies. Is the reflector running there, and is its firewall open?"
@@ -1792,7 +1793,7 @@ class Backend:
                                           "the test", "packet")
                    for e in events[-25:]}
         with st.lock:
-            st.tick.update(sum=summ, counters=c, pace=pace, t_end=now, msg=msg, impacts=impacts,
+            st.tick.update(sum=summ, counters=c, pace=pace, t_end=now, msg=msg, impacts=impacts, hold=hold,
                            cols=N.bucket_samples(samples, now, span, self.TICK_COLS),
                            normal=summ["p50"] or 0.0)
 
@@ -2279,7 +2280,8 @@ class DemoBackend(Backend):
                         if random.random() < 0.5:
                             buf.add_reply(seq, random.uniform(20, 90))
                     elif random.random() > 0.0008:
-                        buf.add_reply(seq, max(0.3, random.gauss(1.2, 0.12)))
+                        buf.add_reply(seq, max(0.3, random.gauss(1.2, 0.12)),
+                                      random.choice((0.2, 0.3, 0.3, 0.4, 19.0 if random.random() < 0.02 else 0.3)), True)
                     due += 1.0 / rate
                 time.sleep(0.05)
         threading.Thread(target=feed, daemon=True).start()
@@ -3174,7 +3176,7 @@ class UI:
         lst.pack(fill="both", expand=True, pady=(self.pad // 2, 0))
         self.set_btns = {}
         rows = [("announce", self.toggle("announce")), ("autolog", self.toggle("autolog")),
-                ("smartsvc", self.toggle("smart_services")),
+                ("smartsvc", self.toggle("smart_services")), ("tickclaude", self.toggle("tick_claude")),
                 ("hostname", self.edit_hostname), ("iperf", self.edit_iperf),
                 ("oui", lambda: threading.Thread(target=self.be.update_oui, daemon=True).start()),
                 ("folder", self.open_data), ("exit", self.quit)]
@@ -3532,6 +3534,7 @@ class UI:
             "announce": f"Announce to switch (LLDP + CDP):  {'ON' if g('announce') else 'OFF'}",
             "autolog": f"Auto-log every port to ports.csv:  {'ON' if g('autolog') else 'OFF'}",
             "smartsvc": f"Smart scan checks common services on every device:  {'ON' if g('smart_services') else 'OFF'}",
+            "tickclaude": f"Claude recommended tick settings (stricter):  {'ON' if g('tick_claude') else 'OFF'}",
             "hostname": f"Name sent to switch:  {self.be.hostname()}",
             "iperf": "iperf3 server:  " + ((g('iperf_server') + (f":{g('iperf_port')}" if g('iperf_port') != 5201 else ""))
                                            if g("iperf_server") else "(tap to set)"),
@@ -3556,6 +3559,7 @@ class UI:
 
     # ---------------------------------------------------------- tool renders
     SEV_COLOR = {"bad": BAD, "warn": WARN, "info": HDR}
+    GRADE_COLOR = {"excellent": OK, "good": OK, "fair": WARN, "bad": BAD, "info": FG}
 
     def render_ping(self, s, v, now):
         p = s["ping"]
@@ -3605,15 +3609,15 @@ class UI:
         v.set_action(2, {30: "30 s", 300: "5 min"}.get(span, f"{span} s"))
         v.set_action(4, "Reflecting" if t["reflecting"] else "Reflect", GREEN if t["reflecting"] else BLUE)
         server = self.be.settings.get("tick_server")
+        claude = bool(self.be.settings.get("tick_claude"))
         tick_ms = 1000.0 / rate
         if summ and summ["n"]:
-            head, level = N.tick_verdict(summ, rate)
-            color = {"ok": OK, "warn": WARN, "bad": BAD}.get(level, FG)
+            head, grade = N.tick_verdict(summ, rate, claude)
             c = t["counters"]
-            sub = t["msg"] or (f"{t['target']} · {rate} a second · sent {c.get('sent', 0):,}"
-                               f" · longest gap {summ['burst']} · late {summ['late']}"
-                               f" · out of order {c.get('reorder', 0)}")
-            v.set_summary(head, color, sub, BAD if t["msg"] else DIM)
+            sub = t["msg"] or (f"{summ['loss_pct']:.2f}% loss · {summ['p50']:.1f} ms · "
+                               f"jitter {summ['jitter'] or 0:.2f} ms · {t['target']} · {rate} a second"
+                               f" · sent {c.get('sent', 0):,}")
+            v.set_summary(head, self.GRADE_COLOR.get(grade, FG), sub, BAD if t["msg"] else DIM)
         elif run:
             v.set_summary("Waiting for replies…", FG, t["msg"] or t["target"], BAD if t["msg"] else DIM)
         else:
@@ -3625,14 +3629,36 @@ class UI:
         self.draw_timeline(v.chart, t["cols"], t["normal"], events, t["t_end"] or now, span,
                            slow=t["normal"] + tick_ms, cap=max(t["normal"] + 3 * tick_ms, 3 * t["normal"] + 5))
         rows = []
+        if summ and summ["n"]:
+            rows.append(("How it rates for Counter-Strike"
+                         + (" (Claude recommended tick settings)" if claude else ""), HDR, "hdr"))
+            for key, value, grade in N.tick_ratings(summ, rate, claude):
+                word = "Not graded" if grade == "info" else grade.capitalize()
+                rows.append((f"{N.TICK_LABELS[key]:<15}{value:>10}   {word}",
+                             self.GRADE_COLOR[grade], "mono"))
+                if grade in ("fair", "bad"):
+                    rows.append((N.TICK_FELT[key], DIM, "dim"))
         if summ and summ["n"] and summ["min"] is not None:
             rows += [("Reply times over the " + ("last 30 s" if span == 30 else "last 5 min"), HDR, "hdr"),
                      (f"fastest {summ['min']:.1f} · typical {summ['p50']:.1f} · 95% under {summ['p95']:.1f} · "
                       f"99% under {summ['p99']:.1f} · slowest {summ['max']:.1f} ms", FG, "row"),
                      (f"{summ['lost']} of {summ['n']:,} lost · longest run of lost packets {summ['burst']} · "
                       f"{summ['late']} replies over a tick ({tick_ms:.1f} ms) late · "
+                      f"{t['counters'].get('reorder', 0)} out of order · "
                       f"{t['counters'].get('dup', 0)} duplicated · this box's own send timing is within "
                       f"{t['pace']:.2f} ms", DIM, "dim")]
+            hold = t.get("hold") or {}
+            if hold.get("mode") == "none":
+                rows.append(("The reflector is an older PorkChopCheck that does not report how long it holds each "
+                             "packet, so its own delays are counted as late replies. Update it to match this one.",
+                             WARN, "dim"))
+            elif hold.get("n"):
+                rows.append((f"Reflector's own delay, already taken out: typical {hold['p50']:.2f} ms · longest "
+                             f"{hold['max']:.1f} ms · {hold['over']} over a tick. What is left is the network.",
+                             DIM, "dim"))
+                if hold["mode"] == "timed":
+                    rows.append(("The reflector's system cannot stamp packets as they arrive (Windows), so time it "
+                                 "spent waiting to run still counts as network delay.", WARN, "dim"))
         if t["reflecting"]:
             rows += [("Reflector", HDR, "hdr"),
                      (f"Answering on UDP port {N.TICK_PORT}: {t['reflected']:,} packets returned"

@@ -120,7 +120,31 @@ It reports what a player actually feels:
 - Packets that arrived **out of order** or **twice**.
 - Reply times: fastest, typical, the time 95% and 99% came in under, and slowest.
 
-The graph is the same as on the Ping page, with port events marked under it, so a spanning-tree change or a link flap lines up with the hitch it caused. The headline goes amber for any loss or late reply, and red for 1% loss, three lost in a row, or jitter over half a tick.
+The graph is the same as on the Ping page, with port events marked under it, so a spanning-tree change or a link flap lines up with the hitch it caused. The headline says in words how the path rates for Counter-Strike, and each figure below it gets its own grade and colour. The headline takes the grade of the worst figure and names it when that is fair or bad, such as `Bad for Counter-Strike: lost in a row`.
+
+| | Excellent | Good | Fair | Bad |
+|---|---|---|---|---|
+| Packet loss | none | up to 0.1% | up to 1% | over 1% |
+| Lost in a row | 0 | 1 | 2 | 3 or more |
+| Late replies | up to 0.1% | up to 0.5% | up to 2% | over 2% |
+| Ping (round trip) | up to 20 ms | up to 50 ms | up to 100 ms | over 100 ms |
+
+Excellent and good are green, fair is amber and bad is red. The limits are `TICK_LIMITS` in `pc_net.py`.
+
+Late replies get more room than lost packets because the reply time covers both directions and any pause on the reflector, so a few stray late ones say nothing about the network. Over 30 seconds at 64 a second, 1 late reply is excellent, up to 9 good and up to 38 fair.
+
+Jitter is shown but not graded. The game buffers uneven delivery away until it costs a tick, and a reply that late is already counted under late replies.
+
+**Settings › Claude recommended tick settings** switches to the stricter limits this test first shipped with: the two rows below replace the ones above, and the tick test page says when it is on. Run the same port both ways to see which set of limits matches what players report.
+
+| | Excellent | Good | Fair | Bad |
+|---|---|---|---|---|
+| Late replies | none | up to 0.1% | up to 1% | over 1% |
+| Jitter | up to 1/16 tick (1.0 ms at 64) | up to 1/8 tick (2.0 ms) | up to 1/2 tick (7.8 ms) | over 1/2 tick |
+
+None of these limits come from a published standard. They are starting points to check against real matches.
+
+**The reflector's own delay is taken out.** A reflector is a program, and on a busy machine a packet can sit for a few milliseconds before the program gets to answer it. That would look exactly like a slow network. So the reflector writes into each reply how long it held the packet, and the test subtracts it; the page shows the reflector's typical and longest delay on its own line. On Linux both ends time packets from the moment the system received them, so the correction covers the wait as well. A Windows reflector can only time from when it woke up, and the page says so. Both ends need this version: with an older reflector the test still runs, and warns that the reflector's delays are being counted.
 
 **It needs something at the far end to send the packets back.** Either:
 
