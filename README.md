@@ -133,6 +133,8 @@ or, on GitHub, go to **Actions › Release › Run workflow** and type the versi
 
 GitHub Actions runs the tests, builds the Windows `.exe`, the Windows zip, and the Linux tarball, and publishes them as a release. A tag with a dash, like `v2.1.0-beta.1`, is published as a pre-release.
 
+The version is written into the app as part of the build, so you don't edit it by hand. The source always says `2.0.0-dev`; a released build shows its real version on the Settings page and from `porkchopcheck --version`.
+
 ## Tests
 
 No hardware needed:
@@ -141,6 +143,8 @@ No hardware needed:
 python tests/test_pc_net.py   # every packet decoder/builder + the port log
 python tests/test_linux.py    # Linux parsers for ip / nmcli / ethtool / ping output
 python tests/test_smart.py    # smart-home protocols, AES, classification, device inventory
+python tests/test_launcher.py # Linux launcher: builds it and checks what it passes to Python
+python tests/test_version.py  # the version line and the release step that writes it
 ```
 
 ## Contributing

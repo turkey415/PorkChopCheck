@@ -46,6 +46,7 @@ jobs:
       - run: python tests/test_linux.py
       - run: python tests/test_smart.py
       - run: python tests/test_launcher.py
+      - run: python tests/test_version.py
 
   windows:
     needs: test
@@ -56,6 +57,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install pyinstaller -r requirements.txt
+      - name: Write the version into the app
+        run: python tools/stamp_version.py "$env:VERSION"
       - run: pyinstaller --onefile --noconsole --uac-admin --name PorkChopCheck --collect-submodules scapy porkchopcheck.py
       - name: Package
         shell: pwsh
@@ -76,6 +79,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Package
         run: |
+          python3 tools/stamp_version.py "$VERSION"
           d="PorkChopCheck-${VERSION}-linux"
           mkdir -p "out/$d"
           cp porkchopcheck.py pc_net.py pc_smart.py install-linux.sh requirements.txt README.md LICENSE "out/$d/"
