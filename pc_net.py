@@ -1217,6 +1217,78 @@ HIST_FIELDS = ["time", "source"] + [f for f in LOG_FIELDS
                                     if f not in ("last_seen", "first_seen", "saves")]
 
 
+# ====================================================================== event timeline
+def add_event(events, kind, text, sev, now, quiet=0.0):
+    """Record something that happened on the port. `events` is a list or deque of dicts, oldest
+    first. A repeat of the same kind and text within `quiet` seconds is counted on the earlier
+    entry, not added again: one spanning-tree change sets its flag on BPDUs for many seconds.
+    Returns the entry."""
+    for e in reversed(events):
+        if now - e["last"] > quiet:
+            break
+        if e["kind"] == kind and e["text"] == text:
+            e["count"] += 1
+            e["last"] = now
+            return e
+    e = {"ts": now, "last": now, "kind": kind, "text": text, "sev": sev, "count": 1}
+    events.append(e)
+    return e
+
+
+def percentile(values, p):
+    """Nearest-rank percentile of a list of numbers; None if it is empty."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    k = max(0, min(len(vals) - 1, int(-(-p * len(vals) // 100)) - 1))
+    return vals[k]
+
+
+def bucket_samples(samples, t_end, span, ncol):
+    """Spread (timestamp, rtt or None) ping samples over `ncol` chart columns covering the `span`
+    seconds up to `t_end`. Each column is (worst rtt or None, pings lost, pings sent)."""
+    cols = [[None, 0, 0] for _ in range(ncol)]
+    t0 = t_end - span
+    for ts, rtt in samples:
+        if ts < t0 or ts > t_end:
+            continue
+        c = cols[min(ncol - 1, int((ts - t0) / span * ncol))]
+        c[2] += 1
+        if rtt is None:
+            c[1] += 1
+        elif c[0] is None or rtt > c[0]:
+            c[0] = rtt
+    return [tuple(c) for c in cols]
+
+
+def event_impact(samples, ts, before=10.0, after=5.0):
+    """What ping did around an event. Returns None when ping wasn't running then, otherwise
+    {"lost", "peak", "normal", "hit"}; "hit" means the event came with loss or a clear spike."""
+    base = [r for t, r in samples if ts - before <= t < ts - 1 and r is not None]
+    near = [(t, r) for t, r in samples if ts - 1 <= t <= ts + after]
+    if not near:
+        return None
+    lost = sum(1 for _, r in near if r is None)
+    got = [r for _, r in near if r is not None]
+    peak = max(got) if got else None
+    normal = percentile(base, 50)
+    spike = peak is not None and normal is not None and peak > max(2 * normal, normal + 10)
+    return {"lost": lost, "peak": peak, "normal": normal, "hit": bool(lost or spike)}
+
+
+def impact_text(imp):
+    if imp is None:
+        return "ping wasn't running"
+    if not imp["hit"]:
+        return "no effect on ping"
+    bits = []
+    if imp["lost"]:
+        bits.append(f"{imp['lost']} ping{'s' if imp['lost'] != 1 else ''} lost")
+    if imp["peak"] is not None and imp["normal"] is not None and imp["peak"] > max(2 * imp["normal"], imp["normal"] + 10):
+        bits.append(f"peak {imp['peak']:.0f} ms, normally {imp['normal']:.0f} ms")
+    return " · ".join(bits)
+
+
 # ====================================================================== multicast
 # Well-known groups, by address or by range, with the name a network person would use.
 MCAST_NAMES = {

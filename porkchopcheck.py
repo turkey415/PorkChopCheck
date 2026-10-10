@@ -218,7 +218,8 @@ ConvertTo-Json -Compress -InputObject @(Get-NetNeighbor -InterfaceAlias __NAME__
 # ================================================================ shared state
 def new_ping():
     return {"running": False, "kind": "gateway", "label": "Gateway", "target": None,
-            "rtts": collections.deque(maxlen=120), "log": collections.deque(maxlen=40),
+            "samples": collections.deque(maxlen=7200),    # (time, rtt or None); 30 min at 4 a second
+            "log": collections.deque(maxlen=40), "span": 30,
             "sent": 0, "recv": 0, "min": None, "max": None, "sum": 0.0, "jit": 0.0, "jn": 0,
             "last": None}
 
@@ -238,6 +239,8 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.events = collections.deque(maxlen=300)       # the timeline: link, STP, gateway, storms…
+        self.bc_storm = False
         self.mcast = {"running": False, "msg": "", "snap": None, "join": None, "probed": None,
                       "last_join": "239."}
         self.capture = {"running": False, "secs": 30, "left": 0, "frames": 0, "bytes": 0,
@@ -289,6 +292,10 @@ class State:
         self.dup_done = False
         self.gw_arp_sent = False
         self.last_announce = 0.0
+
+    def add_event(self, kind, text, sev, now, quiet=0.0):
+        """Call with self.lock held."""
+        N.add_event(self.events, kind, text, sev, now, quiet)
 
     def snapshot(self):
         with self.lock:
@@ -632,8 +639,23 @@ class Backend:
                     came_up = True
                     st.link_up_at = st.ip_wait_from = now
                     st.time_to_ip = None
+                    st.add_event("link", f"Link up at {N.fmt_speed(speed)}" if speed else "Link up", "info", now)
                 elif not st.blink["running"]:
                     st.drops += 1
+                    st.add_event("link", "Link down", "bad", now)
+            elif up and st.link and speed and st.speed_mbps and speed != st.speed_mbps:
+                st.add_event("link", f"Speed changed: {N.fmt_speed(st.speed_mbps)} to {N.fmt_speed(speed)}",
+                             "bad" if speed < st.speed_mbps else "info", now)
+            new_ip = ip if up else None
+            if st.link is not None and new_ip != st.ipv4 and not changed:
+                if new_ip and st.ipv4:
+                    st.add_event("ip", f"IP address changed: {st.ipv4} to {new_ip}", "warn", now)
+                elif new_ip and new_ip.startswith("169.254."):
+                    st.add_event("ip", f"Self-assigned address {new_ip}: no DHCP answer", "warn", now)
+                elif new_ip:
+                    st.add_event("ip", f"Got IP address {new_ip}", "info", now)
+                else:
+                    st.add_event("ip", f"Lost IP address {st.ipv4}", "bad", now)
                 st.nb = {}
                 st.gw_ms = st.dns_ms = st.net_ms = PENDING
                 st.public_ip = None
@@ -704,6 +726,13 @@ class Backend:
                     st.bc_pps = (max(bc - pbc, 0) / dt) if isinstance(bc, num) and isinstance(pbc, num) else None
                     st.mc_pps = max(mc - pmc, 0) / dt
                 st.bc_prev = (bc, mc, now)
+                rate = st.bc_pps
+                if rate is not None and rate > 500 and not st.bc_storm:
+                    st.bc_storm = True
+                    st.add_event("bcast", f"Broadcast storm: {rate:,.0f} a second", "bad", now)
+                elif rate is not None and rate < 100 and st.bc_storm:
+                    st.bc_storm = False
+                    st.add_event("bcast", f"Broadcast back to {rate:,.0f} a second", "info", now)
             if "Duplicate" in N.as_list(data.get("V4State")) and not st.dup_mac:
                 st.dup_mac = "(flagged by Windows)"
 
@@ -725,6 +754,7 @@ class Backend:
         sn = self.sniffer
         if sn is not None and not getattr(sn, "running", True):
             with st.lock:
+                st.add_event("capture", "Packet capture stopped", "warn", time.time(), quiet=3600)
                 st.sniff_msg = ("Capture stopped — run ./install-linux.sh" if IS_LINUX
                                 else "Capture stopped — is Npcap installed?")
         if not up or not ip or ip.startswith("169.254."):
@@ -1000,6 +1030,9 @@ class Backend:
                 st.stp = dict(info, ts=now)
             if info.get("tc") or info.get("tcn"):
                 st.stp_tc_at = now
+                vlan = info.get("vlan")
+                st.add_event("stp", "Spanning-tree topology change" + (f" (VLAN {vlan})" if vlan else ""),
+                             "warn", now, quiet=30)
         elif kind == "EAPOL":
             if info.get("code") in ("Request", "Success", "Failure"):
                 st.dot1x = dict(info, ts=now)
@@ -1014,9 +1047,13 @@ class Backend:
         st = self.st
         ip = st.ipv4
         if (ip and a["spa"] == ip and a["sha"] != my and a["sha"] != "00:00:00:00:00:00"):
+            if st.dup_mac != a["sha"]:
+                st.add_event("dup", f"Duplicate IP: {a['sha']} also claims {ip}", "bad", now, quiet=60)
             st.dup_mac = a["sha"]
         gw = N.first_v4(st.d.get("Gateway"))
         if gw and a["spa"] == gw:
+            if st.gw_mac and a["sha"] != st.gw_mac and a["sha"] != "00:00:00:00:00:00":
+                st.add_event("gwmac", f"Gateway {gw} changed MAC: {st.gw_mac} to {a['sha']}", "bad", now, quiet=10)
             st.gw_mac = a["sha"]
         sc = st.arp_scan
         if sc["range"] and a["spa"] != "0.0.0.0":
@@ -1035,6 +1072,8 @@ class Backend:
         if d["op"] != 2:
             return
         srv = d.get("server") or d.get("ip_src")
+        if srv not in st.dhcp_seen and st.dhcp_seen:
+            st.add_event("dhcp", f"Another DHCP server answered: {srv}", "bad", now, quiet=300)
         st.dhcp_seen[srv] = {"mac": d.get("src"), "ts": now, "msg": d.get("msg")}
         sc = st.dhcp_scan
         if sc and d["xid"] == sc["xid"] and d["msg"] == "OFFER":
@@ -1197,7 +1236,20 @@ class Backend:
             running = p["running"]
             fresh = new_ping()
             fresh["kind"], fresh["label"], fresh["running"] = PING_TARGETS[i][0], PING_TARGETS[i][1], running
+            fresh["span"] = p["span"]
             self.st.ping = fresh
+
+    PING_SPANS = (30, 300, 1800)
+
+    def ping_next_span(self):
+        with self.st.lock:
+            p, opts = self.st.ping, self.PING_SPANS
+            p["span"] = opts[(opts.index(p["span"]) + 1) % len(opts)] if p["span"] in opts else opts[0]
+
+    def event(self, kind, text, sev="warn", quiet=0.0):
+        """Put something on the event timeline. Use st.add_event when st.lock is already held."""
+        with self.st.lock:
+            self.st.add_event(kind, text, sev, time.time(), quiet)
 
     def _ping_loop(self, ev):
         st = self.st
@@ -1223,7 +1275,7 @@ class Backend:
                     p["sent"] += 1
                     if status == "ok":
                         p["recv"] += 1
-                        p["rtts"].append(rtt)
+                        p["samples"].append((t0, rtt))
                         p["min"] = rtt if p["min"] is None else min(p["min"], rtt)
                         p["max"] = rtt if p["max"] is None else max(p["max"], rtt)
                         p["sum"] += rtt
@@ -1233,7 +1285,7 @@ class Backend:
                         p["last"] = rtt
                         p["log"].appendleft((f"#{p['sent']}  reply  {fmt_ms(rtt)}", OK))
                     else:
-                        p["rtts"].append(None)
+                        p["samples"].append((t0, None))
                         p["log"].appendleft((f"#{p['sent']}  {status}", BAD))
                 ev.wait(max(0.0, 0.25 - (time.time() - t0)))
         finally:
@@ -1812,7 +1864,16 @@ class DemoBackend(Backend):
         if ttl < 6:
             hops = ["10.20.30.2", "10.20.0.1", "172.16.1.1", "68.85.10.1", "162.158.4.1"]
             return ("ttl", hops[ttl - 1], random.uniform(1, 4) * ttl)
-        if random.random() < 0.02:
+        # Every 23 s the demo network has a spanning-tree change that costs a second of lag, and
+        # once in between a gateway MAC change that costs nothing.
+        phase = time.time() % 23
+        if phase < 1.2:
+            self.event("stp", "Spanning-tree topology change (VLAN 30)", "warn", quiet=10)
+            return ("timeout", None, None) if random.random() < 0.45 else ("ok", dst, random.uniform(60, 220))
+        if 11 < phase < 12:
+            self.event("gwmac", "Gateway 10.20.30.1 changed MAC: 00:00:0c:07:ac:1e to 70:db:98:1a:00:01",
+                       "bad", quiet=10)
+        if random.random() < 0.004:
             return ("timeout", None, None)
         return ("ok", dst, random.uniform(0.4, 2.5))
 
@@ -2384,7 +2445,8 @@ class ToolView(tk.Frame):
         self.sub.pack(fill="x")
         self.chart = None
         if chart:
-            self.chart = tk.Canvas(self, bg=PANEL, highlightthickness=0, height=int(ui.H * 0.15))
+            frac = chart if isinstance(chart, float) else 0.15
+            self.chart = tk.Canvas(self, bg=PANEL, highlightthickness=0, height=int(ui.H * frac))
             self.chart.pack(fill="x", pady=(ui.pad // 2, 0))
         self.list = ListView(self, ui)
         self.list.pack(fill="both", expand=True, pady=(ui.pad // 2, 0))
@@ -2571,7 +2633,8 @@ class UI:
         self.build_tools_grid()
         self.tools = {
             "ping": ToolView(self.body, self, "Ping", [("Start", self.be.ping_toggle),
-                                                     ("Target ›", self.be.ping_next_target)], chart=True),
+                                                     ("Target ›", self.be.ping_next_target),
+                                                     ("30 s", self.be.ping_next_span)], chart=0.24),
             "trace": ToolView(self.body, self, "Traceroute", [("Run", self.be.trace_toggle),
                                                              ("Target ›", self.be.trace_next_target)]),
             "speed": ToolView(self.body, self, "Speed test", [("iperf3", self.be.speed_iperf),
@@ -3128,9 +3191,13 @@ class UI:
         return (fmt_ms(v), OK)
 
     # ---------------------------------------------------------- tool renders
+    SEV_COLOR = {"bad": BAD, "warn": WARN, "info": HDR}
+
     def render_ping(self, s, v, now):
         p = s["ping"]
+        samples, span = list(p["samples"]), p["span"]
         v.set_action(0, "Stop" if p["running"] else "Start", RED if p["running"] else BLUE)
+        v.set_action(2, {30: "30 s", 300: "5 min", 1800: "30 min"}.get(span, f"{span} s"))
         tgt = p["target"] or "(no address yet)"
         if p["sent"]:
             loss = 100 * (p["sent"] - p["recv"]) / p["sent"]
@@ -3138,32 +3205,70 @@ class UI:
             jit = p["jit"] / p["jn"] if p["jn"] else 0
             color = OK if loss == 0 else WARN if loss < 5 else BAD
             summ = f"{loss:.1f}% loss · avg {fmt_ms(avg) or '—'} · jitter {jit:.1f} ms"
+            rtts = [r for _, r in samples]
+            p99 = N.percentile(rtts, 99)
             sub = (f"{p['label']} {tgt} · sent {p['sent']} · min {fmt_ms(p['min']) or '—'}"
-                   f" · max {fmt_ms(p['max']) or '—'}")
+                   f" · 99% under {fmt_ms(p99) or '—'} · max {fmt_ms(p['max']) or '—'}")
         else:
             color, summ = FG, f"{p['label']}: {tgt}"
-            sub = "Tap Start — 4 pings a second. Target › cycles gateway / DNS / switch / internet."
+            sub = "Tap Start — 4 pings a second. Port events are marked on the graph as they happen."
         v.set_summary(summ, color, sub)
-        self.draw_chart(v.chart, list(p["rtts"]))
-        v.list.set_rows([(t, c, "mono") for t, c in p["log"]], "")
+        t_end = now if p["running"] or not samples else samples[-1][0]
+        events = list(s["events"])
+        self.draw_timeline(v.chart, samples, events, t_end, span)
+        rows = [("Port events, newest first", HDR, "hdr")]
+        for e in reversed(events[-25:]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+            went_on = e["last"] - e["ts"]
+            lasted = f"  (kept up for {went_on:.0f} s)" if went_on >= 2 else ""
+            rows.append((f"{stamp}  {e['text']}{lasted}", self.SEV_COLOR.get(e["sev"], FG), "row"))
+            rows.append(("              " + N.impact_text(N.event_impact(samples, e["ts"])), DIM, "dim"))
+        if not events:
+            rows.append(("None yet. Link drops, speed changes, spanning-tree changes, gateway MAC changes, "
+                         "broadcast storms, duplicate IPs and extra DHCP servers show up here and on the graph.",
+                         DIM, "dim"))
+        rows.append(("Last pings", HDR, "hdr"))
+        rows += [(t, c, "mono") for t, c in list(p["log"])[:8]]
+        v.list.set_rows(rows, "")
 
-    def draw_chart(self, c, rtts):
+    def draw_timeline(self, c, samples, events, t_end, span):
+        """Latency bars with lost pings in red, and under them a lane marking each port event."""
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 20 or not rtts:
+        if w < 20:
             return
-        n = 120
-        bw = w / n
-        vals = [r for r in rtts if r is not None]
+        lane = max(10, int(h * 0.2))
+        ph = h - lane
+        ncol = 120 if span <= 30 else max(60, w // 3)
+        cols = N.bucket_samples(samples, t_end, span, ncol)
+        bw = w / ncol
+        vals = [r for r, _, _ in cols if r is not None]
+        normal = N.percentile([r for _, r in samples if r is not None], 50) or 0
+        slow = max(20, 3 * normal)
         top = max(max(vals) if vals else 1, 2) * 1.15
-        for i, r in enumerate(rtts):
-            x = (n - len(rtts) + i) * bw
+        for i, (r, lost, n) in enumerate(cols):
+            x = i * bw
+            if not n:
+                continue
             if r is None:
-                c.create_rectangle(x, 0, x + bw - 1, h, fill=BAD, width=0)
-            else:
-                bh = max(2, h * r / top)
-                c.create_rectangle(x, h - bh, x + bw - 1, h, fill=OK if r < 20 else WARN, width=0)
-        c.create_text(6, 4, anchor="nw", text=f"{top:.0f} ms", fill=DIM, font=self.font(self.sz["rowsm"]))
+                c.create_rectangle(x, 0, x + bw - 1, ph, fill=BAD, width=0)
+                continue
+            bh = max(2, ph * r / top)
+            c.create_rectangle(x, ph - bh, x + bw - 1, ph, fill=OK if r < slow else WARN, width=0)
+            if lost:
+                c.create_rectangle(x, 0, x + bw - 1, max(3, ph * 0.12), fill=BAD, width=0)
+        c.create_line(0, ph, w, ph, fill=GREY)
+        t0 = t_end - span
+        for e in events:
+            if e["last"] < t0 or e["ts"] > t_end:
+                continue
+            x = max(1, min(w - 2, (max(e["ts"], t0) - t0) / span * w))
+            col = self.SEV_COLOR.get(e["sev"], FG)
+            c.create_line(x, 0, x, ph, fill=col, dash=(3, 3))
+            c.create_polygon(x, ph + 2, x - lane * 0.45, h - 1, x + lane * 0.45, h - 1, fill=col, outline="")
+        font = self.font(self.sz["rowsm"])
+        label = {30: "last 30 s", 300: "last 5 min", 1800: "last 30 min"}.get(span, "")
+        c.create_text(6, 4, anchor="nw", text=f"{top:.0f} ms  ·  {label}", fill=DIM, font=font)
 
     def render_trace(self, s, v, now):
         t = s["trace"]
