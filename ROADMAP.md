@@ -16,9 +16,6 @@ On a trunk port, tag onto each VLAN in a list, request DHCP on each one, and rep
 
 ## Planned
 
-### Open ports on smart devices
-Show which common services each device answers on in the SMART tab (web interface, SSH, printing, video streams, casting…), with friendly names, in the device details, and saved to `devices.csv` for documentation.
-
 ### MTU / jumbo frame test
 Find the largest packet that gets through without fragmenting, toward the gateway or any host. Catches jumbo-frame and tunnel MTU mismatches.
 
@@ -52,6 +49,7 @@ Not committed to, but worth thinking about:
 
 ## Already shipped
 
+- **Open services on smart devices:** a Ports button on each device checks 35 common services and names them; saved to `devices.csv`.
 - **Capture to file:** Tools › Capture records 30 s, 60 s or 5 min to a `.pcap` in the data folder.
 - **Public IP** on the PORT page's Internet tile.
 - **v2.0 betas:** port, switch (CDP/LLDP), L2 checks (802.1X, STP, trunk/DTP, rogue DHCP, phone options, IPv6, broadcast), stats, ping, traceroute, speed tests, ARP table and scan, mDNS browser, port finder, port log, the SMART home device tab, Windows `.exe`, and native Linux (Nobara) support including bridged NICs.

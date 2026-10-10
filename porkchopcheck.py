@@ -1427,7 +1427,7 @@ class Backend:
                 self._mdns_scan(ip)
                 return self.mdns.snapshot()
             scan = S.SmartScan(ip, mask, mac, self.oui, lambda: self._arp_table(name), mdns_fn,
-                               self._smart_progress)
+                               self._smart_progress, services=bool(self.settings.get("smart_services")))
             devs = scan.run(ev)
             self._smart_store(devs, scan.counts)
         except Exception as e:  # noqa: BLE001
@@ -1442,6 +1442,7 @@ class Backend:
         _, err = self.devstore.merge(devs)
         for d in devs:
             d["label"] = self.devstore.label(d["key"])
+            d["ports"] = self.devstore.ports(d["key"])      # includes what an earlier full check found
         with self.st.lock:
             self.st.smart.update(devices=devs, ts=time.time(), counts=dict(counts))
         n = sum(1 for d in devs if d.get("smart"))
@@ -1454,6 +1455,35 @@ class Backend:
                 if d.get("key") == key:
                     d["label"] = label
         self.st.say(err or (f"Labelled: {label}" if label else "Label cleared"), 3)
+
+    def device_ports_scan(self, key):
+        """Check every common service port on one device (the Ports button on its detail card)."""
+        with self.st.lock:
+            d = next((x for x in self.st.smart["devices"] if x.get("key") == key), None)
+            src = self.st.ipv4
+            if not d or d.get("port_scan") == "running":
+                return
+            d["port_scan"] = "running"
+            ip = d["ip"]
+        threading.Thread(target=self._device_ports_scan, args=(key, ip, src), daemon=True).start()
+
+    def _probe_device(self, ip, src):
+        return S.probe_ports(ip, S.ALL_PORTS, src)
+
+    def _device_ports_scan(self, key, ip, src):
+        try:
+            ports = self._probe_device(ip, src)
+        except Exception:  # noqa: BLE001
+            log_error("Port check failed")
+            ports = None
+        err = self.devstore.set_ports(key, ports) if ports is not None else "Port check failed"
+        with self.st.lock:
+            for d in self.st.smart["devices"]:
+                if d.get("key") == key:
+                    d["port_scan"] = "done" if ports is not None else ""
+                    if ports is not None:
+                        d["ports"], d["services_checked"] = ports, True
+        self.st.say(err or f"{ip}: {len(ports)} of {len(S.ALL_PORTS)} common services answer", 4)
 
     # ---------------------------------------------------------- capture to file
     CAPTURE_SECS = (30, 60, 300)
@@ -1727,6 +1757,14 @@ class DemoBackend(Backend):
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
 
+    def _probe_device(self, ip, src):
+        time.sleep(1.2)
+        with self.st.lock:
+            d = next((x for x in self.st.smart["devices"] if x.get("ip") == ip), {})
+        extra = {"camera": [80, 443, 554, 8554], "tv": [7000, 8008, 8009, 8060], "printer": [80, 443, 515, 631, 9100],
+                 "speaker": [1400, 7000], "hub": [80, 443, 8080]}.get(d.get("category"), [80])
+        return sorted(set(d.get("ports", [])) | set(extra))
+
     def capture_refresh(self):
         with self.st.lock:
             self.st.capture["files"] = [("capture-20261010-101502-SW-IDF2-03-Gi1_0_14.pcap", 4_812_330, 0),
@@ -1990,6 +2028,8 @@ class DeviceDetail(tk.Frame):
         ui.button(hdr, "Close", self.close, ui.sz["small"], bg=GREY, padx=pad * 2).pack(side="right")
         ui.button(hdr, "Label", self.relabel, ui.sz["small"], bg=BLUE, padx=pad * 2).pack(
             side="right", padx=(0, pad // 2))
+        self.ports_btn = ui.button(hdr, "Ports", self.scan_ports, ui.sz["small"], bg=BLUE, padx=pad * 2)
+        self.ports_btn.pack(side="right", padx=(0, pad // 2))
         titles = tk.Frame(hdr, bg=BG)
         titles.pack(side="left", fill="x", expand=True, padx=pad)
         tk.Label(titles, text=device_title(d), bg=BG, fg=FG, anchor="w",
@@ -1997,6 +2037,40 @@ class DeviceDetail(tk.Frame):
         tk.Label(titles, text=f"{d.get('brand', '')}  ·  {S.CATEGORIES.get(d.get('category', ''), '')}",
                  bg=BG, fg=CAT_COLORS.get(d.get("category"), DIM), anchor="w",
                  font=ui.font(ui.sz["small"], "bold")).pack(fill="x")
+        self.lst = ListView(self, ui)
+        self.lst.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+        self.fill()
+        ui.overlay = self
+        self.after(500, self.poll)
+
+    def poll(self):
+        """Pick up the result of a port check, or a label change, while the card is open."""
+        if self.ui.overlay is not self:
+            return
+        with self.ui.st.lock:
+            cur = next((copy.deepcopy(x) for x in self.ui.st.smart["devices"]
+                        if x.get("key") == self.d.get("key")), None)
+        if cur is not None and cur != self.d:
+            self.d = cur
+            self.fill()
+        self.after(500, self.poll)
+
+    def scan_ports(self):
+        self.ui.be.device_ports_scan(self.d.get("key"))
+
+    def fill(self):
+        d, ui = self.d, self.ui
+        busy = d.get("port_scan") == "running"
+        self.ports_btn.config(text="Checking…" if busy else "Ports", bg=GREY if busy else BLUE)
+        ports = d.get("ports", [])
+        if busy:
+            svc = "Checking every common service…"
+        elif ports:
+            svc = "\n".join(S.describe_ports(ports))
+        else:
+            svc = "none answered"
+        if not busy and not d.get("services_checked"):
+            svc += "\n(quick check only: tap Ports to check all " + str(len(S.ALL_PORTS)) + " common services)"
         serial = d.get("serial") or ""
         rows = [
             ("Label", d.get("label") or "(tap Label to add one)"),
@@ -2005,20 +2079,17 @@ class DeviceDetail(tk.Frame):
             ("IP address", d.get("ip", "")), ("MAC address", d.get("mac") or "not seen"),
             ("MAC vendor", d.get("vendor", "")), ("Hostname", d.get("hostname", "")),
             ("Firmware", d.get("fw", "")),
-            ("Open ports", " ".join(map(str, d.get("ports", [])))),
-            ("Services", ", ".join(t.replace(".local", "") for t in d.get("mdns_types", []))),
+            ("Open services", svc),
+            ("Advertises (mDNS)", ", ".join(t.replace(".local", "") for t in d.get("mdns_types", []))),
             ("Found via", ", ".join(d.get("sources", []))),
             ("Smart home", "yes" if d.get("smart") else "no"),
         ]
-        lst = ListView(self, ui)
-        lst.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
         out = []
         for k, v in rows:
             if v:
                 out.append((k.upper(), DIM, "dim"))
                 out.append((str(v), FG, "row"))
-        lst.set_rows(out)
-        ui.overlay = self
+        self.lst.set_rows(out)
 
     def relabel(self):
         key, d = self.d.get("key"), self.d
@@ -2493,10 +2564,13 @@ class UI:
         self.button(hdr, "‹ Back", self.show_tools, self.sz["small"], bg=GREY, padx=self.pad * 2).pack(side="left")
         tk.Label(hdr, text="Settings", bg=BG, fg=FG, font=self.font(self.sz["sub"], "bold")).pack(
             side="left", padx=self.pad)
+        tk.Label(hdr, text=f"v{VERSION}  ·  github.com/turkey415/porkchopcheck", bg=BG, fg=DIM,
+                 font=self.font(self.sz["rowsm"])).pack(side="right", padx=self.pad)
         lst = tk.Frame(page, bg=BG)
         lst.pack(fill="both", expand=True, pady=(self.pad // 2, 0))
         self.set_btns = {}
         rows = [("announce", self.toggle("announce")), ("autolog", self.toggle("autolog")),
+                ("smartsvc", self.toggle("smart_services")),
                 ("hostname", self.edit_hostname), ("iperf", self.edit_iperf),
                 ("oui", lambda: threading.Thread(target=self.be.update_oui, daemon=True).start()),
                 ("folder", self.open_data), ("exit", self.quit)]
@@ -2507,8 +2581,6 @@ class UI:
             b.grid(row=r, column=0, sticky="nsew", pady=self.pad // 4)
             self.set_btns[key] = b
         lst.columnconfigure(0, weight=1)
-        tk.Label(page, text=f"PorkChopCheck v{VERSION}  ·  github.com/turkey415/porkchopcheck",
-                 bg=BG, fg=DIM, font=self.font(self.sz["rowsm"])).pack(fill="x", pady=(self.pad // 2, 0))
 
     # ---------------------------------------------------------- navigation
     def show(self, name):
@@ -2833,6 +2905,7 @@ class UI:
         texts = {
             "announce": f"Announce to switch (LLDP + CDP):  {'ON' if g('announce') else 'OFF'}",
             "autolog": f"Auto-log every port to ports.csv:  {'ON' if g('autolog') else 'OFF'}",
+            "smartsvc": f"Smart scan checks common services on every device:  {'ON' if g('smart_services') else 'OFF'}",
             "hostname": f"Name sent to switch:  {self.be.hostname()}",
             "iperf": "iperf3 server:  " + ((g('iperf_server') + (f":{g('iperf_port')}" if g('iperf_port') != 5201 else ""))
                                            if g("iperf_server") else "(tap to set)"),

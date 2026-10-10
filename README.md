@@ -80,6 +80,12 @@ How it finds them, all locally with no cloud logins:
 | LIFX, Govee, WiZ, Yeelight, Tuya / Smart Life | model and device ID |
 | HTTP device info | Roku serial, Hue bridge ID, Shelly ID, Cast model |
 
+### Open services
+
+Tap a device, then **Ports**, and PorkChopCheck checks 35 common service ports on it and lists what answers in plain words: `80 Web interface`, `554 Video stream (RTSP)`, `9100 Printing (raw)`, `22 SSH`. The result is saved to `devices.csv` in the `open_ports` and `services` columns.
+
+A normal scan only tries nine ports, the ones that help identify a device. To run the full check on every device during a scan, turn on **Settings › Smart scan checks common services on every device**. It is off by default: it makes one connection attempt per port to every host, which takes longer on a big subnet and can look like a port scan to an intrusion detection system. Each check is a plain connect that is closed straight away; nothing is sent to the service.
+
 Good to know:
 - **Govee:** turn on *LAN Control* per device in the Govee app. **WiZ:** turn on *Allow local communication* in the WiZ app.
 - Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
@@ -126,7 +132,7 @@ Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ## Coming soon
 
-The **multicast browser** (live groups, IGMP querier check, join test), a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, open ports on smart devices, new-device alerts, printable port reports, and a handful of quick checks.
+The **multicast browser** (live groups, IGMP querier check, join test), a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, new-device alerts, printable port reports, and a handful of quick checks.
 
 See the full **[roadmap](ROADMAP.md)**. Ideas and pull requests welcome.
 

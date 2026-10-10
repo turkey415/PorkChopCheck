@@ -157,6 +157,69 @@ PORT_CATEGORY = {554: "camera", 1400: "speaker", 8060: "tv", 9100: "printer", 66
                  9999: "plug", 55443: "light"}
 PROBE_PORTS = [80, 554, 1400, 8008, 8060, 9100, 6668, 9999, 55443]
 
+# The fuller list for documenting a device: common services, with the name a person would use.
+SERVICE_PORTS = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 53: "DNS", 80: "Web interface",
+    139: "Windows file sharing", 443: "Web interface (HTTPS)", 445: "Windows file sharing",
+    515: "Printing (LPD)", 548: "Mac file sharing", 554: "Video stream (RTSP)",
+    631: "Printing (IPP)", 1400: "Sonos control", 1883: "MQTT", 2049: "NFS file sharing",
+    3389: "Remote Desktop", 5000: "AirPlay / UPnP", 5357: "Windows device discovery",
+    5900: "Screen sharing (VNC)", 6668: "Tuya local control", 7000: "AirPlay",
+    8008: "Chromecast", 8009: "Chromecast", 8060: "Roku control", 8080: "Web interface (alt)",
+    8123: "Home Assistant", 8443: "Web interface (HTTPS alt)", 8554: "Video stream (RTSP alt)",
+    8883: "MQTT (TLS)", 9100: "Printing (raw)", 9999: "TP-Link Kasa control", 32400: "Plex",
+    49152: "UPnP", 55443: "Yeelight control", 62078: "iPhone / iPad sync",
+}
+ALL_PORTS = sorted(set(PROBE_PORTS) | set(SERVICE_PORTS))
+
+
+def describe_ports(ports):
+    """["80  Web interface", "554  Video stream (RTSP)", "12345"] for a list of port numbers."""
+    return [f"{p}  {SERVICE_PORTS[p]}" if p in SERVICE_PORTS else str(p) for p in sorted(set(ports))]
+
+
+def service_names(ports):
+    """Distinct service names for the open ports, in port order: "Web interface, Chromecast"."""
+    seen = []
+    for p in sorted(set(ports)):
+        n = SERVICE_PORTS.get(p)
+        if n and n not in seen:
+            seen.append(n)
+    return ", ".join(seen)
+
+
+def port_open(ip, port, src=None, timeout=0.4):
+    """One TCP connect. True only if the device accepted it; the connection is closed at once."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        if src:
+            s.bind((src, 0))
+        return s.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def probe_ports(ip, ports, src=None, timeout=0.6, workers=32, stop=None):
+    """Which of `ports` one device answers on, sorted."""
+    found = []
+    ex = cf.ThreadPoolExecutor(workers)
+    try:
+        futs = {ex.submit(port_open, ip, p, src, timeout): p for p in ports}
+        try:
+            for f in cf.as_completed(futs, timeout=timeout * len(futs) / workers + 10):
+                if stop and stop.is_set():
+                    break
+                if f.result():
+                    found.append(futs[f])
+        except cf.TimeoutError:
+            pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return sorted(found)
+
 # Where a fact came from; higher wins when two sources disagree.
 PRIO = {"oui": 1, "dns": 2, "ports": 2, "mdns": 4, "upnp": 5, "http": 6, "protocol": 7}
 
@@ -623,7 +686,9 @@ class SmartScan:
       progress(text)  -> status line updates
     """
 
-    def __init__(self, src_ip, mask, my_mac, oui, arp_table_fn, mdns_scan_fn, progress=None):
+    def __init__(self, src_ip, mask, my_mac, oui, arp_table_fn, mdns_scan_fn, progress=None,
+                 services=False):
+        self.services = services           # also check the common-services ports on every host
         self.src, self.mask, self.my_mac = src_ip, mask, N.norm_mac(my_mac)
         self.oui, self.arp_table_fn, self.mdns_scan_fn = oui, arp_table_fn, mdns_scan_fn
         self.progress = progress or (lambda t: None)
@@ -669,7 +734,8 @@ class SmartScan:
             return self.finish()
         self.progress("Reading the ARP table…")
         self._arp()
-        self.progress("Checking hostnames and open ports…")
+        self.progress("Checking hostnames and common services…" if self.services
+                      else "Checking hostnames and open ports…")
         self._rdns_and_ports(stop)
         self.progress("Fetching device details (Roku, Hue, Shelly, Cast)…")
         self._http_enrich(stop)
@@ -681,6 +747,7 @@ class SmartScan:
         with self.lock:
             for d in self.devs.values():
                 d = {k: v for k, v in d.items() if not k.startswith("_")}
+                d["services_checked"] = self.services
                 if d.get("mac") and self.oui:
                     d["vendor"] = self.oui.vendor_long(d["mac"])
                 out.append(classify(d))
@@ -893,30 +960,32 @@ class SmartScan:
                 return ip, ""
 
         def probe(ip, port):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.4)
-            try:
-                s.bind((self.src, 0))
-                return ip, port, s.connect_ex((ip, port)) == 0
-            except OSError:
-                return ip, port, False
-            finally:
-                s.close()
+            return ip, port, port_open(ip, port, self.src)
 
-        with cf.ThreadPoolExecutor(96) as ex:
+        ports = ALL_PORTS if self.services else PROBE_PORTS
+        workers = 96
+        # Every probe that gets no answer costs its full 0.4 s, so allow for a quiet subnet.
+        budget = max(40, min(300, 0.4 * len(ips) * len(ports) / workers + 20))
+        ex = cf.ThreadPoolExecutor(workers)
+        try:
             rd = [ex.submit(rdns, ip) for ip in ips]
-            pr = [ex.submit(probe, ip, p) for ip in ips for p in PROBE_PORTS]
-            for f in cf.as_completed(rd + pr, timeout=40):
-                if stop and stop.is_set():
-                    break
-                try:
-                    r = f.result()
-                except Exception:  # noqa: BLE001
-                    continue
-                if len(r) == 2 and r[1]:
-                    self.add(r[0], {"hostname": r[1].split(".")[0]}, "DNS", PRIO["dns"])
-                elif len(r) == 3 and r[2]:
-                    self.add(r[0], {"ports": [r[1]]}, "Ports", PRIO["ports"])
+            pr = [ex.submit(probe, ip, p) for ip in ips for p in ports]
+            try:
+                for f in cf.as_completed(rd + pr, timeout=budget):
+                    if stop and stop.is_set():
+                        break
+                    try:
+                        r = f.result()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if len(r) == 2 and r[1]:
+                        self.add(r[0], {"hostname": r[1].split(".")[0]}, "DNS", PRIO["dns"])
+                    elif len(r) == 3 and r[2]:
+                        self.add(r[0], {"ports": [r[1]]}, "Ports", PRIO["ports"])
+            except cf.TimeoutError:
+                pass                       # keep what we have; the rest of the scan still runs
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
     # -- 6. HTTP device info
     def _http_enrich(self, stop):
@@ -950,7 +1019,16 @@ class SmartScan:
 
 # ====================================================================== inventory (devices.csv)
 INV_FIELDS = ["label", "brand", "category", "name", "model", "serial", "serial_source", "ip", "mac",
-              "vendor", "hostname", "fw", "smart", "discovered_by", "open_ports", "first_seen", "last_seen"]
+              "vendor", "hostname", "fw", "smart", "discovered_by", "open_ports", "services",
+              "first_seen", "last_seen"]
+
+
+def kept_ports(old_ports, new_ports, services_checked):
+    """The ports to record after a scan. A quick scan only tests PROBE_PORTS, so anything an
+    earlier full check found outside that list was not retested and is kept."""
+    old = {int(p) for p in str(old_ports or "").split() if p.isdigit()}
+    new = {int(p) for p in new_ports}
+    return sorted(new if services_checked else new | (old - set(PROBE_PORTS)))
 
 
 class DeviceStore:
@@ -986,7 +1064,9 @@ class DeviceStore:
                             if d.get(f)})
                 rec["smart"] = "yes" if d.get("smart") else "no"
                 rec["discovered_by"] = ", ".join(d.get("sources", []))
-                rec["open_ports"] = " ".join(map(str, d.get("ports", [])))
+                ports = kept_ports(old.get("open_ports"), d.get("ports", []), d.get("services_checked"))
+                rec["open_ports"] = " ".join(map(str, ports))
+                rec["services"] = service_names(ports)
                 rec["first_seen"] = old.get("first_seen") or now
                 rec["last_seen"] = now
                 self.items[k] = rec
@@ -1002,6 +1082,19 @@ class DeviceStore:
     def label(self, key):
         with self.lock:
             return self.items.get(key, {}).get("label", "")
+
+    def set_ports(self, key, ports):
+        """Record a full service check of one device."""
+        with self.lock:
+            if key in self.items:
+                self.items[key]["open_ports"] = " ".join(map(str, sorted(set(ports))))
+                self.items[key]["services"] = service_names(ports)
+                return self._save()
+        return None
+
+    def ports(self, key):
+        with self.lock:
+            return [int(p) for p in str(self.items.get(key, {}).get("open_ports", "")).split() if p.isdigit()]
 
     def _save(self):
         try:
