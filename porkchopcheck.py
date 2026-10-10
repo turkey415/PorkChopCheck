@@ -51,6 +51,17 @@ def _fatal(msg):
     sys.exit(1)
 
 
+def log_error(what):
+    """Append the current exception to crash.log without stopping the app."""
+    import traceback
+    try:
+        with open(os.path.join(SCRIPT_DIR, "crash.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + what + f"  [python: {sys.executable}]\n"
+                    + traceback.format_exc() + "\n")
+    except OSError:
+        pass
+
+
 try:
     import tkinter as tk
     import tkinter.font as tkfont
@@ -810,9 +821,13 @@ class Backend:
         try:
             from scapy.all import AsyncSniffer, conf
             from scapy.layers.l2 import Ether
-        except Exception:  # noqa: BLE001
-            self._set_sniff(gen, "Capture off — " + ("run ./install-linux.sh" if IS_LINUX
-                                                     else "run: py -m pip install scapy"))
+        except Exception as e:  # noqa: BLE001
+            log_error("Packet capture library (scapy) failed to load")
+            if isinstance(e, ImportError) and "scapy" in str(e):
+                hint = "run ./install-linux.sh" if IS_LINUX else "run: py -m pip install scapy"
+                self._set_sniff(gen, f"Capture off — scapy not installed for {sys.executable} — {hint}"[:110])
+            else:
+                self._set_sniff(gen, f"Capture off — scapy error: {type(e).__name__}: {e} (details in crash.log)"[:110])
             return
         if IS_LINUX and not N.has_net_caps():
             self._set_sniff(gen, "No capture permission — run ./install-linux.sh")
