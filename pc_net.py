@@ -1271,7 +1271,7 @@ class Oui:
 # ====================================================================== settings + port log
 class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
-                "iperf_port": 5201, "smart_services": False, "tick_server": ""}
+                "iperf_port": 5201, "smart_services": False, "tick_server": "", "tick_claude": False}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")
@@ -1745,6 +1745,63 @@ def parse_tick(data):
     return struct.unpack("!II", data[4:12])
 
 
+# A reflector is a program, and a program is not always running the instant a packet lands. The
+# time a packet sat waiting for it is not the network's doing, so the reflector writes that time
+# into the reply and the test takes it off. Both ends ask the system to stamp each packet as it
+# arrives (Linux can), so the wait is measured from then and not from when the program woke up.
+TICK_HOLD = b"RD"
+SO_TIMESTAMPNS = 35
+
+
+def tick_reply(data, hold_us, stamped):
+    """What the reflector sends back: the same packet, the same size, with how long it was held
+    (microseconds) written into the padding, and whether the system stamped its arrival."""
+    if len(data) < 19:
+        return data
+    return (data[:12] + TICK_HOLD + struct.pack("!BI", 1 if stamped else 0, max(0, min(hold_us, 0xFFFFFFFF)))
+            + data[19:])
+
+
+def parse_tick_hold(data):
+    """(hold in ms, True if timed from the system's arrival stamp) from a reply, or None from a
+    reflector too old to say."""
+    if len(data) < 19 or data[12:14] != TICK_HOLD:
+        return None
+    flag, us = struct.unpack("!BI", data[14:19])
+    return (us / 1000.0, bool(flag & 1))
+
+
+def stamp_socket(sock):
+    """Ask the system to stamp each packet as it arrives. True if it will."""
+    if not IS_LINUX or not hasattr(sock, "recvmsg"):
+        return False
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+        return True
+    except OSError:
+        return False
+
+
+def recv_stamped(sock, stamped):
+    """(data, sender, arrival time in ns on the system clock, True if the system stamped it)."""
+    if not stamped:
+        data, addr = sock.recvfrom(2048)
+        return data, addr, time.time_ns(), False
+    data, anc, _, addr = sock.recvmsg(2048, 128)
+    for level, kind, val in anc:
+        if level == socket.SOL_SOCKET and kind == SO_TIMESTAMPNS and len(val) in (8, 16):
+            sec, ns = struct.unpack("qq" if len(val) == 16 else "ii", val)
+            return data, addr, sec * 1_000_000_000 + ns, True
+    return data, addr, time.time_ns(), False
+
+
+def hold_summary(holds, rate):
+    """Figures for the reflector's hold times, in ms: how many, typical, longest, and how many
+    were over a tick, each of which would have looked like a late reply."""
+    return {"n": len(holds), "p50": percentile(holds, 50), "max": max(holds) if holds else None,
+            "over": sum(1 for h in holds if h > 1000.0 / rate)}
+
+
 def parse_tick_server(text, default_port=TICK_PORT):
     """"10.1.2.3", "10.1.2.3:27015", "10.1.2.3 27015" or "server.lan" -> (host, port) or None."""
     m = re.fullmatch(r"\s*([A-Za-z0-9][A-Za-z0-9.\-]*)(?:\s*[:/ ]\s*(\d{1,5}))?\s*", text or "")
@@ -1755,35 +1812,38 @@ def parse_tick_server(text, default_port=TICK_PORT):
 
 
 class TickBuffer:
-    """Every packet of a run: when it left and how long its reply took."""
+    """Every packet of a run: when it left, how long its reply took on the network, and how long
+    the reflector held it."""
 
     MAX = 40000                    # about 10 minutes at 64 a second, 5 at 128
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.rows = collections.deque()        # [send time, rtt in ms or None]
+        self.rows = collections.deque()        # [send time, rtt in ms or None, reflector hold in ms]
+        self.hold_mode = None                  # how the reflector times its hold: stamped | timed | none
         self.base = 0                          # sequence number of rows[0]
         self.top = -1                          # highest sequence number answered so far
         self.sent = self.recv = self.reorder = self.dup = 0
 
     def add_sent(self, ts):
         with self.lock:
-            self.rows.append([ts, None])
+            self.rows.append([ts, None, None])
             self.sent += 1
             if len(self.rows) > self.MAX:
                 self.rows.popleft()
                 self.base += 1
             return self.base + len(self.rows) - 1
 
-    def add_reply(self, seq, rtt_ms):
+    def add_reply(self, seq, rtt_ms, hold=None, stamped=False):
         with self.lock:
+            self.hold_mode = "none" if hold is None else "stamped" if stamped else "timed"
             i = seq - self.base
             if not 0 <= i < len(self.rows):
                 return
             if self.rows[i][1] is not None:
                 self.dup += 1
                 return
-            self.rows[i][1] = rtt_ms
+            self.rows[i][1], self.rows[i][2] = rtt_ms, hold
             self.recv += 1
             if seq < self.top:
                 self.reorder += 1
@@ -1793,7 +1853,12 @@ class TickBuffer:
     def samples(self, now, timeout=1.0):
         """[(send time, rtt or None)], leaving out packets still inside their timeout."""
         with self.lock:
-            return [(ts, rtt) for ts, rtt in self.rows if rtt is not None or now - ts >= timeout]
+            return [(ts, rtt) for ts, rtt, _ in self.rows if rtt is not None or now - ts >= timeout]
+
+    def holds(self, since):
+        """The reflector's hold time for every reply to a packet sent after `since`."""
+        with self.lock:
+            return [h for ts, _, h in self.rows if h is not None and ts >= since]
 
     def counters(self):
         with self.lock:
@@ -1823,20 +1888,64 @@ def tick_summary(samples, rate):
     return out
 
 
-def tick_verdict(s, rate):
-    """(headline, level) for a summary: ok | warn | bad, judged the way a player would feel it."""
+# How each figure rates for Counter-Strike: the worst value that still earns "excellent", "good"
+# and "fair". Anything past the last is "bad". Loss and late replies are percentages, jitter is
+# in ticks because the game smooths it a tick at a time, and ping is the round trip in ms, the
+# same figure the scoreboard shows.
+# Jitter is graded only with the switch below on. The game buffers jitter away until it costs a
+# tick, and that already shows as a late reply, so otherwise it is shown but not judged. Late
+# replies get more room than lost packets: the reply time covers both directions and the
+# reflector's own pauses, so a few stray late ones are not the network's doing.
+TICK_GRADES = ("excellent", "good", "fair", "bad")
+TICK_LIMITS = {"loss": (0, 0.1, 1), "burst": (0, 1, 2), "jitter": (1 / 16, 1 / 8, 1 / 2),
+               "late": (0.1, 0.5, 2), "ping": (20, 50, 100)}
+# The first limits this test shipped with, kept behind the "Claude recommended tick settings"
+# switch to compare against in the field. They allow fewer late replies and grade jitter as well.
+TICK_LIMITS_CLAUDE = dict(TICK_LIMITS, late=(0, 0.1, 1))
+TICK_LABELS = {"loss": "Packet loss", "burst": "Lost in a row", "jitter": "Jitter",
+               "late": "Late replies", "ping": "Ping"}
+TICK_FELT = {"loss": "Lost packets are moves and shots that never arrived, so the game has to guess.",
+             "burst": "Packets lost together are a visible hitch: players freeze, then jump.",
+             "jitter": "Packets arrive unevenly, so enemies move in fits and the game adds delay to hide it.",
+             "late": "A reply that misses its tick is as good as lost to the game.",
+             "ping": "Everything a player sees and does reaches the other side this much later."}
+
+
+def tick_grade(key, value, claude=False):
+    for grade, limit in zip(TICK_GRADES, (TICK_LIMITS_CLAUDE if claude else TICK_LIMITS)[key]):
+        if value <= limit + 1e-9:
+            return grade
+    return "bad"
+
+
+def tick_ratings(s, rate, claude=False):
+    """[(key, value as text, grade)] for a summary, one for each figure a player can feel.
+    With `claude` set the first, stricter limits apply; without it jitter's grade is "info",
+    shown but not judged."""
+    out = [("loss", f"{s['loss_pct']:.2f}%", tick_grade("loss", s["loss_pct"])),
+           ("burst", str(s["burst"]), tick_grade("burst", s["burst"]))]
+    replies = s["n"] - s["lost"]
+    if s["jitter"] is not None:
+        out.append(("jitter", f"{s['jitter']:.2f} ms", tick_grade("jitter", s["jitter"] * rate / 1000.0, claude) if claude else "info"))
+    if replies:
+        out.append(("late", str(s["late"]), tick_grade("late", 100 * s["late"] / replies, claude)))
+        out.append(("ping", f"{s['p50']:.1f} ms", tick_grade("ping", s["p50"])))
+    return out
+
+
+def tick_verdict(s, rate, claude=False):
+    """(headline, grade) for a summary: the grade of its worst figure, which is the one a player
+    would feel, or "wait" before anything has been sent."""
     if not s["n"]:
         return ("Waiting for replies…", "wait")
     if s["lost"] == s["n"]:
         return ("No replies", "bad")
-    tick = 1000.0 / rate
-    if s["loss_pct"] >= 1 or s["burst"] >= 3 or (s["jitter"] or 0) > tick / 2:
-        level = "bad"
-    elif s["lost"] or s["late"] or (s["jitter"] or 0) > tick / 8:
-        level = "warn"
-    else:
-        level = "ok"
-    return (f"{s['loss_pct']:.2f}% loss · {s['p50']:.1f} ms · jitter {s['jitter'] or 0:.2f} ms", level)
+    rated = [r for r in tick_ratings(s, rate, claude) if r[2] != "info"]
+    grade = max((g for _, _, g in rated), key=TICK_GRADES.index)
+    head = f"{grade.capitalize()} for Counter-Strike"
+    if grade in ("fair", "bad"):
+        head += ": " + ", ".join(TICK_LABELS[k].lower() for k, _, g in rated if g == grade)
+    return (head, grade)
 
 
 class TickTest:
@@ -1858,7 +1967,8 @@ class TickTest:
         except OSError:
             self.sock.close()
             raise
-        self.sent_at = {}              # seq -> perf_counter when it left
+        self.stamped = stamp_socket(self.sock)
+        self.sent_at = {}              # seq -> system clock, in ns, when it left
 
     def start(self):
         for fn in (self._send_loop, self._recv_loop):
@@ -1880,11 +1990,12 @@ class TickTest:
                 due = now
             self.pace_err += (abs(now - due) * 1000 - self.pace_err) * 0.05
             seq = self.buf.add_sent(time.time())
-            self.sent_at[seq] = now
             if len(self.sent_at) > 4 * self.rate:
                 self.sent_at.pop(next(iter(self.sent_at)), None)
+            pkt = tick_packet(self.session, seq, self.size)
+            self.sent_at[seq] = time.time_ns()
             try:
-                self.sock.send(tick_packet(self.session, seq, self.size))
+                self.sock.send(pkt)
             except OSError as e:
                 self.error = str(e)    # e.g. ICMP port unreachable coming back; keep going
             due += gap
@@ -1895,7 +2006,7 @@ class TickTest:
     def _recv_loop(self):
         while not self.stop_ev.is_set():
             try:
-                data = self.sock.recv(2048)
+                data, _, now, _ = recv_stamped(self.sock, self.stamped)
             except socket.timeout:
                 continue
             except OSError as e:
@@ -1904,19 +2015,19 @@ class TickTest:
                 self.error = str(e)
                 time.sleep(0.05)
                 continue
-            now = time.perf_counter()
             p = parse_tick(data)
             if not p or p[0] != self.session:
                 continue
             t = self.sent_at.get(p[1])
             if t is not None:
-                self.buf.add_reply(p[1], (now - t) * 1000)
+                hold, stamped = parse_tick_hold(data) or (None, False)
+                self.buf.add_reply(p[1], max(0.001, (now - t) / 1e6 - (hold or 0.0)), hold, stamped)
 
 
 class Reflector:
-    """The far end of the tick test: sends every test packet straight back where it came from.
-    It answers only packets that start with the test's marker, one reply per packet, so it
-    cannot be used to amplify traffic."""
+    """The far end of the tick test: sends every test packet straight back where it came from,
+    marked with how long it was held here. It answers only packets that start with the test's
+    marker, one reply of the same size per packet, so it cannot be used to amplify traffic."""
 
     def __init__(self, port=TICK_PORT, bind=""):
         self.port, self.count, self.peers = port, 0, {}
@@ -1928,11 +2039,12 @@ class Reflector:
         except OSError:
             self.sock.close()
             raise
+        self.stamped = stamp_socket(self.sock)
 
     def serve(self):
         while not self.stop_ev.is_set():
             try:
-                data, addr = self.sock.recvfrom(2048)
+                data, addr, came, stamped = recv_stamped(self.sock, self.stamped)
             except socket.timeout:
                 continue
             except OSError:
@@ -1942,7 +2054,7 @@ class Reflector:
             if data[:4] != TICK_MAGIC:
                 continue
             try:
-                self.sock.sendto(data, addr)
+                self.sock.sendto(tick_reply(data, (time.time_ns() - came) // 1000, stamped), addr)
             except OSError:
                 continue
             self.count += 1

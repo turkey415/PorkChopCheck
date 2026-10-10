@@ -297,22 +297,65 @@ check("tick buffer: a reply for a packet no longer held is ignored", tb2.rows[-1
 steady = [(i / 64, 1.2 + (0.05 if i % 2 else 0)) for i in range(640)]
 ss = N.tick_summary(steady, 64)
 check("tick summary: a clean run", (ss["lost"], ss["burst"], ss["late"]) == (0, 0, 0) and abs(ss["jitter"] - 0.05) < 1e-9 and ss["p50"] == 1.2 and ss["max"] == 1.25, ss)
-check("tick verdict: clean is ok", N.tick_verdict(ss, 64) == ("0.00% loss · 1.2 ms · jitter 0.05 ms", "ok"))
+check("tick verdict: clean is excellent", N.tick_verdict(ss, 64) == ("Excellent for Counter-Strike", "excellent"))
+check("tick ratings: every figure, with its value and grade", N.tick_ratings(ss, 64, True) == [("loss", "0.00%", "excellent"), ("burst", "0", "excellent"), ("jitter", "0.05 ms", "excellent"), ("late", "0", "excellent"), ("ping", "1.2 ms", "excellent")], N.tick_ratings(ss, 64, True))
+check("tick ratings: jitter is shown but not graded unless asked", [r for r in N.tick_ratings(ss, 64) if r[0] == "jitter"] == [("jitter", "0.05 ms", "info")] and N.tick_verdict(ss, 64) == ("Excellent for Counter-Strike", "excellent"))
+check("tick grade: limits are inclusive", [N.tick_grade("ping", x) for x in (20, 20.1, 50, 100, 100.1)] == ["excellent", "good", "good", "fair", "bad"])
+one = steady * 3; one[300] = (one[300][0], None)
+check("tick verdict: one lost packet in thirty seconds is still good", N.tick_verdict(N.tick_summary(one, 64), 64) == ("Good for Counter-Strike", "good"))
+two = list(one); two[900] = (two[900][0], None)
+check("tick verdict: two lost apart in thirty seconds is fair", N.tick_verdict(N.tick_summary(two, 64), 64) == ("Fair for Counter-Strike: packet loss", "fair"))
+check("tick verdict, Claude settings: jitter between a sixteenth and an eighth of a tick is good", N.tick_verdict(N.tick_summary([(i / 64, 1.0 + (1.5 if i % 2 else 0)) for i in range(640)], 64), 64, True)[1] == "good")
+check("tick verdict, Claude settings: the same jitter is only fair at 128 a second", N.tick_verdict(N.tick_summary([(i / 128, 1.0 + (1.5 if i % 2 else 0)) for i in range(640)], 128), 128, True) == ("Fair for Counter-Strike: jitter", "fair"))
+check("tick verdict: a slow but steady path is rated on its ping", N.tick_verdict(N.tick_summary([(i / 64, 60.0) for i in range(640)], 64), 64) == ("Fair for Counter-Strike: ping", "fair"))
 late = list(steady); late[100] = (late[100][0], 1.2 + 16.0)
 check("tick summary: a reply over one tick slow is late", N.tick_summary(late, 64)["late"] == 1 and N.tick_summary(late, 128)["late"] == 1)
-check("tick verdict: one late reply is a warning", N.tick_verdict(N.tick_summary(late, 64), 64)[1] == "warn")
+check("tick verdict, Claude settings: one late reply in ten seconds is fair", N.tick_verdict(N.tick_summary(late, 64), 64, True) == ("Fair for Counter-Strike: late replies", "fair"))
+check("tick verdict: one late reply in ten seconds is good", N.tick_verdict(N.tick_summary(late, 64), 64) == ("Good for Counter-Strike", "good"))
+def lates(n):
+    out = steady * 3
+    for i in range(n):
+        out[100 + 40 * i] = (out[100 + 40 * i][0], 1.2 + 16.0)
+    return N.tick_verdict(N.tick_summary(out, 64), 64)[1]
+check("tick verdict: late replies in thirty seconds, 1 excellent, 2 to 9 good, 10 to 38 fair, more bad", [lates(n) for n in (1, 2, 9, 10, 38, 39)] == ["excellent", "good", "good", "fair", "fair", "bad"], [lates(n) for n in (1, 2, 9, 10, 38, 39)])
 gap = list(steady)
 for i in (200, 201, 202):
     gap[i] = (gap[i][0], None)
-check("tick verdict: three lost in a row is bad even under 1% loss", N.tick_summary(gap, 64)["burst"] == 3 and N.tick_summary(gap, 64)["loss_pct"] < 1 and N.tick_verdict(N.tick_summary(gap, 64), 64)[1] == "bad")
+check("tick verdict: three lost in a row is bad even under 1% loss", N.tick_summary(gap, 64)["burst"] == 3 and N.tick_summary(gap, 64)["loss_pct"] < 1 and N.tick_verdict(N.tick_summary(gap, 64), 64) == ("Bad for Counter-Strike: lost in a row", "bad"))
 jittery = [(i / 64, 1.0 + (10.0 if i % 2 else 0)) for i in range(640)]
-check("tick verdict: jitter over half a tick is bad", N.tick_verdict(N.tick_summary(jittery, 64), 64)[1] == "bad")
+check("tick verdict, Claude settings: jitter over half a tick is bad", N.tick_verdict(N.tick_summary(jittery, 64), 64, True) == ("Bad for Counter-Strike: jitter", "bad"))
+check("tick verdict: jitter that makes no reply late does not lower the grade", N.tick_verdict(N.tick_summary(jittery, 64), 64) == ("Excellent for Counter-Strike", "excellent"))
+check("settings: Claude's tick settings are off until switched on", N.Settings(tempfile.mkdtemp()).get("tick_claude") is False)
 check("tick verdict: nothing back at all", N.tick_verdict(N.tick_summary([(i / 64, None) for i in range(64)], 64), 64) == ("No replies", "bad"))
 check("tick verdict: nothing sent yet", N.tick_verdict(N.tick_summary([], 64), 64)[1] == "wait")
 import time as _t
 rf = N.Reflector(0, "127.0.0.1"); rport = rf.sock.getsockname()[1]; rf.start()
 tt = N.TickTest("127.0.0.1", "127.0.0.1", rport, 128); tt.start(); _t.sleep(1.3); tt.stop(); _t.sleep(0.3)
 cn = tt.buf.counters()
+check("live run on loopback: the reflector reports its hold time, from the system's stamp on Linux", tt.buf.hold_mode == ("stamped" if N.IS_LINUX else "timed") and len(tt.buf.holds(0)) == cn["recv"] and max(tt.buf.holds(0)) < 50, (tt.buf.hold_mode, cn))
+rp = N.tick_reply(pk, 1234, True)
+check("tick reply: same size, same packet, hold time written in", len(rp) == len(pk) and N.parse_tick(rp) == (0xDEADBEEF, 41) and N.parse_tick_hold(rp) == (1.234, True) and N.parse_tick_hold(N.tick_reply(pk, -5, False)) == (0.0, False))
+check("tick reply: an old reflector's plain echo carries no hold time", N.parse_tick_hold(pk) is None and N.parse_tick_hold(b"PCC1") is None and N.tick_reply(b"PCC1short", 5, True) == b"PCC1short")
+check("hold summary: typical, longest, and how many were over a tick", N.hold_summary([0.2, 0.3, 0.4, 20.0], 64) == {"n": 4, "p50": 0.3, "max": 20.0, "over": 1} and N.hold_summary([], 64)["n"] == 0)
+tb3 = N.TickBuffer(); tb3.add_sent(1.0); tb3.add_sent(2.0); tb3.add_reply(0, 1.0, 0.5, True); tb3.add_reply(1, 1.0, 0.7, True)
+check("tick buffer: hold times kept with their packets", tb3.holds(0) == [0.5, 0.7] and tb3.holds(1.5) == [0.7] and tb3.hold_mode == "stamped" and tb3.samples(3.0) == [(1.0, 1.0), (2.0, 1.0)])
+tb3.add_sent(3.0); tb3.add_reply(2, 1.0)
+check("tick buffer: a reply with no hold time marks the reflector as an old one", tb3.hold_mode == "none")
+import threading as _th
+class SlowReflector(N.Reflector):
+    """Sits on every packet for 12 ms, as a busy machine would."""
+    def serve(self):
+        while not self.stop_ev.is_set():
+            try:
+                data, addr, came, stamped = N.recv_stamped(self.sock, self.stamped)
+            except OSError:
+                continue
+            _t.sleep(0.012)
+            self.sock.sendto(N.tick_reply(data, (_t.time_ns() - came) // 1000, stamped), addr)
+sr = SlowReflector(0, "127.0.0.1"); sr.start()
+st2 = N.TickTest("127.0.0.1", "127.0.0.1", sr.sock.getsockname()[1], 64); st2.start(); _t.sleep(1.5); st2.stop(); sr.stop(); _t.sleep(0.4)
+ssum = N.tick_summary(st2.buf.samples(_t.time() + 2), 64); hs = N.hold_summary(st2.buf.holds(0), 64)
+check("live run, slow reflector: its 12 ms is taken out and the network still reads as fast", hs["p50"] >= 12 and ssum["p50"] < 3 and ssum["late"] == 0, (ssum, hs))
 check("live run on loopback: about 128 a second, every packet back", 140 <= cn["sent"] <= 190 and cn["recv"] >= cn["sent"] - 2 and cn["dup"] == 0, cn)
 check("live run: reply times are sane and the reflector counted them", 0 < N.tick_summary(tt.buf.samples(_t.time() + 2), 128)["p50"] < 50 and rf.count >= cn["recv"] and "127.0.0.1" in rf.peers)
 junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); junk.settimeout(0.4); junk.sendto(b"not a test packet", ("127.0.0.1", rport))
