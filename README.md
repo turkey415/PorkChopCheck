@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Wire report (flow control, EEE, flooding, loud senders, conflicts, rogue routers), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -130,6 +130,28 @@ The graph is the same as on the Ping page, with port events marked under it, so 
 Then tap **Server**, enter that machine's address, and tap **Start**. The reflector listens on UDP port 27777; add a different port after the address if you started it with one, e.g. `--reflector 27015`. If nothing comes back, open that UDP port in the far machine's firewall (`sudo firewall-cmd --add-port=27777/udp` on Fedora and Nobara).
 
 The reflector answers only this test's packets, one reply for each, so it can't be used to amplify traffic. The test also shows how accurate this box's own send timing is, so you can tell network jitter from a busy tester.
+
+## Wire report
+
+**Tools › Wire report** is one page for the things that cause lag and odd behaviour but that no other page shows. It watches the whole time the app is open and gives a one-line verdict, such as `3 things worth a look`, with the details below. Everything it finds also goes on the event timeline, so it lines up with the Ping and Tick test graphs.
+
+| Section | What it tells you |
+|---|---|
+| **This adapter** | Whether flow control is on, and whether PAUSE frames are being counted (each one stops traffic for a moment). Whether Energy Efficient Ethernet is active (the link sleeps between packets and adds a wake-up delay). Whether the link came up slower than both ends offer, which usually means a bad cable. Whether the adapter's error counters are rising. |
+| **Flooding** | Traffic addressed to other machines arriving on this port. The switch is flooding: a spanning-tree change, a full MAC table, or a hub. |
+| **Loudest broadcast and multicast senders** | Which machines are filling the network, by MAC and maker, with their current rate. |
+| **Address conflicts** | Any IP address that has answered from two different MACs. |
+| **IPv6 routers** | Every machine advertising itself as an IPv6 router. More than one usually means a PC with internet sharing switched on. |
+| **Switch protocols heard** | LACP or PAgP (the switch expects a port-channel here), UDLD, VTP, loopback keepalives, and PAUSE frames seen on the wire. |
+| **Routing and MTU notices** | ICMP redirects (two routers, or a wrong gateway) and "fragmentation needed" replies (a smaller MTU somewhere along the path). |
+
+Good to know:
+- **This adapter** is read with `ethtool`, on Linux only for now. Which counters exist depends on the network card's driver.
+- Network cards usually act on PAUSE frames without passing them up, so the adapter's counters are the reliable sign; seeing one on the wire is a bonus.
+- On a normal switch port the report sees this box's traffic plus whatever the switch floods. It cannot see a conflict or a storm on a VLAN this port is not in.
+- On a Linux box that bridges virtual machines, traffic for those machines is not counted as flooding.
+- If more than 5,000 frames a second arrive that are not addressed to this box, the report stops counting for 30 seconds and says so. That is what a mirror port or a severe flood looks like.
+- **Restart** clears the report and starts counting again from now.
 
 ## Multicast browser
 
