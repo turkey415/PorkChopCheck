@@ -66,3 +66,17 @@ Demo-mode renders (`py portcheck.py --demo`). Fonts on a real Windows box are la
 ## Tests
 
 `python tests/test_pc_net.py` round-trips every packet decoder/builder (CDP, LLDP, DTP, STP, EAPOL, ARP, DHCP, mDNS, IPv6 RA) plus the port log. No hardware needed.
+
+## Contributing
+
+Pull requests are welcome! Good places to start:
+
+- **Linux port.** The packet engine (`pc_net.py`) is already cross-platform. The Windows-only pieces are the PowerShell queries, `ipconfig` renew, and `netsh` port finder in `portcheck.py`.
+- **More decoders.** Add them to `pc_net.classify()`, with a round-trip check in `tests/test_pc_net.py`.
+- **Bug reports from real switches.** A pcap of the frame that confused it is gold.
+
+Run `python tests/test_pc_net.py` before sending a PR.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
