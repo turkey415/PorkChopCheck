@@ -62,6 +62,12 @@ if N.IS_LINUX:
         up, spd = N.linux_link(ads[0]["name"])
         check("linux_link reads carrier", isinstance(up, bool) and spd >= 0, (up, spd))
     check("has_net_caps returns bool", isinstance(N.has_net_caps(), bool))
+    fl = N.linux_link_flags("lo")
+    check("link flags read in-process (lo is up + loopback)", fl & N.IFF_UP and fl & 0x8, hex(fl))
+    check("set_link on a missing interface is False, not an exception",
+          N.linux_set_link("pcc-no-such-if", True) is False)
+    if not N.has_net_caps():
+        check("set_link without the capability is False", N.linux_set_link("lo", True) is False)
 
 # --- a bridged NIC, laid out exactly like a Nobara box running VMs (enp14s0 enslaved to br0)
 import tempfile

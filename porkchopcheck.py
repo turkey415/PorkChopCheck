@@ -34,13 +34,22 @@ FROZEN = getattr(sys, "frozen", False)          # running as the PyInstaller .ex
 SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
 
 
+def _crash_log(text):
+    """Append to crash.log next to the app, or under ~/Documents/PorkChopCheck when the app
+    folder is read-only (the Linux install in /opt)."""
+    for d in (SCRIPT_DIR, os.path.join(os.path.expanduser("~"), "Documents", "PorkChopCheck")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "crash.log"), "a", encoding="utf-8") as f:
+                f.write(text)
+            return
+        except OSError:
+            continue
+
+
 def _fatal(msg):
     """Show a startup error even without a console (pythonw / .exe), and keep it in crash.log."""
-    try:
-        with open(os.path.join(SCRIPT_DIR, "crash.log"), "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n\n")
-    except OSError:
-        pass
+    _crash_log(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n\n")
     print(msg, file=sys.stderr)
     if sys.platform == "win32":
         try:
@@ -52,31 +61,49 @@ def _fatal(msg):
 
 
 def _use_private_python():
-    """Linux: if install-linux.sh made .venv next to this file, always run under that Python.
-    It has scapy and the capture permission; the system Python (e.g. double-clicking the
-    file) has neither."""
+    """Linux: an installed copy always runs through pcc-launch, which is the only thing holding
+    the capture permission (see linux/pcc-launch.c). Starting the file directly, e.g. by
+    double-clicking it, hands over to the launcher. A source checkout with a .venv next to it
+    runs under that Python instead, for scapy; it gets no capture permission that way."""
     if not sys.platform.startswith("linux") or FROZEN or "--no-venv" in sys.argv:
         return
+    if os.environ.get("PCC_LAUNCHED"):
+        return
+    launcher = os.path.join(SCRIPT_DIR, "pcc-launch")
+    if os.access(launcher, os.X_OK):
+        try:
+            os.execv(launcher, [launcher] + sys.argv[1:])
+        except OSError:
+            pass                      # fall through and run as-is; the L2 page will explain
     vpy = os.path.join(SCRIPT_DIR, ".venv", "bin", "python3")
     if os.path.exists(vpy) and os.path.realpath(sys.executable) != os.path.realpath(vpy):
         try:
             os.execv(vpy, [vpy, os.path.abspath(__file__)] + sys.argv[1:])
         except OSError:
-            pass                      # fall through and run as-is; the L2 page will explain
+            pass
+
+
+def _drop_ambient_caps():
+    """Linux: keep the capture and link capabilities in this process only. pcc-launch passes
+    them as ambient capabilities, which every program we start would otherwise inherit."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(47, 4, 0, 0, 0)   # PR_CAP_AMBIENT, CLEAR_ALL
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _use_private_python()
+_drop_ambient_caps()
 
 
 def log_error(what):
     """Append the current exception to crash.log without stopping the app."""
     import traceback
-    try:
-        with open(os.path.join(SCRIPT_DIR, "crash.log"), "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + what + f"  [python: {sys.executable}]\n"
-                    + traceback.format_exc() + "\n")
-    except OSError:
-        pass
+    _crash_log(time.strftime("%Y-%m-%d %H:%M:%S  ") + what + f"  [python: {sys.executable}]\n"
+               + traceback.format_exc() + "\n")
 
 
 try:

@@ -95,6 +95,16 @@ check("ports.csv sorted naturally", "Gi1/0/9" in lines[1] and "Gi1/0/10" in line
 hist = open(os.path.join(tmp, "history.csv"), encoding="utf-8-sig").read().splitlines()
 check("history rows", len(hist) == 4, len(hist))
 pl2 = N.PortLog(tmp); check("portlog reload", len(pl2.rows()) == 2)
+# a switch that names itself with a spreadsheet formula
+evil = dict(r, switch='=HYPERLINK("http://x","SW")', port="Gi1/0/1", label="@SUM(1+1)", model="-2+3", vlan="+1")
+pl.upsert(evil, manual=True)
+import csv as _csv
+for name in ("ports.csv", "history.csv"):
+    cells = [c for row in _csv.reader(open(os.path.join(tmp, name), encoding="utf-8-sig")) for c in row]
+    check(f"{name}: no cell starts a formula", not any(c and c[0] in "=+-@" for c in cells), [c for c in cells if c and c[0] in "=+-@"])
+    check(f"{name}: the text is kept, quoted", "'=HYPERLINK(\"http://x\",\"SW\")" in cells and "'@SUM(1+1)" in cells)
+check("csv_safe leaves ordinary values alone", N.csv_safe({"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"}) == {"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"})
+check("ports.json keeps the raw value", N.PortLog(tmp).label_for(evil) == "@SUM(1+1)")
 # Oui parsing
 p = os.path.join(tmp, "manuf"); open(p, "w").write("# c\n00:00:0C\tCisco\tCisco Systems, Inc\n00:1B:C5:00:00:00/36\tX\n")
 o = N.Oui(p); check("oui lookup", o.lookup("00:00:0c:07:ac:01") == "Cisco · HSRPv1 group 1", o.lookup("00:00:0c:07:ac:01"))

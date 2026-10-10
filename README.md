@@ -37,7 +37,11 @@ cd PorkChopCheck-*-linux
 
 Then launch **PorkChopCheck** from the app menu, or run `porkchopcheck`. On a small touchscreen, use `porkchopcheck --fullscreen`.
 
-The installer uses `dnf` to add Tk, libpcap, iproute, ethtool, and iperf3. It then creates a private Python for the app and gives *only that Python* permission to capture packets and bring the link up and down. You never run it as root. To remove it, run `./install-linux.sh --uninstall`.
+The installer uses `dnf` to add Tk, libpcap, iproute, ethtool, a C compiler, and iperf3. It copies the app to `/opt/porkchopcheck`, owned by root, and builds a small launcher there. *Only that launcher* gets permission to capture packets and bring the link up and down, and all it can do is start PorkChopCheck. You never run the app as root. To remove it, run `./install-linux.sh --uninstall`.
+
+Your port log, device inventory and settings live in `~/Documents/PorkChopCheck/data`. If you are upgrading from a beta that kept them next to the app, the installer copies them across.
+
+**Upgrading from v2.0.0-beta.1 to beta.4:** those versions gave the capture permission to a Python interpreter inside the unpacked folder, which any program on the machine could run. Running the new `./install-linux.sh` removes that permission from the old copies it finds. You can then delete the old `PorkChopCheck-*-linux` folders.
 
 On Linux the app reads link and IP details from `/sys`, `ip`, and NetworkManager (`nmcli`). Linux drivers usually pass VLAN tags and LLDP frames through, so trunk and LLDP detection tend to work even better than on Windows.
 
