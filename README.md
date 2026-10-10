@@ -2,8 +2,6 @@
 
 A great tool to check your network and ports on your network. CDP, LLDP, and so much more.
 
-Cooked up in a cast-iron dark theme with pork-pink accents. Status colors stay plain green, amber, and red, so a bad port never looks cute.
-
 
 Full-screen, big-text, touch-friendly switch-port tester for a small Windows 11 box.
 

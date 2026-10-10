@@ -63,19 +63,19 @@ def pick_data_dir():
 DATA_DIR = pick_data_dir()
 
 # ---------------------------------------------------------------- colors
-BG = "#16110f"        # cast-iron black
-PANEL = "#251c1a"     # seasoned skillet
-FG = "#f6ebe7"
-DIM = "#a8958f"
-GREEN = "#2e7d46"
-AMBER = "#a8620e"     # caramelized
-RED = "#b3261e"
-PINK = "#c4496b"      # pork pink (accent)
-GREY = "#3d302c"
-OK = "#5cc97a"
-WARN = "#f0b04c"
-BAD = "#ff6b5e"
-HDR = "#ff9fb2"       # light pink headers
+BG = "#0b0f14"
+PANEL = "#161b22"
+FG = "#e6edf3"
+DIM = "#8b949e"
+GREEN = "#238636"
+AMBER = "#9e6a03"
+RED = "#b62324"
+BLUE = "#1f6feb"
+GREY = "#30363d"
+OK = "#3fb950"
+WARN = "#e3b341"
+BAD = "#f85149"
+HDR = "#79c0ff"
 
 PENDING = "pending"
 
@@ -1523,7 +1523,7 @@ class ToolView(tk.Frame):
             side="left", padx=ui.pad)
         self.act = []
         for text, cmd in reversed(actions):
-            b = ui.button(hdr, text, cmd, ui.sz["small"], bg=PINK, padx=ui.pad)
+            b = ui.button(hdr, text, cmd, ui.sz["small"], bg=BLUE, padx=ui.pad)
             b.pack(side="right", padx=(ui.pad // 2, 0))
             self.act.insert(0, b)
         self.summary = tk.Label(self, text="", bg=BG, fg=FG, anchor="w",
@@ -1539,7 +1539,7 @@ class ToolView(tk.Frame):
         self.list.pack(fill="both", expand=True, pady=(ui.pad // 2, 0))
         self._sum = None
 
-    def set_action(self, i, text, bg=PINK):
+    def set_action(self, i, text, bg=BLUE):
         b = self.act[i]
         if b.cget("text") != text or b.cget("bg") != bg:
             b.config(text=text, bg=bg)
@@ -1667,7 +1667,7 @@ class UI:
         # banner (tap = next adapter)
         self.banner = tk.Frame(root, bg=GREY)
         self.banner.pack(side="top", fill="x")
-        self.b_big = tk.Label(self.banner, text="HEATING THE SKILLET…", bg=GREY, fg="white",
+        self.b_big = tk.Label(self.banner, text="STARTING", bg=GREY, fg="white",
                               font=self.font(self.sz["big"], "bold"))
         self.b_big.pack(fill="x", pady=(self.pad // 2, 0))
         self.b_sub = tk.Label(self.banner, text="", bg=GREY, fg="white", font=self.font(self.sz["sub"]))
@@ -1832,7 +1832,7 @@ class UI:
             b.grid(row=r, column=0, sticky="nsew", pady=self.pad // 4)
             self.set_btns[key] = b
         lst.columnconfigure(0, weight=1)
-        tk.Label(page, text=f"PorkChopCheck v{VERSION}  ·  github.com/turkey415/porkchopcheck  ·  oink",
+        tk.Label(page, text=f"PorkChopCheck v{VERSION}  ·  github.com/turkey415/porkchopcheck",
                  bg=BG, fg=DIM, font=self.font(self.sz["rowsm"])).pack(fill="x", pady=(self.pad // 2, 0))
 
     # ---------------------------------------------------------- navigation
@@ -1845,7 +1845,7 @@ class UI:
         self.cur = name
         active = name if name in self.MAIN else "TOOLS"
         for n, b in self.nav_btns.items():
-            b.config(bg=PINK if n == active else (GREEN if n == "SAVE" else PANEL))
+            b.config(bg=BLUE if n == active else (GREEN if n == "SAVE" else PANEL))
 
     def show_tools(self):
         self.show("TOOLS")
@@ -1978,7 +1978,7 @@ class UI:
         if not s["sel"]:
             color, big, sub = GREY, "NO ETHERNET ADAPTER", "Plug in a USB NIC or check drivers"
         elif s["blink"]["running"]:
-            color, big, sub = PINK, "PORT FINDER ON", "Watch the switch for the blinking LED"
+            color, big, sub = BLUE, "PORT FINDER ON", "Watch the switch for the blinking LED"
         elif up is None:
             color, big, sub = GREY, "CHECKING…", s["sel"]
         elif not up:
@@ -1996,7 +1996,7 @@ class UI:
                 color, big = AMBER, "WAITING FOR IP"
                 sub = f"Link {N.fmt_speed(s['speed_mbps'])}" + (f" · {waited:.0f}s" if waited else "")
         elif s["gw_ms"] == PENDING and gw:
-            color, big, sub = PINK, "TESTING…", f"{ip} · pinging gateway"
+            color, big, sub = BLUE, "TESTING…", f"{ip} · pinging gateway"
         elif gw and s["gw_ms"] is None:
             color, big, sub = AMBER, "GATEWAY NOT REPLYING", f"{ip} · wrong VLAN?"
         elif len(dhcp_servers(s)) > 1:
@@ -2169,7 +2169,7 @@ class UI:
     # ---------------------------------------------------------- tool renders
     def render_ping(self, s, v, now):
         p = s["ping"]
-        v.set_action(0, "Stop" if p["running"] else "Start", RED if p["running"] else PINK)
+        v.set_action(0, "Stop" if p["running"] else "Start", RED if p["running"] else BLUE)
         tgt = p["target"] or "(no address yet)"
         if p["sent"]:
             loss = 100 * (p["sent"] - p["recv"]) / p["sent"]
@@ -2206,7 +2206,7 @@ class UI:
 
     def render_trace(self, s, v, now):
         t = s["trace"]
-        v.set_action(0, "Stop" if t["running"] else "Run", RED if t["running"] else PINK)
+        v.set_action(0, "Stop" if t["running"] else "Run", RED if t["running"] else BLUE)
         state = "running…" if t["running"] else ("done" if t["hops"] else "tap Run")
         v.set_summary(f"{t['label']}: {t['target'] or '—'}", FG,
                       f"{state} · up to 20 hops, sourced from the Ethernet port")
@@ -2250,7 +2250,7 @@ class UI:
 
     def render_arpscan(self, s, v, now):
         a = s["arp_scan"]
-        v.set_action(0, "Stop" if a["running"] else "Scan", RED if a["running"] else PINK)
+        v.set_action(0, "Stop" if a["running"] else "Scan", RED if a["running"] else BLUE)
         found = a["found"]
         dups = {ip: m for ip, m in found.items() if len(m) > 1}
         if a["net"]:
@@ -2281,7 +2281,7 @@ class UI:
         m = self.be.mdns.snapshot()
         n_inst = len(m["inst"])
         n_dev = len(m["responders"])
-        v.set_action(0, "Scanning" if m["running"] else "Scan", GREY if m["running"] else PINK)
+        v.set_action(0, "Scanning" if m["running"] else "Scan", GREY if m["running"] else BLUE)
         if m["error"]:
             v.set_summary("mDNS error", BAD, m["error"])
         elif m["running"] and not n_inst:
@@ -2298,7 +2298,7 @@ class UI:
 
     def render_blink(self, s, v, now):
         b = s["blink"]
-        v.set_action(0, "Stop" if b["running"] else "Start", RED if b["running"] else PINK)
+        v.set_action(0, "Stop" if b["running"] else "Start", RED if b["running"] else BLUE)
         if b["running"]:
             v.set_summary(f"Blinking… {b['cycles']} cycles", WARN,
                           "The port LED goes dark ~1.5 s every 4.5 s. Tap Stop when you find it.")
@@ -2328,7 +2328,7 @@ class UI:
                     r.get("poe", ""), f"802.1X {r['dot1x']}" if r.get("dot1x") not in ("", "—", "Not detected") else ""]
             out.append(("  ·  ".join(b for b in bits if b), FG, "row"))
             out.append((f"last {r.get('last_seen', '')}  ·  first {r.get('first_seen', '')}", DIM, "dim"))
-        v.list.set_rows(out, "Nothing on the plate yet. Ports are logged automatically once CDP/LLDP names "
+        v.list.set_rows(out, "Nothing yet. Ports are logged automatically once CDP/LLDP names "
                              "the switch port, or tap SAVE to log one with a label.")
 
 
