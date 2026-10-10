@@ -50,6 +50,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time-to-IP (flags portfast off), internet |
 | **SWITCH** | CDP/LLDP: switch, port, data and voice VLAN, mgmt IP, model, PoE, negotiation |
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
+| **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
 | **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
@@ -59,6 +60,27 @@ The banner turns red or amber for: no link, duplicate IP, 802.1X with no access,
 ## Port log
 
 Every time CDP/LLDP names the switch and port, PorkChopCheck logs it automatically to `data/ports.csv`. That file keeps one row per switch+port and is updated to the latest result. Tap **SAVE** to add a label like "Room 204 jack B". Every save also goes to `data/history.csv`. Both open in Excel or LibreOffice.
+
+## Smart home discovery
+
+The **SMART** tab finds smart plugs, bulbs, speakers, TVs and streamers, cameras and doorbells, thermostats, locks, hubs and appliances, and documents them in `data/devices.csv`. That file is a running inventory: every device ever seen, with your labels, first-seen and last-seen times.
+
+How it finds them, all locally with no cloud logins:
+
+| Method | Finds |
+|---|---|
+| ARP sweep + reverse DNS + MAC vendor | every host, including cloud-only gadgets (Ring, Echo, Nest, Wyze…) by brand, IP and MAC |
+| SSDP / UPnP | Sonos, Philips Hue, Belkin WeMo, Roku, smart TVs; usually with **serial numbers** |
+| mDNS | Chromecast / Google Nest, HomeKit, AirPlay, ESPHome, WLED, Matter, printers |
+| TP-Link Kasa / Tapo (UDP 9999 + 20002) | name, model, device ID, MAC |
+| LIFX, Govee, WiZ, Yeelight, Tuya / Smart Life | model and device ID |
+| HTTP device info | Roku serial, Hue bridge ID, Shelly ID, Cast model |
+
+Good to know:
+- **Govee:** turn on *LAN Control* per device in the Govee app. **WiZ:** turn on *Allow local communication* in the WiZ app.
+- Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
+- Icons are generic device-type drawings, not brand logos.
+- Per-device throughput isn't shown. A normal switch port can't see other devices' traffic.
 
 ## Announcing itself
 
@@ -84,6 +106,8 @@ By default, PorkChopCheck sends LLDP and CDP every 30 s, so `show cdp neighbors`
 Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ![Main pages](docs/screenshots/main-pages.png)
+![Smart devices](docs/screenshots/smart.png)
+![Device details](docs/screenshots/smart-detail.png)
 ![Tools](docs/screenshots/tools.png)
 ![Save and settings](docs/screenshots/save-settings.png)
 
@@ -106,6 +130,7 @@ No hardware needed:
 ```bash
 python tests/test_pc_net.py   # every packet decoder/builder + the port log
 python tests/test_linux.py    # Linux parsers for ip / nmcli / ethtool / ping output
+python tests/test_smart.py    # smart-home protocols, AES, classification, device inventory
 ```
 
 ## Contributing
@@ -113,10 +138,11 @@ python tests/test_linux.py    # Linux parsers for ip / nmcli / ethtool / ping ou
 Pull requests are welcome! Good places to start:
 
 - **More decoders.** Add them to `pc_net.classify()`, with a round-trip check in `tests/test_pc_net.py`.
+- **More smart-home brands.** Add a regex to `BRANDS` in `pc_smart.py`, or a discovery method to `SmartScan`, with a test in `tests/test_smart.py`.
 - **More Linux distros.** The Linux layer lives at the bottom of `pc_net.py`, and `install-linux.sh` handles dnf and apt.
 - **Bug reports from real switches.** A pcap of the frame that confused it is gold.
 
-Run both test files before sending a PR.
+Run all three test files before sending a PR.
 
 ## License
 

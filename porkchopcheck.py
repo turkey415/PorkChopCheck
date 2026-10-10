@@ -6,6 +6,7 @@ Pages:  PORT    link, speed/duplex, IP, gateway, DHCP, DNS, time-to-IP, internet
         SWITCH  CDP/LLDP neighbor: switch, port, VLAN, voice VLAN, mgmt IP, model, PoE
         L2      802.1X, spanning tree, trunk/DTP, DHCP servers, phone options, gateway MAC,
                 IPv6, broadcast rate
+        SMART   every smart-home device on the network: brand, type, model, serial, IP, MAC
         STATS   MAC, adapter, errors, discards, throughput, link drops
         TOOLS   ping, traceroute, speed test (iperf3 / internet), ARP table, ARP scan,
                 mDNS browser, port finder, port log, re-run checks, settings
@@ -63,8 +64,9 @@ except ImportError:
 
 try:
     import pc_net as N
+    import pc_smart as S
 except Exception as e:  # noqa: BLE001
-    _fatal("PorkChopCheck couldn't load pc_net.py. Keep pc_net.py in the same folder as "
+    _fatal("PorkChopCheck couldn't load pc_net.py / pc_smart.py. Keep them in the same folder as "
            "porkchopcheck.py.\n\n" + repr(e))
 
 IS_WIN = N.IS_WIN
@@ -179,6 +181,7 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.smart = {"running": False, "stage": "", "devices": [], "ts": None, "counts": {}}
         self.reset_adapter()
 
     def reset_adapter(self):
@@ -455,6 +458,7 @@ class Backend:
         self.last_sig = None
         self.last_log = 0.0
         self.oui_tried = False
+        self.devstore = S.DeviceStore(DATA_DIR)
 
     # ---------------------------------------------------------- lifecycle
     def start(self):
@@ -1314,6 +1318,60 @@ class Backend:
             return
         threading.Thread(target=self._mdns_scan, args=(src,), daemon=True).start()
 
+    # ---------------------------------------------------------- smart-home discovery
+    def smart_scan_toggle(self):
+        with self.st.lock:
+            running = self.st.smart["running"]
+            ip, mask, mac, name = self.st.ipv4, self.st.mask, self.my_mac(), self.st.sel
+        if running:
+            self.stops["smart"].set()
+            return
+        if not ip or not mask or ip.startswith("169.254."):
+            self.st.say("Need an IP address to scan", 3)
+            return
+        ev = self._new_stop("smart")
+        threading.Thread(target=self._smart_scan, args=(ev, ip, mask, mac, name), daemon=True).start()
+
+    def _smart_progress(self, text):
+        with self.st.lock:
+            self.st.smart["stage"] = text
+
+    def _smart_scan(self, ev, ip, mask, mac, name):
+        with self.st.lock:
+            self.st.smart.update(running=True, stage="Starting…")
+        try:
+            def mdns_fn():
+                self._mdns_scan(ip)
+                return self.mdns.snapshot()
+            scan = S.SmartScan(ip, mask, mac, self.oui, lambda: self._arp_table(name), mdns_fn,
+                               self._smart_progress)
+            devs = scan.run(ev)
+            self._smart_store(devs, scan.counts)
+        except Exception as e:  # noqa: BLE001
+            self.st.say(f"Scan error: {e}"[:70], 6)
+        finally:
+            with self.st.lock:
+                self.st.smart["running"] = False
+
+    def _smart_store(self, devs, counts):
+        for d in devs:
+            d["key"] = S.DeviceStore.key(d)
+        _, err = self.devstore.merge(devs)
+        for d in devs:
+            d["label"] = self.devstore.label(d["key"])
+        with self.st.lock:
+            self.st.smart.update(devices=devs, ts=time.time(), counts=dict(counts))
+        n = sum(1 for d in devs if d.get("smart"))
+        self.st.say(err or f"Found {n} smart devices ({len(devs)} hosts) — saved to devices.csv", 5)
+
+    def set_device_label(self, key, label):
+        err = self.devstore.set_label(key, label)
+        with self.st.lock:
+            for d in self.st.smart["devices"]:
+                if d.get("key") == key:
+                    d["label"] = label
+        self.st.say(err or (f"Labelled: {label}" if label else "Label cleared"), 3)
+
     # ---------------------------------------------------------- port finder
     def blink_toggle(self):
         with self.st.lock:
@@ -1496,8 +1554,285 @@ class DemoBackend(Backend):
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
 
+    def smart_scan_toggle(self):
+        def work():
+            with self.st.lock:
+                self.st.smart.update(running=True)
+            for stage in ("Waking up every host on the subnet…", "Asking devices to identify themselves…",
+                          "Fetching device details (Roku, Hue, Shelly, Cast)…"):
+                self._smart_progress(stage)
+                time.sleep(0.4)
+            raw = [
+                dict(ip="10.20.30.21", mac="d8:31:34:aa:bb:cc", name="Den TV", model="Roku Ultra",
+                     serial="YH00AB123456", serial_source="Roku ECP", brand="Roku", category="tv", sources=["SSDP", "Roku"]),
+                dict(ip="10.20.30.70", mac="48:a6:b8:c1:d2:e3", name="Lobby", model="Sonos Era 100 S39",
+                     serial="48-A6-B8-C1-D2-E3:A", serial_source="UPnP", brand_hint="Sonos, Inc.", sources=["SSDP", "UPnP"]),
+                dict(ip="10.20.30.15", mac="ec:b5:fa:12:34:56", name="Hue Bridge", model="Hue Bridge BSB002",
+                     serial="ECB5FAFFFE123456", serial_source="Hue bridge ID", brand="Philips Hue", category="hub",
+                     sources=["SSDP", "Hue"]),
+                dict(ip="10.20.30.40", mac="1c:3b:f3:11:22:33", name="Coffee maker", model="HS103(US)",
+                     serial="8006ABCDEF0123456789", serial_source="Kasa device ID", brand="TP-Link Kasa / Tapo",
+                     category="plug", sources=["Kasa"]),
+                dict(ip="10.20.30.81", mac="5c:62:8b:aa:bb:cc", model="L530E(US)", serial="802A1B2C",
+                     serial_source="TP-Link device ID", brand="TP-Link Kasa / Tapo", category="light", sources=["Kasa"]),
+                dict(ip="10.20.30.33", mac="44:00:49:11:22:33", hostname="echo-dot-kitchen",
+                     vendor="Amazon Technologies Inc.", sources=["ARP", "DNS"]),
+                dict(ip="10.20.30.34", mac="9c:76:13:aa:01:02", hostname="ring-front-door", vendor="Ring LLC",
+                     sources=["ARP", "DNS"]),
+                dict(ip="10.20.30.50", mac="18:b4:30:12:ab:cd", name="Hallway thermostat", vendor="Nest Labs Inc.",
+                     sources=["ARP", "mDNS"]),
+                dict(ip="10.20.30.61", mac="f4:f5:d8:01:02:03", name="Conf Room Display", model="Chromecast",
+                     brand_hint="Google", mdns_types=["_googlecast._tcp.local"], sources=["mDNS", "Cast"]),
+                dict(ip="10.20.30.90", name="Office lights", model="Govee H6163", serial="1F:80:C5:32:32:36:72:4E",
+                     serial_source="Govee device ID", brand="Govee", category="light", sources=["Govee"]),
+                dict(ip="10.20.30.44", mac="44:17:93:a1:b2:c3", model="Shelly Plus1PM",
+                     serial="shellyplus1pm-441793a1b2c3", serial_source="Shelly ID", brand="Shelly", category="plug",
+                     sources=["Shelly"]),
+                dict(ip="10.20.30.55", mac="2c:aa:8e:01:02:03", hostname="wyze-cam-garage", vendor="Wyze Labs Inc",
+                     ports=[554], sources=["ARP", "Ports"]),
+                dict(ip="10.20.30.20", mac="a0:d3:c1:44:55:66", name="HP LaserJet 4th Floor", model="HP LaserJet M404",
+                     mdns_types=["_ipp._tcp.local"], vendor="Hewlett Packard", sources=["mDNS"]),
+                dict(ip="10.20.30.9", mac="f8:bc:12:9a:8b:7c", hostname="desktop-7h2k", vendor="Dell Inc.",
+                     sources=["ARP", "DNS"]),
+            ]
+            devs = [S.classify(d) for d in raw]
+            self._smart_store(devs, {"SSDP": 3, "UPnP": 1, "Kasa": 2, "mDNS": 3, "Govee": 1, "Shelly": 1,
+                                     "Roku": 1, "Hue": 1, "ARP": 6, "DNS": 4})
+            self._smart_progress("Done in 18s")
+            with self.st.lock:
+                self.st.smart["running"] = False
+        threading.Thread(target=work, daemon=True).start()
+
 
 # ================================================================ UI widgets
+CAT_COLORS = {"light": "#e3b341", "plug": "#3fb950", "speaker": "#a371f7", "tv": "#58a6ff",
+              "camera": "#f85149", "thermostat": "#ff9e64", "hub": "#79c0ff", "lock": "#d29922",
+              "sensor": "#56d4dd", "appliance": "#db61a2", "iot": "#7ee787", "printer": "#8b949e",
+              "console": "#bc8cff", "computer": "#8b949e", "phone": "#8b949e", "network": "#2f81f7",
+              "unknown": "#6e7681"}
+
+
+def draw_icon(c, cat, x, y, s):
+    """Generic device-type icons drawn from simple shapes (no brand logos)."""
+    col = CAT_COLORS.get(cat, CAT_COLORS["unknown"])
+    w = max(2, int(s / 16))
+    c.create_rectangle(x, y, x + s, y + s, fill="#0d1117", outline="#30363d")
+
+    def P(*pts):
+        return [x + v * s if i % 2 == 0 else y + v * s for i, v in enumerate(pts)]
+    line = dict(fill=col, width=w, capstyle="round")
+    shape = dict(outline=col, width=w)
+    if cat == "light":
+        c.create_oval(*P(.28, .12, .72, .56), **shape)
+        c.create_rectangle(*P(.4, .56, .6, .72), **shape)
+        c.create_line(*P(.42, .8, .58, .8), **line)
+    elif cat == "plug":
+        c.create_rectangle(*P(.22, .18, .78, .82), **shape)
+        c.create_line(*P(.4, .36, .4, .5), **line)
+        c.create_line(*P(.6, .36, .6, .5), **line)
+        c.create_oval(*P(.45, .6, .55, .7), **shape)
+    elif cat == "speaker":
+        c.create_rectangle(*P(.26, .1, .74, .9), **shape)
+        c.create_oval(*P(.35, .45, .65, .75), **shape)
+        c.create_oval(*P(.44, .2, .56, .32), **shape)
+    elif cat == "tv":
+        c.create_rectangle(*P(.1, .2, .9, .7), **shape)
+        c.create_line(*P(.5, .7, .5, .82), **line)
+        c.create_line(*P(.32, .84, .68, .84), **line)
+    elif cat == "camera":
+        c.create_rectangle(*P(.12, .32, .66, .7), **shape)
+        c.create_polygon(*P(.66, .44, .88, .32, .88, .7, .66, .58), fill="", **shape)
+        c.create_oval(*P(.26, .42, .42, .58), **shape)
+    elif cat == "thermostat":
+        c.create_oval(*P(.14, .14, .86, .86), **shape)
+        c.create_arc(*P(.28, .28, .72, .72), start=220, extent=-260, style="arc", **shape)
+        c.create_oval(*P(.46, .46, .54, .54), fill=col, outline=col)
+    elif cat == "hub":
+        c.create_rectangle(*P(.2, .52, .8, .84), **shape)
+        for r in (.14, .26):
+            c.create_arc(*P(.5 - r, .5 - r, .5 + r, .5 + r), start=45, extent=90, style="arc", **shape)
+    elif cat == "lock":
+        c.create_rectangle(*P(.24, .46, .76, .86), **shape)
+        c.create_arc(*P(.33, .16, .67, .62), start=0, extent=180, style="arc", **shape)
+        c.create_oval(*P(.46, .58, .54, .66), fill=col, outline=col)
+    elif cat == "sensor":
+        c.create_oval(*P(.4, .4, .6, .6), fill=col, outline=col)
+        for r in (.2, .32):
+            c.create_arc(*P(.5 - r, .5 - r, .5 + r, .5 + r), start=-40, extent=80, style="arc", **shape)
+            c.create_arc(*P(.5 - r, .5 - r, .5 + r, .5 + r), start=140, extent=80, style="arc", **shape)
+    elif cat == "appliance":
+        c.create_oval(*P(.14, .14, .86, .86), **shape)
+        c.create_oval(*P(.38, .38, .62, .62), **shape)
+    elif cat == "printer":
+        c.create_rectangle(*P(.12, .38, .88, .7), **shape)
+        c.create_rectangle(*P(.3, .14, .7, .38), **shape)
+        c.create_rectangle(*P(.3, .62, .7, .86), **shape)
+    elif cat == "console":
+        c.create_rectangle(*P(.1, .34, .9, .7), **shape)
+        c.create_line(*P(.24, .52, .4, .52), **line)
+        c.create_line(*P(.32, .44, .32, .6), **line)
+        c.create_oval(*P(.62, .44, .7, .52), fill=col, outline=col)
+        c.create_oval(*P(.72, .52, .8, .6), fill=col, outline=col)
+    elif cat == "computer":
+        c.create_rectangle(*P(.12, .16, .88, .64), **shape)
+        c.create_line(*P(.5, .64, .5, .8), **line)
+        c.create_line(*P(.3, .82, .7, .82), **line)
+    elif cat == "phone":
+        c.create_rectangle(*P(.32, .1, .68, .9), **shape)
+        c.create_line(*P(.45, .8, .55, .8), **line)
+    elif cat == "network":
+        c.create_rectangle(*P(.12, .52, .88, .8), **shape)
+        c.create_line(*P(.28, .52, .2, .2), **line)
+        c.create_line(*P(.72, .52, .8, .2), **line)
+        for fx in (.3, .45, .6):
+            c.create_oval(*P(fx, .63, fx + .06, .69), fill=col, outline=col)
+    else:                                                      # iot / unknown: a chip
+        c.create_rectangle(*P(.28, .28, .72, .72), **shape)
+        for f in (.38, .5, .62):
+            c.create_line(*P(f, .14, f, .28), **line)
+            c.create_line(*P(f, .72, f, .86), **line)
+            c.create_line(*P(.14, f, .28, f), **line)
+            c.create_line(*P(.72, f, .86, f), **line)
+
+
+def device_title(d):
+    return d.get("label") or d.get("name") or d.get("hostname") or d.get("model") or d.get("ip", "")
+
+
+class DeviceList(tk.Canvas):
+    """Scrollable list of devices with icons. Drag to scroll, tap a row for details."""
+
+    def __init__(self, master, ui, on_tap):
+        super().__init__(master, bg=PANEL, highlightthickness=0, yscrollincrement=8)
+        self.ui, self.on_tap = ui, on_tap
+        self.items, self._sig, self._empty, self._py = [], None, "", 0
+        self.row_h = ui.sz["row"] + 2 * ui.sz["rowsm"] + 14 + 2 * ui.pad
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", lambda e: self.scan_dragto(0, e.y, gain=1))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<MouseWheel>", lambda e: self.yview_scroll(int(-e.delta / 120) * 4, "units"))
+        self.bind("<Configure>", lambda e: self.redraw())
+
+    def _press(self, e):
+        self._py = e.y
+        self.scan_mark(0, e.y)
+
+    def _release(self, e):
+        if abs(e.y - self._py) < 10 and self.ui._moved(e) < self.ui.W * 0.04:
+            i = int(self.canvasy(e.y) // self.row_h)
+            if 0 <= i < len(self.items):
+                self.on_tap(self.items[i])
+
+    def set_items(self, items, empty=""):
+        sig = tuple((d.get("key"), d.get("label"), d.get("name"), d.get("model"), d.get("serial"), d.get("ip"),
+                     d.get("mac"), d.get("brand"), d.get("category")) for d in items)
+        if sig == self._sig and empty == self._empty:
+            return
+        self.items, self._sig, self._empty = items, sig, empty
+        self.redraw()
+
+    def redraw(self):
+        w = self.winfo_width()
+        if w < 20:
+            return
+        top = self.yview()[0]
+        self.delete("all")
+        ui, pad, rh = self.ui, self.ui.pad, self.row_h
+        ic = rh - 2 * pad
+        if not self.items:
+            self.create_text(pad, pad, anchor="nw", text=self._empty, fill=DIM,
+                             font=ui.font(ui.sz["row"]), width=w - 2 * pad)
+        for i, d in enumerate(self.items):
+            y = i * rh
+            if i:
+                self.create_line(pad, y, w - pad, y, fill=BG, width=2)
+            cat = d.get("category", "unknown")
+            draw_icon(self, cat, pad, y + pad, ic)
+            x = 2 * pad + ic
+            brand = (d.get("brand") or "")[:24]
+            self.create_text(w - pad, y + pad, anchor="ne", text=brand, fill=CAT_COLORS.get(cat, DIM),
+                             font=ui.font(ui.sz["rowsm"], "bold"))
+            room = max(10, (w - x - pad - ui.font(ui.sz["rowsm"], "bold").measure(brand) - pad)
+                       // max(1, ui.font(ui.sz["row"], "bold").measure("M")))
+            title = device_title(d)
+            self.create_text(x, y + pad, anchor="nw", text=title[:room], fill=FG,
+                             font=ui.font(ui.sz["row"], "bold"))
+            line2 = "  ·  ".join(b for b in (S.CATEGORIES.get(cat, ""), d.get("model", ""),
+                                             f"SN {d['serial']}" if d.get("serial") else "") if b)
+            self.create_text(x, y + pad + ui.sz["row"] + 4, anchor="nw", text=line2, fill=DIM,
+                             font=ui.font(ui.sz["rowsm"]))
+            self.create_text(x, y + pad + ui.sz["row"] + ui.sz["rowsm"] + 9, anchor="nw",
+                             text=f"{d.get('ip', ''):<16}{d.get('mac') or 'MAC not seen'}", fill=FG,
+                             font=ui.mono(ui.sz["rowsm"]))
+        h = max(len(self.items) * rh, self.winfo_height())
+        self.configure(scrollregion=(0, 0, w, h))
+        self.yview_moveto(top)
+
+
+class DeviceDetail(tk.Frame):
+    """Full-screen card with everything known about one device."""
+
+    def __init__(self, ui, d):
+        super().__init__(ui.root, bg=BG)
+        self.ui, self.d = ui, d
+        pad = ui.pad
+        self.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.lift()
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x", padx=pad, pady=pad)
+        isz = int(ui.H * 0.11)
+        icon = tk.Canvas(hdr, width=isz, height=isz, bg=BG, highlightthickness=0)
+        icon.pack(side="left")
+        draw_icon(icon, d.get("category", "unknown"), 1, 1, isz - 2)
+        ui.button(hdr, "Close", self.close, ui.sz["small"], bg=GREY, padx=pad * 2).pack(side="right")
+        ui.button(hdr, "Label", self.relabel, ui.sz["small"], bg=BLUE, padx=pad * 2).pack(
+            side="right", padx=(0, pad // 2))
+        titles = tk.Frame(hdr, bg=BG)
+        titles.pack(side="left", fill="x", expand=True, padx=pad)
+        tk.Label(titles, text=device_title(d), bg=BG, fg=FG, anchor="w",
+                 font=ui.font(ui.sz["sub"], "bold")).pack(fill="x")
+        tk.Label(titles, text=f"{d.get('brand', '')}  ·  {S.CATEGORIES.get(d.get('category', ''), '')}",
+                 bg=BG, fg=CAT_COLORS.get(d.get("category"), DIM), anchor="w",
+                 font=ui.font(ui.sz["small"], "bold")).pack(fill="x")
+        serial = d.get("serial") or ""
+        rows = [
+            ("Label", d.get("label") or "(tap Label to add one)"),
+            ("Name", d.get("name", "")), ("Model", d.get("model", "")),
+            ("Serial / ID", f"{serial}   ({d.get('serial_source', '')})" if serial else "not published by this device"),
+            ("IP address", d.get("ip", "")), ("MAC address", d.get("mac") or "not seen"),
+            ("MAC vendor", d.get("vendor", "")), ("Hostname", d.get("hostname", "")),
+            ("Firmware", d.get("fw", "")),
+            ("Open ports", " ".join(map(str, d.get("ports", [])))),
+            ("Services", ", ".join(t.replace(".local", "") for t in d.get("mdns_types", []))),
+            ("Found via", ", ".join(d.get("sources", []))),
+            ("Smart home", "yes" if d.get("smart") else "no"),
+        ]
+        lst = ListView(self, ui)
+        lst.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+        out = []
+        for k, v in rows:
+            if v:
+                out.append((k.upper(), DIM, "dim"))
+                out.append((str(v), FG, "row"))
+        lst.set_rows(out)
+        ui.overlay = self
+
+    def relabel(self):
+        key, d = self.d.get("key"), self.d
+        self.close()
+        Keyboard(self.ui, f"Label for {device_title(d)}", d.get("label", ""),
+                 lambda v: self.ui.be.set_device_label(key, v),
+                 "Saved to devices.csv, e.g. 'Garage camera' or 'Room 204 TV'. Leave empty to clear.")
+
+    def close(self):
+        self.ui.overlay = None
+        self.destroy()
+
+    def key(self, e):
+        if e.keysym in ("Escape", "Return"):
+            self.close()
+
+
 class Tile(tk.Frame):
     def __init__(self, master, ui, title):
         super().__init__(master, bg=PANEL)
@@ -1706,7 +2041,7 @@ class Keyboard(tk.Frame):
 
 # ================================================================ UI
 class UI:
-    MAIN = ("PORT", "SWITCH", "L2", "STATS", "TOOLS")
+    MAIN = ("PORT", "SWITCH", "L2", "SMART", "STATS", "TOOLS")
 
     def __init__(self, root, st, be, size):
         self.root, self.st, self.be = root, st, be
@@ -1778,6 +2113,7 @@ class UI:
             actions.columnconfigure(i, weight=1, uniform="act")
             self.button(actions, label, cmd, self.sz["small"], bg=GREY).grid(
                 row=0, column=i, sticky="nsew", padx=self.pad // 3)
+        self.build_smart()
         self.build_tools_grid()
         self.tools = {
             "ping": ToolView(self.body, self, "Ping", [("Start", self.be.ping_toggle),
@@ -1854,6 +2190,76 @@ class UI:
             t.grid(row=i // 2, column=i % 2, sticky="nsew",
                    padx=(0, self.pad // 3) if i % 2 == 0 else (self.pad // 3, 0), pady=self.pad // 3)
             self.tiles[(name, title)] = t
+
+    def build_smart(self):
+        page = tk.Frame(self.body, bg=BG)
+        self.views["SMART"] = page
+        self.sm_filter, self.sm_all = "", False
+        hdr = tk.Frame(page, bg=BG)
+        hdr.pack(fill="x")
+        self.sm_summary = tk.Label(hdr, text="", bg=BG, fg=FG, anchor="w", font=self.font(self.sz["sub"], "bold"))
+        self.sm_summary.pack(side="left", fill="x", expand=True)
+        self.sm_btns = {}
+        for key, text, cmd in (("scan", "Scan", self.be.smart_scan_toggle), ("search", "Search", self.smart_search),
+                               ("all", "Smart only", self.smart_toggle_all), ("folder", "Folder", self.open_data)):
+            b = self.button(hdr, text, cmd, self.sz["small"], bg=BLUE if key == "scan" else GREY, padx=self.pad)
+            b.pack(side="left", padx=(self.pad // 2, 0))
+            self.sm_btns[key] = b
+        self.sm_sub = tk.Label(page, text="", bg=BG, fg=DIM, anchor="w", font=self.font(self.sz["small"]))
+        self.sm_sub.pack(fill="x")
+        self.sm_list = DeviceList(page, self, lambda d: DeviceDetail(self, d))
+        self.sm_list.pack(fill="both", expand=True, pady=(self.pad // 3, 0))
+
+    def smart_search(self):
+        Keyboard(self, "Search devices", self.sm_filter, lambda v: setattr(self, "sm_filter", v),
+                 "Matches label, name, brand, type, model, serial, IP or MAC. Leave empty to show everything.")
+
+    def smart_toggle_all(self):
+        self.sm_all = not self.sm_all
+
+    def render_smart(self, s):
+        sm = s["smart"]
+        devs = sm["devices"]
+        smart = [d for d in devs if d.get("smart")]
+        shown = devs if self.sm_all else smart
+        if self.sm_filter:
+            q = self.sm_filter.lower()
+            shown = [d for d in shown if q in " ".join(str(d.get(k, "")) for k in (
+                "label", "name", "brand", "model", "serial", "ip", "mac", "hostname", "vendor")).lower()
+                or q in S.CATEGORIES.get(d.get("category"), "").lower()]
+        shown = sorted(shown, key=lambda d: (not d.get("smart"), d.get("category", ""), d.get("brand", "").lower(),
+                                             device_title(d).lower()))
+        b = self.sm_btns
+        b["scan"].config(text="Stop" if sm["running"] else "Scan", bg=RED if sm["running"] else BLUE)
+        b["all"].config(text="All hosts" if self.sm_all else "Smart only")
+        b["search"].config(text=f"Search: {self.sm_filter[:10]}" if self.sm_filter else "Search",
+                           bg=BLUE if self.sm_filter else GREY)
+        if devs:
+            brands = len({d.get("brand") for d in smart if d.get("brand")})
+            summ = f"{len(smart)} smart devices · {brands} brands"
+            if self.sm_all:
+                summ += f" · {len(devs)} hosts"
+        else:
+            summ = "Smart home devices"
+        self.fit(self.sm_summary, summ, self.sz["sub"], max(50, self.sm_summary.winfo_width()), FG)
+        if sm["running"]:
+            sub, col = sm["stage"], WARN
+        elif sm["ts"]:
+            top = sorted(sm["counts"].items(), key=lambda kv: -kv[1])[:5]
+            via = ", ".join(f"{k} {v}" for k, v in top)
+            sub = (f"Scanned {time.strftime('%H:%M', time.localtime(sm['ts']))} · showing {len(shown)}"
+                   + (f" · via {via}" if via else "") + " · tap a device for details")
+            col = DIM
+        else:
+            sub, col = "Tap Scan — takes about 20 seconds", DIM
+        if self.sm_sub.cget("text") != sub:
+            self.sm_sub.config(text=sub, fg=col)
+        empty = ("No devices match that search." if devs else
+                 "Tap Scan to find smart plugs, bulbs, speakers, TVs, cameras, thermostats and hubs.\n\n"
+                 "Tips: Govee needs 'LAN Control' and WiZ needs 'Allow local communication' turned on in "
+                 "their apps. Cloud-only gadgets still show up by brand, IP and MAC. Results are saved to "
+                 "devices.csv.")
+        self.sm_list.set_items(shown, empty)
 
     def build_tools_grid(self):
         page = tk.Frame(self.body, bg=BG)
@@ -1992,7 +2398,7 @@ class UI:
                 self.root.attributes("-fullscreen", False)
         elif e.keysym in ("Left", "Right") and self.cur in self.MAIN:
             self.step(-1 if e.keysym == "Left" else 1)
-        elif ch in "12345" and ch:
+        elif ch in "123456" and ch:
             self.show(self.MAIN[int(ch) - 1])
         elif ch == "s":
             self.open_save()
@@ -2028,6 +2434,8 @@ class UI:
             self.render_l2(s, now)
         elif self.cur == "STATS":
             self.render_stats(s)
+        elif self.cur == "SMART":
+            self.render_smart(s)
         elif self.cur == "settings":
             self.render_settings()
         elif self.cur in self.tools:

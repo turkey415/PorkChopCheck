@@ -727,6 +727,8 @@ FRIENDLY = {
     "_amzn-wplay._tcp.local": "Amazon Fire/Echo", "_androidtvremote2._tcp.local": "Android TV",
     "_rdlink._tcp.local": "Apple remote", "_touch-able._tcp.local": "Apple remote",
     "_esphomelib._tcp.local": "ESPHome", "_hue._tcp.local": "Philips Hue",
+    "_wled._tcp.local": "WLED", "_nanoleafapi._tcp.local": "Nanoleaf", "_elg._tcp.local": "Elgato light",
+    "_shelly._tcp.local": "Shelly", "_tuya._tcp.local": "Tuya",
 }
 COMMON_TYPES = sorted(FRIENDLY)
 
@@ -1111,7 +1113,7 @@ class Oui:
         self.load()
 
     def load(self):
-        m = {}
+        m, longm = {}, {}
         try:
             with open(self.path, encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -1120,15 +1122,21 @@ class Oui:
                     parts = line.rstrip("\n").split("\t")
                     if len(parts) >= 2 and len(parts[0]) == 8:
                         m[parts[0].lower()] = parts[1].strip()
+                        if len(parts) >= 3 and parts[2].strip():
+                            longm[parts[0].lower()] = parts[2].strip()
         except OSError:
             pass
-        self.map = m
+        self.map, self.long = m, longm
 
     def available(self):
         return bool(self.map)
 
     def vendor(self, mac):
         return self.map.get(norm_mac(mac)[:8], "")
+
+    def vendor_long(self, mac):
+        k = norm_mac(mac)[:8]
+        return self.long.get(k) or self.map.get(k, "")
 
     def lookup(self, mac):
         bits = [b for b in (self.vendor(mac), mac_kind(mac)) if b]
