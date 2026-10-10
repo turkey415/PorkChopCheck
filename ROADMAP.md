@@ -35,6 +35,8 @@ Small tools that come up all the time:
 ## Ideas parking lot
 
 Not committed to, but worth thinking about:
+- Cable test from the wire report (pair lengths and faults), on network cards that support it
+- Flow control, EEE and error counters on Windows
 - IPv6 multicast (MLD) in the multicast browser
 - Read port configuration from the switch over SNMP (description, VLANs, errors)
 - Per-device throughput in a "mirror port" mode, when plugged into a SPAN port
@@ -43,6 +45,9 @@ Not committed to, but worth thinking about:
 
 ## Already shipped
 
+- **Wire report:** flow control and PAUSE counters, Energy Efficient Ethernet, speed downshift, flooding, loudest senders, IP conflicts, IPv6 routers, LACP/UDLD/VTP, ICMP redirects and MTU notices.
+- **Tick test:** UDP at 64 or 128 packets a second to a reflector (`porkchopcheck --reflector`), reporting loss bursts, jitter, late and out-of-order packets.
+- **Event timeline:** the Ping graph marks link, spanning-tree, gateway, broadcast, duplicate-IP and DHCP events and says what each did to latency.
 - **Multicast browser:** Tools › Multicast lists live groups with names and rates, finds the IGMP querier, and has a join test.
 - **Open services on smart devices:** a Ports button on each device checks 35 common services and names them; saved to `devices.csv`.
 - **Capture to file:** Tools › Capture records 30 s, 60 s or 5 min to a `.pcap` in the data folder.

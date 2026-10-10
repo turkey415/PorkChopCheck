@@ -6,6 +6,7 @@ ICMP ping + traceroute, iperf3 / HTTP speed tests, MAC vendor lookup, port log, 
 No GUI code in here, so it can be tested on any OS.
 """
 
+import collections
 import csv
 import ctypes
 import http.client
@@ -19,6 +20,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -189,7 +191,11 @@ DHCP_MAGIC = b"\x63\x82\x53\x63"
 BPF = ("ether dst 01:00:0c:cc:cc:cc or ether dst 01:00:0c:cc:cc:cd or ether dst 01:80:c2:00:00:00"
        " or ether proto 0x88cc or ether proto 0x888e or arp"
        " or (udp and (port 67 or port 68 or port 5353))"
-       " or (icmp6 and ip6[40] == 134) or vlan")
+       " or (icmp6 and ip6[40] == 134) or vlan"
+       # slow protocols (LACP), MAC control (PAUSE), Cisco loopback keepalive, and the two ICMP
+       # messages that give away a routing or MTU problem: redirect, and fragmentation needed
+       " or ether proto 0x8809 or ether proto 0x8808 or ether proto 0x9000"
+       " or (icmp and (icmp[0] == 5 or (icmp[0] == 3 and icmp[1] == 4)))")
 
 MAU = {10: "10BASE-T HD", 11: "10BASE-T FD", 15: "100BASE-TX HD", 16: "100BASE-TX FD",
        29: "1000BASE-T HD", 30: "1000BASE-T FD"}
@@ -229,6 +235,12 @@ def classify(raw):
     elif et == 0x0800:
         for k, i in parse_ipv4(p):
             add(k, i)
+    elif et == 0x8809:
+        add("LACP", parse_lacp(p))
+    elif et == 0x8808:
+        add("PAUSE", parse_pause(p))
+    elif et == 0x9000:
+        add("LOOP", {"kind": "Cisco loopback keepalive"})
     elif et == 0x86DD:
         for k, i in parse_ipv6(p):
             add(k, i)
@@ -241,6 +253,12 @@ def classify(raw):
                 add("DTP", parse_dtp(body))
             elif pid == 0x010B:
                 add("STP", parse_bpdu(body, pvst=True))
+            elif pid == 0x0111:
+                add("UDLD", parse_udld(body))
+            elif pid == 0x0104:
+                add("PAGP", {"kind": "PAgP"})
+            elif pid == 0x2003:
+                add("VTP", parse_vtp(body))
         elif p[:3] == b"\x42\x42\x03":
             add("STP", parse_bpdu(p[3:]))
     return ev
@@ -498,10 +516,77 @@ def build_arp_request(mac, sender_ip, target_ip):
 
 
 # ---------------------------------------------------------------------- IPv4 / IPv6 / UDP
+def parse_lacp(p):
+    """A LACPDU: the switch port is set up as part of a port-channel."""
+    if len(p) < 2 or p[0] != 1:
+        return None                                    # marker and OAM share this ethertype
+    if len(p) < 19 or p[2] != 1:
+        return {"kind": "LACP"}
+    state = p[18]                  # after: subtype, version, TLV type, length, priority, system, key, port priority, port
+    return {"kind": "LACP", "system": mac_str(p[6:12]), "sys_prio": u16(p, 4), "key": u16(p, 12),
+            "port": u16(p, 16), "active": bool(state & 0x01), "fast": bool(state & 0x02),
+            "aggregating": bool(state & 0x04), "in_sync": bool(state & 0x08)}
+
+
+def parse_pause(p):
+    """802.3x PAUSE (opcode 1) or priority flow control (opcode 0x0101)."""
+    if len(p) < 4:
+        return None
+    op = u16(p, 0)
+    if op == 0x0001:
+        return {"kind": "PAUSE", "quanta": u16(p, 2)}
+    if op == 0x0101:
+        return {"kind": "PFC", "quanta": max(struct.unpack("!8H", p[4:20])) if len(p) >= 20 else 0}
+    return None
+
+
+UDLD_OPS = {1: "probe", 2: "echo", 3: "flush"}
+
+
+def parse_udld(b):
+    if len(b) < 4:
+        return None
+    info, off = {"op": UDLD_OPS.get(b[0] & 0x1F, str(b[0] & 0x1F))}, 4
+    while off + 4 <= len(b):
+        t, ln = u16(b, off), u16(b, off + 2)
+        if ln < 4:
+            break
+        v = b[off + 4:off + ln]
+        if t == 1:
+            info["device"] = v.decode("ascii", "replace").strip("\x00 ")
+        elif t == 2:
+            info["port"] = v.decode("ascii", "replace").strip("\x00 ")
+        off += ln
+    return info
+
+
+def parse_vtp(b):
+    if len(b) < 36:
+        return {"kind": "VTP"}
+    return {"kind": "VTP", "version": b[0], "domain": b[4:4 + min(b[3], 32)].decode("ascii", "replace")}
+
+
+def parse_icmp_notice(p, ihl, src, dst):
+    """ICMP redirect, or "fragmentation needed": the two that point at a routing or MTU fault."""
+    b = p[ihl:]
+    if len(b) < 8:
+        return []
+    inner = b[8:]
+    about = socket.inet_ntoa(inner[16:20]) if len(inner) >= 20 else ""
+    if b[0] == 5:
+        return [("ICMP", {"what": "redirect", "from": src, "to": dst, "use": socket.inet_ntoa(b[4:8]),
+                          "about": about})]
+    if b[0] == 3 and b[1] == 4:
+        return [("ICMP", {"what": "fragneeded", "from": src, "to": dst, "mtu": u16(b, 6), "about": about})]
+    return []
+
+
 def parse_ipv4(p):
     if len(p) < 20 or p[0] >> 4 != 4:
         return []
     ihl = (p[0] & 0x0F) * 4
+    if p[9] == 1 and len(p) >= ihl + 8:
+        return parse_icmp_notice(p, ihl, socket.inet_ntoa(p[12:16]), socket.inet_ntoa(p[16:20]))
     if p[9] != 17 or len(p) < ihl + 8:
         return []
     return parse_udp(p[ihl:], socket.inet_ntoa(p[12:16]), socket.inet_ntoa(p[16:20]))
@@ -1186,7 +1271,7 @@ class Oui:
 # ====================================================================== settings + port log
 class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
-                "iperf_port": 5201, "smart_services": False}
+                "iperf_port": 5201, "smart_services": False, "tick_server": ""}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")
@@ -1215,6 +1300,691 @@ LOG_FIELDS = ["last_seen", "label", "switch", "port", "vlan", "voice_vlan", "mgm
               "tagged_vlans", "ipv6", "pc_mac", "adapter", "first_seen", "saves"]
 HIST_FIELDS = ["time", "source"] + [f for f in LOG_FIELDS
                                     if f not in ("last_seen", "first_seen", "saves")]
+
+
+# ====================================================================== event timeline
+def add_event(events, kind, text, sev, now, quiet=0.0):
+    """Record something that happened on the port. `events` is a list or deque of dicts, oldest
+    first. A repeat of the same kind and text within `quiet` seconds is counted on the earlier
+    entry, not added again: one spanning-tree change sets its flag on BPDUs for many seconds.
+    Returns the entry."""
+    for e in reversed(events):
+        if now - e["last"] > quiet:
+            break
+        if e["kind"] == kind and e["text"] == text:
+            e["count"] += 1
+            e["last"] = now
+            return e
+    e = {"ts": now, "last": now, "kind": kind, "text": text, "sev": sev, "count": 1}
+    events.append(e)
+    return e
+
+
+def percentile(values, p):
+    """Nearest-rank percentile of a list of numbers; None if it is empty."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    k = max(0, min(len(vals) - 1, int(-(-p * len(vals) // 100)) - 1))
+    return vals[k]
+
+
+def bucket_samples(samples, t_end, span, ncol):
+    """Spread (timestamp, rtt or None) ping samples over `ncol` chart columns covering the `span`
+    seconds up to `t_end`. Each column is (worst rtt or None, pings lost, pings sent)."""
+    cols = [[None, 0, 0] for _ in range(ncol)]
+    t0 = t_end - span
+    for ts, rtt in samples:
+        if ts < t0 or ts > t_end:
+            continue
+        c = cols[min(ncol - 1, int((ts - t0) / span * ncol))]
+        c[2] += 1
+        if rtt is None:
+            c[1] += 1
+        elif c[0] is None or rtt > c[0]:
+            c[0] = rtt
+    return [tuple(c) for c in cols]
+
+
+def event_impact(samples, ts, before=10.0, after=5.0):
+    """What ping did around an event. Returns None when ping wasn't running then, otherwise
+    {"lost", "peak", "normal", "hit"}; "hit" means the event came with loss or a clear spike."""
+    base = [r for t, r in samples if ts - before <= t < ts - 1 and r is not None]
+    near = [(t, r) for t, r in samples if ts - 1 <= t <= ts + after]
+    if not near:
+        return None
+    lost = sum(1 for _, r in near if r is None)
+    got = [r for _, r in near if r is not None]
+    peak = max(got) if got else None
+    normal = percentile(base, 50)
+    spike = peak is not None and normal is not None and peak > max(2 * normal, normal + 10)
+    return {"lost": lost, "peak": peak, "normal": normal, "hit": bool(lost or spike)}
+
+
+def impact_text(imp, name="ping", unit="ping"):
+    """`name` is what was running ("ping", "the test"); `unit` is one of what it sends."""
+    if imp is None:
+        return f"{name} wasn't running"
+    if not imp["hit"]:
+        return f"no effect on {name}"
+    bits = []
+    if imp["lost"]:
+        bits.append(f"{imp['lost']} {unit}{'s' if imp['lost'] != 1 else ''} lost")
+    if imp["peak"] is not None and imp["normal"] is not None and imp["peak"] > max(2 * imp["normal"], imp["normal"] + 10):
+        bits.append(f"peak {imp['peak']:.0f} ms, normally {imp['normal']:.0f} ms")
+    return " · ".join(bits)
+
+
+# ====================================================================== wire report
+class ArpWatch:
+    """Remembers which MAC answers for each IP and notices when two different ones do."""
+
+    MAX = 4096
+
+    def __init__(self):
+        self.owner = {}            # ip -> mac
+        self.conflicts = {}        # ip -> {"macs": [..], "ts": last}
+        self.gratuitous = 0
+
+    def feed(self, a, now):
+        """`a` is parse_arp output. Returns (ip, old_mac, new_mac) when an address changes hands."""
+        ip, mac = a["spa"], a["sha"]
+        if ip in ("0.0.0.0", "") or mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            return None
+        if a["spa"] == a["tpa"]:
+            self.gratuitous += 1
+        old = self.owner.get(ip)
+        if old is None and len(self.owner) >= self.MAX:
+            return None
+        self.owner[ip] = mac
+        if old and old != mac:
+            c = self.conflicts.setdefault(ip, {"macs": [old], "ts": now})
+            if mac not in c["macs"]:
+                c["macs"].append(mac)
+            c["ts"] = now
+            return (ip, old, mac)
+        return None
+
+
+class WireWatch:
+    """Counts who is sending broadcast and multicast, and how much traffic for other machines
+    is being flooded to this port."""
+
+    MAX_TALKERS = 512
+
+    def __init__(self, local_macs=(), now=None):
+        self.lock = threading.Lock()
+        self.local = {norm_mac(m) for m in local_macs if m}
+        self.started = self._at = time.time() if now is None else now
+        self.talk = {}             # mac -> [broadcast frames, multicast frames, bytes]
+        self.flood = self._flood = 0
+        self.flood_dst = {}        # mac the flooded frames were for -> frames
+        self.frames = self._frames = 0
+        self.flood_pps = self.pps = 0.0
+        self._talk = {}
+        self.rates = {}            # mac -> (broadcast/s, multicast/s)
+
+    def feed(self, raw):
+        if len(raw) < 14:
+            return
+        dst, src = mac_str(raw[0:6]), mac_str(raw[6:12])
+        if src in self.local:
+            return
+        with self.lock:
+            self.frames += 1
+            if raw[0] & 1:
+                t = self.talk.get(src)
+                if t is None:
+                    if len(self.talk) >= self.MAX_TALKERS:
+                        return
+                    t = self.talk[src] = [0, 0, 0]
+                t[0 if dst == "ff:ff:ff:ff:ff:ff" else 1] += 1
+                t[2] += len(raw)
+            elif dst not in self.local:
+                self.flood += 1
+                if dst in self.flood_dst or len(self.flood_dst) < 64:
+                    self.flood_dst[dst] = self.flood_dst.get(dst, 0) + 1
+
+    def tick(self, now):
+        with self.lock:
+            dt = now - self._at
+            if dt < 0.5:
+                return
+            self.flood_pps = (self.flood - self._flood) / dt
+            self.pps = (self.frames - self._frames) / dt
+            self.rates = {m: ((t[0] - self._talk.get(m, (0, 0))[0]) / dt, (t[1] - self._talk.get(m, (0, 0))[1]) / dt)
+                          for m, t in self.talk.items()}
+            self._talk = {m: (t[0], t[1]) for m, t in self.talk.items()}
+            self._at, self._flood, self._frames = now, self.flood, self.frames
+
+    def snapshot(self, top=8):
+        with self.lock:
+            rows = [{"mac": m, "bc": t[0], "mc": t[1], "bytes": t[2],
+                     "bc_pps": self.rates.get(m, (0, 0))[0], "mc_pps": self.rates.get(m, (0, 0))[1]}
+                    for m, t in self.talk.items()]
+            rows.sort(key=lambda r: (-(r["bc_pps"] + r["mc_pps"]), -(r["bc"] + r["mc"])))
+            return {"talkers": rows[:top], "n_talkers": len(rows), "flood": self.flood,
+                    "flood_pps": self.flood_pps, "pps": self.pps,
+                    "flood_dst": sorted(self.flood_dst, key=self.flood_dst.get, reverse=True)[:4]}
+
+
+def wire_bpf(mac):
+    """Everything that is not unicast addressed to this adapter: broadcast, multicast, and
+    whatever the switch is flooding."""
+    return f"ether multicast or not ether dst {norm_mac(mac)}" if mac else "ether multicast"
+
+
+def parse_ethtool_pause(text):
+    """`ethtool -a`: {"autoneg": bool, "rx": bool, "tx": bool}, missing keys when not reported."""
+    out = {}
+    for key, pat in (("autoneg", r"Autonegotiate:\s*(on|off)"), ("rx", r"RX:\s*(on|off)"), ("tx", r"TX:\s*(on|off)")):
+        m = re.search(pat, text or "")
+        if m:
+            out[key] = m.group(1) == "on"
+    return out
+
+
+def parse_ethtool_eee(text):
+    """`ethtool --show-eee`: {"supported": bool, "enabled": bool, "active": bool, "partner": bool}."""
+    text = text or ""
+    m = re.search(r"EEE status:\s*(.+)", text)
+    if not m:
+        return {}
+    status = m.group(1).strip().lower()
+    if "not supported" in status:
+        return {"supported": False, "enabled": False, "active": False}
+    partner = re.search(r"Link partner advertised EEE link modes:\s*(.*)", text)
+    return {"supported": True, "enabled": status.startswith("enabled"),
+            "active": "enabled" in status and "inactive" not in status and "active" in status,
+            "partner": bool(partner and partner.group(1).strip() not in ("", "Not reported"))}
+
+
+def _ethtool_modes(text, label):
+    """The link speeds, in Mb/s, listed under a multi-line `ethtool` heading."""
+    m = re.search(re.escape(label) + r":\s*(.*(?:\n\s+(?![A-Za-z ]+:).*)*)", text or "")
+    return sorted({int(x) for x in re.findall(r"(\d+)base", m.group(1))}) if m else []
+
+
+def parse_ethtool_link(text):
+    """`ethtool IFACE`: what each end offered and what was agreed."""
+    text = text or ""
+    sp = re.search(r"Speed:\s*(\d+)Mb/s", text)
+    dup = re.search(r"Duplex:\s*(\w+)", text)
+    return {"speed": int(sp.group(1)) if sp else None, "duplex": dup.group(1) if dup else None,
+            "ours": _ethtool_modes(text, "Advertised link modes"),
+            "partner": _ethtool_modes(text, "Link partner advertised link modes")}
+
+
+def downshift(link):
+    """The speed both ends offered but did not get, or None. A link that settles below what both
+    ends advertise has usually given up on a bad cable pair."""
+    if not link.get("speed") or not link.get("ours") or not link.get("partner"):
+        return None
+    best = max(set(link["ours"]) & set(link["partner"]), default=None)
+    return best if best and best > link["speed"] else None
+
+
+PAUSE_STAT = re.compile(r"pause|flow_?control|flow_?ctrl|xoff|xon", re.I)
+ERROR_STAT = re.compile(r"crc|fcs|align|symbol|jabber|runt|undersize|oversize|fragment|carrier|"
+                        r"length_err|rx_err|tx_err|missed|fifo|over_?run|collision", re.I)
+
+
+def parse_nic_stats(text):
+    """`ethtool -S`: ({pause counters}, {error counters}), by name."""
+    pause, errors = {}, {}
+    for m in re.finditer(r"^\s*([\w .\[\]-]+?):\s*(\d+)\s*$", text or "", re.M):
+        name, val = m.group(1).strip(), int(m.group(2))
+        if PAUSE_STAT.search(name):
+            pause[name] = val
+        elif ERROR_STAT.search(name):
+            errors[name] = val
+    return pause, errors
+
+
+def counter_rises(old, new):
+    """{name: how much it went up} for counters that rose between two readings."""
+    return {k: v - old[k] for k, v in new.items() if k in old and v > old[k]}
+
+
+def linux_local_macs(name):
+    """MACs that legitimately live behind this adapter: its own, the bridge it belongs to, and
+    any virtual machines on that bridge. Frames for these are not flooding."""
+    macs = set()
+    for n in {name, linux_l3_iface(name)}:
+        m = _read(os.path.join(SYS_NET, n, "address"))
+        if m:
+            macs.add(norm_mac(m))
+    rows = _json_cmd(["bridge", "-j", "fdb", "show"]) if shutil.which("bridge") else None
+    for r in rows or []:
+        if isinstance(r, dict) and r.get("mac") and r.get("ifname") != name:
+            macs.add(norm_mac(r["mac"]))
+    return macs
+
+
+def linux_nic_report(name):
+    """Flow control, EEE, link offer and the pause and error counters for one adapter."""
+    if not shutil.which("ethtool"):
+        return None
+    return {"pause": parse_ethtool_pause(run(["ethtool", "-a", name], 5)[1]),
+            "eee": parse_ethtool_eee(run(["ethtool", "--show-eee", name], 5)[1]),
+            "link": parse_ethtool_link(run(["ethtool", name], 5)[1]),
+            "stats": parse_nic_stats(run(["ethtool", "-S", name], 5)[1])}
+
+
+def new_wire():
+    """Everything the wire report shows, empty."""
+    return {"lacp": None, "udld": None, "vtp": None, "pagp": None, "loop": None,
+            "pause_frames": 0, "pause_at": None, "icmp": [], "conflicts": [], "gratuitous": 0,
+            "routers": {}, "talk": None, "nic": None, "rises": {}, "paused": False,
+            "since": time.time()}
+
+
+def wire_findings(w, vendor=lambda mac: "", platform_linux=True):
+    """The wire report as [(section, level, text)], level in ok | info | warn | bad. `vendor`
+    turns a MAC into a maker's name."""
+    out = []
+
+    def who(mac):
+        v = vendor(mac)
+        return f"{mac} ({v})" if v else mac
+
+    # ---- this adapter: flow control, energy saving, speed, error counters
+    sec, nic = "This adapter", w.get("nic")
+    if nic is None:
+        out.append((sec, "info", "Flow control, energy saving and error counters are read on Linux only for now."
+                    if not platform_linux else "ethtool is not installed, so the adapter's settings can't be read."))
+    else:
+        p = nic.get("pause") or {}
+        if p:
+            on = [d for d in ("rx", "tx") if p.get(d)]
+            out.append((sec, "info" if on else "ok",
+                        f"Flow control is on ({' and '.join(x.upper() for x in on)}): this link can be told to stop sending."
+                        if on else "Flow control is off."))
+        pause_rise = {k: v for k, v in w.get("rises", {}).items() if PAUSE_STAT.search(k)}
+        if pause_rise:
+            out.append((sec, "warn", "PAUSE frames counted since the report started: "
+                        + ", ".join(f"{k} +{v:,}" for k, v in sorted(pause_rise.items()))
+                        + ". Each one stops traffic for a moment."))
+        e = nic.get("eee") or {}
+        if e.get("active"):
+            out.append((sec, "warn", "Energy Efficient Ethernet is active: the link sleeps between packets and "
+                        "adds a wake-up delay. Turn it off on the switch port or this adapter for gaming."))
+        elif e.get("enabled"):
+            out.append((sec, "info", "Energy Efficient Ethernet is enabled here but not in use on this link."))
+        elif e.get("supported") is not None:
+            out.append((sec, "ok", "Energy Efficient Ethernet is off."))
+        link = nic.get("link") or {}
+        best = downshift(link)
+        if best:
+            out.append((sec, "bad", f"Linked at {fmt_speed(link['speed'])} although both ends offer "
+                        f"{fmt_speed(best)}. That usually means a bad cable or connector."))
+        elif link.get("speed"):
+            out.append((sec, "ok", f"Linked at {fmt_speed(link['speed'])}"
+                        + (", the fastest both ends offer." if link.get("partner") else ".")))
+        err_rise = {k: v for k, v in w.get("rises", {}).items() if not PAUSE_STAT.search(k)}
+        if err_rise:
+            out.append((sec, "bad", "Error counters rising: "
+                        + ", ".join(f"{k} +{v:,}" for k, v in sorted(err_rise.items()))))
+        else:
+            total = sum((nic.get("stats") or ({}, {}))[1].values())
+            out.append((sec, "ok" if not total else "info",
+                        "No errors counted by the adapter." if not total
+                        else f"{total:,} errors counted since the adapter came up, none since the report started."))
+
+    # ---- flooding and loud senders
+    t = w.get("talk")
+    sec = "Flooding"
+    if w.get("paused"):
+        out.append((sec, "warn", "Too much traffic to count (over 5,000 frames a second not addressed to this "
+                    "box). This looks like a mirror port, a hub, or a severe flood."))
+    elif t is None:
+        out.append((sec, "info", "Not counting yet."))
+    elif t["flood_pps"] >= 5:
+        eg = f", for example to {who(t['flood_dst'][0])}" if t["flood_dst"] else ""
+        out.append((sec, "warn", f"{t['flood_pps']:,.0f} frames a second meant for other machines are reaching "
+                    f"this port{eg}. The switch is flooding: a spanning-tree change, a full MAC table, or a hub."))
+    elif t["flood"]:
+        out.append((sec, "info", f"{t['flood']:,} frames for other machines seen since the report started, "
+                    "none right now. A few after a topology change is normal."))
+    else:
+        out.append((sec, "ok", "None: nothing meant for other machines is reaching this port."))
+    sec = "Loudest broadcast and multicast senders"
+    for r in (t or {}).get("talkers", [])[:6]:
+        rate = r["bc_pps"] + r["mc_pps"]
+        level = "bad" if r["bc_pps"] > 200 else "warn" if r["bc_pps"] > 50 else "info"
+        out.append((sec, level, f"{who(r['mac'])}: {r['bc_pps']:,.0f} broadcast and {r['mc_pps']:,.0f} multicast "
+                    f"a second ({r['bc'] + r['mc']:,} frames in all)" if rate >= 0.5 else
+                    f"{who(r['mac'])}: quiet now ({r['bc'] + r['mc']:,} frames in all)"))
+    if t is not None and not t.get("talkers"):
+        out.append((sec, "ok", "Nobody yet."))
+
+    # ---- addresses
+    sec = "Address conflicts"
+    for c in w.get("conflicts", [])[-6:]:
+        out.append((sec, "bad", f"{c['ip']} is claimed by {' and '.join(who(m) for m in c['macs'][:3])}"))
+    if not w.get("conflicts"):
+        out.append((sec, "ok", "None seen: every IP address has answered from one MAC."))
+    sec = "IPv6 routers"
+    routers = w.get("routers", {})
+    for mac, r in list(routers.items())[:6]:
+        out.append((sec, "bad" if len(routers) > 1 else "info",
+                    f"{who(mac)} is advertising itself as an IPv6 router" + (f" for {r['prefix']}" if r.get("prefix") else "")))
+    if len(routers) > 1:
+        out.append((sec, "bad", "More than one machine is doing this. Unless both are real routers, one is a PC "
+                    "with internet sharing on, and it will take other machines' IPv6 traffic."))
+    if not routers:
+        out.append((sec, "ok", "None heard."))
+
+    # ---- switch protocols
+    sec = "Switch protocols heard"
+    n0 = len(out)
+    la = w.get("lacp")
+    if la:
+        detail = (f" (switch {la['system']}, key {la['key']}, {'active' if la['active'] else 'passive'}, "
+                  f"{'fast' if la['fast'] else 'slow'} timer)") if la.get("system") else ""
+        out.append((sec, "warn", f"LACP{detail}: the switch expects this port to be one leg of a port-channel. "
+                    "A single machine plugged into it may be blocked or flap."))
+    if w.get("pagp"):
+        out.append((sec, "warn", "PAgP: the switch is trying to form a Cisco port-channel on this port."))
+    ud = w.get("udld")
+    if ud:
+        out.append((sec, "info", "UDLD" + (f" from {ud['device']} {ud.get('port', '')}".rstrip() if ud.get("device") else "")
+                    + ": the switch is checking this link for one-way faults. Meant for switch-to-switch links."))
+    if w.get("vtp"):
+        dom = w["vtp"].get("domain")
+        out.append((sec, "info", "VTP" + (f" domain '{dom}'" if dom else "") + ": this is a trunk-capable port."))
+    if w.get("loop"):
+        out.append((sec, "info", "Loopback keepalives: the switch is watching this port for a loop."))
+    if w.get("pause_frames"):
+        out.append((sec, "warn", f"{w['pause_frames']:,} PAUSE frames seen on the wire."))
+    if len(out) == n0:
+        out.append((sec, "ok", "Nothing beyond the usual: no LACP, PAgP, UDLD, VTP, loop keepalives or PAUSE frames."))
+
+    # ---- ICMP
+    sec = "Routing and MTU notices"
+    for i in w.get("icmp", [])[-6:]:
+        if i["what"] == "redirect":
+            out.append((sec, "warn", f"{i['from']} says: to reach {i['about'] or 'that host'}, use {i['use']} instead. "
+                        "Two routers on this subnet, or a wrong gateway."))
+        else:
+            out.append((sec, "warn", f"{i['from']} says a packet to {i['about'] or 'somewhere'} was too big: the path "
+                        f"only carries {i['mtu']} bytes. A tunnel or a smaller MTU along the way."))
+    if not w.get("icmp"):
+        out.append((sec, "ok", "None: no ICMP redirects or \"fragmentation needed\" replies."))
+    return out
+
+
+def wire_headline(findings):
+    """("3 things worth a look", level) from wire_findings output."""
+    bad = sum(1 for _, lv, _ in findings if lv == "bad")
+    warn = sum(1 for _, lv, _ in findings if lv == "warn")
+    n = bad + warn
+    if not n:
+        return ("Nothing unusual on the wire", "ok")
+    return (f"{n} thing{'s' if n != 1 else ''} worth a look", "bad" if bad else "warn")
+
+
+# ====================================================================== tick-rate test
+# A game sends small UDP packets at a steady rate, 64 or 128 a second for Counter-Strike. This
+# test does the same to a reflector and times every packet, which shows what ICMP ping hides:
+# short bursts of loss, packets arriving out of order, and replies that miss their tick.
+TICK_MAGIC = b"PCC1"
+TICK_PORT = 27777
+TICK_RATES = (64, 128)
+TICK_SIZE = 160                    # bytes of UDP payload, about a game client's packet
+
+
+def tick_packet(session, seq, size=TICK_SIZE):
+    return (TICK_MAGIC + struct.pack("!II", session, seq)).ljust(size, b"\x00")
+
+
+def parse_tick(data):
+    """(session, seq) from a test packet, or None."""
+    if len(data) < 12 or data[:4] != TICK_MAGIC:
+        return None
+    return struct.unpack("!II", data[4:12])
+
+
+def parse_tick_server(text, default_port=TICK_PORT):
+    """"10.1.2.3", "10.1.2.3:27015", "10.1.2.3 27015" or "server.lan" -> (host, port) or None."""
+    m = re.fullmatch(r"\s*([A-Za-z0-9][A-Za-z0-9.\-]*)(?:\s*[:/ ]\s*(\d{1,5}))?\s*", text or "")
+    if not m:
+        return None
+    port = int(m.group(2)) if m.group(2) else default_port
+    return (m.group(1), port) if 0 < port < 65536 else None
+
+
+class TickBuffer:
+    """Every packet of a run: when it left and how long its reply took."""
+
+    MAX = 40000                    # about 10 minutes at 64 a second, 5 at 128
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rows = collections.deque()        # [send time, rtt in ms or None]
+        self.base = 0                          # sequence number of rows[0]
+        self.top = -1                          # highest sequence number answered so far
+        self.sent = self.recv = self.reorder = self.dup = 0
+
+    def add_sent(self, ts):
+        with self.lock:
+            self.rows.append([ts, None])
+            self.sent += 1
+            if len(self.rows) > self.MAX:
+                self.rows.popleft()
+                self.base += 1
+            return self.base + len(self.rows) - 1
+
+    def add_reply(self, seq, rtt_ms):
+        with self.lock:
+            i = seq - self.base
+            if not 0 <= i < len(self.rows):
+                return
+            if self.rows[i][1] is not None:
+                self.dup += 1
+                return
+            self.rows[i][1] = rtt_ms
+            self.recv += 1
+            if seq < self.top:
+                self.reorder += 1
+            else:
+                self.top = seq
+
+    def samples(self, now, timeout=1.0):
+        """[(send time, rtt or None)], leaving out packets still inside their timeout."""
+        with self.lock:
+            return [(ts, rtt) for ts, rtt in self.rows if rtt is not None or now - ts >= timeout]
+
+    def counters(self):
+        with self.lock:
+            return {"sent": self.sent, "recv": self.recv, "reorder": self.reorder, "dup": self.dup}
+
+
+def tick_summary(samples, rate):
+    """Figures for a stretch of tick-test samples: loss, the longest run of lost packets, reply
+    times, jitter, and how many replies were late enough to miss a tick."""
+    rtts = [r for _, r in samples if r is not None]
+    n = len(samples)
+    lost = n - len(rtts)
+    burst = run = 0
+    for _, r in samples:
+        run = run + 1 if r is None else 0
+        burst = max(burst, run)
+    out = {"n": n, "lost": lost, "loss_pct": 100 * lost / n if n else 0.0, "burst": burst,
+           "min": min(rtts) if rtts else None, "max": max(rtts) if rtts else None,
+           "avg": sum(rtts) / len(rtts) if rtts else None,
+           "p50": percentile(rtts, 50), "p95": percentile(rtts, 95), "p99": percentile(rtts, 99),
+           "jitter": None, "late": 0}
+    if len(rtts) > 1:
+        out["jitter"] = sum(abs(b - a) for a, b in zip(rtts, rtts[1:])) / (len(rtts) - 1)
+    if rtts:
+        tick = 1000.0 / rate
+        out["late"] = sum(1 for r in rtts if r > out["p50"] + tick)
+    return out
+
+
+def tick_verdict(s, rate):
+    """(headline, level) for a summary: ok | warn | bad, judged the way a player would feel it."""
+    if not s["n"]:
+        return ("Waiting for replies…", "wait")
+    if s["lost"] == s["n"]:
+        return ("No replies", "bad")
+    tick = 1000.0 / rate
+    if s["loss_pct"] >= 1 or s["burst"] >= 3 or (s["jitter"] or 0) > tick / 2:
+        level = "bad"
+    elif s["lost"] or s["late"] or (s["jitter"] or 0) > tick / 8:
+        level = "warn"
+    else:
+        level = "ok"
+    return (f"{s['loss_pct']:.2f}% loss · {s['p50']:.1f} ms · jitter {s['jitter'] or 0:.2f} ms", level)
+
+
+class TickTest:
+    """Sends the packets, at a steady rate, and times the replies."""
+
+    def __init__(self, src, host, port, rate, size=TICK_SIZE):
+        self.host, self.port, self.rate, self.size = host, port, rate, size
+        self.buf = TickBuffer()
+        self.session = random.getrandbits(32)
+        self.stop_ev = threading.Event()
+        self.pace_err = 0.0            # how far off its schedule this box's own sending is, in ms
+        self.error = None
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if src:
+                self.sock.bind((src, 0))
+            self.sock.connect((host, port))
+            self.sock.settimeout(0.2)
+        except OSError:
+            self.sock.close()
+            raise
+        self.sent_at = {}              # seq -> perf_counter when it left
+
+    def start(self):
+        for fn in (self._send_loop, self._recv_loop):
+            threading.Thread(target=fn, daemon=True).start()
+
+    def stop(self):
+        self.stop_ev.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _send_loop(self):
+        gap = 1.0 / self.rate
+        due = time.perf_counter()
+        while not self.stop_ev.is_set():
+            now = time.perf_counter()
+            if now - due > 0.5:        # the machine slept or stalled; don't fire a burst to catch up
+                due = now
+            self.pace_err += (abs(now - due) * 1000 - self.pace_err) * 0.05
+            seq = self.buf.add_sent(time.time())
+            self.sent_at[seq] = now
+            if len(self.sent_at) > 4 * self.rate:
+                self.sent_at.pop(next(iter(self.sent_at)), None)
+            try:
+                self.sock.send(tick_packet(self.session, seq, self.size))
+            except OSError as e:
+                self.error = str(e)    # e.g. ICMP port unreachable coming back; keep going
+            due += gap
+            wait = due - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+
+    def _recv_loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                data = self.sock.recv(2048)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if self.stop_ev.is_set():
+                    return
+                self.error = str(e)
+                time.sleep(0.05)
+                continue
+            now = time.perf_counter()
+            p = parse_tick(data)
+            if not p or p[0] != self.session:
+                continue
+            t = self.sent_at.get(p[1])
+            if t is not None:
+                self.buf.add_reply(p[1], (now - t) * 1000)
+
+
+class Reflector:
+    """The far end of the tick test: sends every test packet straight back where it came from.
+    It answers only packets that start with the test's marker, one reply per packet, so it
+    cannot be used to amplify traffic."""
+
+    def __init__(self, port=TICK_PORT, bind=""):
+        self.port, self.count, self.peers = port, 0, {}
+        self.stop_ev = threading.Event()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind((bind, port))
+            self.sock.settimeout(0.3)
+        except OSError:
+            self.sock.close()
+            raise
+
+    def serve(self):
+        while not self.stop_ev.is_set():
+            try:
+                data, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop_ev.is_set():
+                    return
+                continue
+            if data[:4] != TICK_MAGIC:
+                continue
+            try:
+                self.sock.sendto(data, addr)
+            except OSError:
+                continue
+            self.count += 1
+            self.peers[addr[0]] = time.time()
+
+    def start(self):
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def stop(self):
+        self.stop_ev.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def reflector_main(argv):
+    """`porkchopcheck --reflector [port]`: run only the reflector, with no window. For the game
+    server or any spare machine at the far end of the path you want to test."""
+    port = TICK_PORT
+    for a in argv[argv.index("--reflector") + 1:][:1]:
+        if a.isdigit() and 0 < int(a) < 65536:
+            port = int(a)
+    try:
+        r = Reflector(port)
+    except OSError as e:
+        print(f"Can't listen on UDP port {port}: {e}", file=sys.stderr)
+        return 1
+    print(f"PorkChopCheck reflector listening on UDP port {port}. Press Ctrl+C to stop.")
+    print("If nothing reaches it, open that port in this machine's firewall.")
+    r.start()
+    try:
+        last = 0
+        while True:
+            time.sleep(5)
+            if r.count != last:
+                last = r.count
+                print(f"  {r.count:,} packets returned, to {', '.join(sorted(r.peers))}")
+    except KeyboardInterrupt:
+        r.stop()
+        print(f"\nStopped after {r.count:,} packets.")
+        return 0
 
 
 # ====================================================================== multicast

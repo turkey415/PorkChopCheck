@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Wire report (flow control, EEE, flooding, loud senders, conflicts, rogue routers), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -91,6 +91,67 @@ Good to know:
 - Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
 - Icons are generic device-type drawings, not brand logos.
 - Per-device throughput isn't shown. A normal switch port can't see other devices' traffic.
+
+## Ping and the event timeline
+
+**Tools › Ping** sends four pings a second and draws them as a graph, with lost pings in red. Under the graph is a lane that marks everything that happened on the port, at the moment it happened:
+
+- link down and up, and a change of link speed
+- a spanning-tree topology change
+- the gateway answering from a different MAC address
+- a broadcast storm starting and ending
+- another machine claiming this box's IP address
+- a second DHCP server answering
+- this box's own address changing or being lost
+
+Each event is listed below the graph with what ping did around it, such as `2 pings lost · peak 212 ms, normally 3 ms` or `no effect on ping`. That is the point of the page: a lag spike sits directly above whatever caused it, or above nothing, which tells you the cause is somewhere this port cannot see.
+
+The third button switches the graph between the last 30 seconds, 5 minutes and 30 minutes. The summary line shows loss, average, jitter, and the time 99% of pings came in under. Events are collected the whole time the app is open, whether or not ping is running.
+
+## Tick test (game-rate UDP)
+
+Counter-Strike and most other games send small UDP packets at a steady rate, 64 or 128 a second. ICMP ping is a different kind of traffic at a much lower rate, and switches and routers often treat it differently. **Tools › Tick test** sends 160-byte UDP packets at the game's rate to a reflector and times every one.
+
+It reports what a player actually feels:
+
+- **Loss**, and the **longest run of lost packets** in a row. Three lost together is a visible hitch even when overall loss is well under 1%.
+- **Jitter**, how much the reply time changes from one packet to the next.
+- **Late replies**: ones that took a whole tick (15.6 ms at 64 a second) longer than usual.
+- Packets that arrived **out of order** or **twice**.
+- Reply times: fastest, typical, the time 95% and 99% came in under, and slowest.
+
+The graph is the same as on the Ping page, with port events marked under it, so a spanning-tree change or a link flap lines up with the hitch it caused. The headline goes amber for any loss or late reply, and red for 1% loss, three lost in a row, or jitter over half a tick.
+
+**It needs something at the far end to send the packets back.** Either:
+
+- on the game server or any spare machine, run `porkchopcheck --reflector` (from source: `python3 porkchopcheck.py --reflector`). It needs only Python, no window and no admin rights; or
+- on a second PorkChopCheck box, open Tools › Tick test and tap **Reflect**.
+
+Then tap **Server**, enter that machine's address, and tap **Start**. The reflector listens on UDP port 27777; add a different port after the address if you started it with one, e.g. `--reflector 27015`. If nothing comes back, open that UDP port in the far machine's firewall (`sudo firewall-cmd --add-port=27777/udp` on Fedora and Nobara).
+
+The reflector answers only this test's packets, one reply for each, so it can't be used to amplify traffic. The test also shows how accurate this box's own send timing is, so you can tell network jitter from a busy tester.
+
+## Wire report
+
+**Tools › Wire report** is one page for the things that cause lag and odd behaviour but that no other page shows. It watches the whole time the app is open and gives a one-line verdict, such as `3 things worth a look`, with the details below. Everything it finds also goes on the event timeline, so it lines up with the Ping and Tick test graphs.
+
+| Section | What it tells you |
+|---|---|
+| **This adapter** | Whether flow control is on, and whether PAUSE frames are being counted (each one stops traffic for a moment). Whether Energy Efficient Ethernet is active (the link sleeps between packets and adds a wake-up delay). Whether the link came up slower than both ends offer, which usually means a bad cable. Whether the adapter's error counters are rising. |
+| **Flooding** | Traffic addressed to other machines arriving on this port. The switch is flooding: a spanning-tree change, a full MAC table, or a hub. |
+| **Loudest broadcast and multicast senders** | Which machines are filling the network, by MAC and maker, with their current rate. |
+| **Address conflicts** | Any IP address that has answered from two different MACs. |
+| **IPv6 routers** | Every machine advertising itself as an IPv6 router. More than one usually means a PC with internet sharing switched on. |
+| **Switch protocols heard** | LACP or PAgP (the switch expects a port-channel here), UDLD, VTP, loopback keepalives, and PAUSE frames seen on the wire. |
+| **Routing and MTU notices** | ICMP redirects (two routers, or a wrong gateway) and "fragmentation needed" replies (a smaller MTU somewhere along the path). |
+
+Good to know:
+- **This adapter** is read with `ethtool`, on Linux only for now. Which counters exist depends on the network card's driver.
+- Network cards usually act on PAUSE frames without passing them up, so the adapter's counters are the reliable sign; seeing one on the wire is a bonus.
+- On a normal switch port the report sees this box's traffic plus whatever the switch floods. It cannot see a conflict or a storm on a VLAN this port is not in.
+- On a Linux box that bridges virtual machines, traffic for those machines is not counted as flooding.
+- If more than 5,000 frames a second arrive that are not addressed to this box, the report stops counting for 30 seconds and says so. That is what a mirror port or a severe flood looks like.
+- **Restart** clears the report and starts counting again from now.
 
 ## Multicast browser
 

@@ -99,6 +99,11 @@ def _drop_ambient_caps():
 _use_private_python()
 _drop_ambient_caps()
 
+if "--reflector" in sys.argv:
+    # The far end of the tick test, with no window: needs nothing but Python itself.
+    import pc_net
+    sys.exit(pc_net.reflector_main(sys.argv))
+
 
 def log_error(what):
     """Append the current exception to crash.log without stopping the app."""
@@ -218,7 +223,8 @@ ConvertTo-Json -Compress -InputObject @(Get-NetNeighbor -InterfaceAlias __NAME__
 # ================================================================ shared state
 def new_ping():
     return {"running": False, "kind": "gateway", "label": "Gateway", "target": None,
-            "rtts": collections.deque(maxlen=120), "log": collections.deque(maxlen=40),
+            "samples": collections.deque(maxlen=7200),    # (time, rtt or None); 30 min at 4 a second
+            "log": collections.deque(maxlen=40), "span": 30,
             "sent": 0, "recv": 0, "min": None, "max": None, "sum": 0.0, "jit": 0.0, "jn": 0,
             "last": None}
 
@@ -238,6 +244,11 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.tick = {"running": False, "rate": 64, "span": 30, "msg": "", "target": "", "sum": None,
+                     "cols": [], "t_end": 0.0, "normal": 0.0, "counters": {}, "pace": 0.0,
+                     "impacts": {}, "reflecting": False, "reflected": 0, "peers": []}
+        self.events = collections.deque(maxlen=300)       # the timeline: link, STP, gateway, storms…
+        self.bc_storm = False
         self.mcast = {"running": False, "msg": "", "snap": None, "join": None, "probed": None,
                       "last_join": "239."}
         self.capture = {"running": False, "secs": 30, "left": 0, "frames": 0, "bytes": 0,
@@ -289,6 +300,11 @@ class State:
         self.dup_done = False
         self.gw_arp_sent = False
         self.last_announce = 0.0
+        self.wire = N.new_wire()
+
+    def add_event(self, kind, text, sev, now, quiet=0.0):
+        """Call with self.lock held."""
+        N.add_event(self.events, kind, text, sev, now, quiet)
 
     def snapshot(self):
         with self.lock:
@@ -522,6 +538,10 @@ class Backend:
         self.last_log = 0.0
         self.oui_tried = False
         self.pubip_at = 0.0             # last time the public IP was asked for
+        self.arpwatch = N.ArpWatch()    # kept here, not in State: it can hold thousands of entries
+        self.wirewatch = None
+        self.wire_sniffer = None
+        self.nic_base = None            # the adapter's counters when the wire report started
         self.pubip_for = None           # (adapter, local IP) it was asked from
         self.devstore = S.DeviceStore(DATA_DIR)
 
@@ -529,7 +549,7 @@ class Backend:
     def start(self):
         self.recover_blink()
         self.load_adapters()
-        for fn in (self.fast_loop, self.detail_loop, self.health_loop, self.probe_loop):
+        for fn in (self.fast_loop, self.detail_loop, self.health_loop, self.probe_loop, self.wire_loop):
             threading.Thread(target=fn, daemon=True).start()
         self.restart_sniffer()
 
@@ -632,8 +652,23 @@ class Backend:
                     came_up = True
                     st.link_up_at = st.ip_wait_from = now
                     st.time_to_ip = None
+                    st.add_event("link", f"Link up at {N.fmt_speed(speed)}" if speed else "Link up", "info", now)
                 elif not st.blink["running"]:
                     st.drops += 1
+                    st.add_event("link", "Link down", "bad", now)
+            elif up and st.link and speed and st.speed_mbps and speed != st.speed_mbps:
+                st.add_event("link", f"Speed changed: {N.fmt_speed(st.speed_mbps)} to {N.fmt_speed(speed)}",
+                             "bad" if speed < st.speed_mbps else "info", now)
+            new_ip = ip if up else None
+            if st.link is not None and new_ip != st.ipv4 and not changed:
+                if new_ip and st.ipv4:
+                    st.add_event("ip", f"IP address changed: {st.ipv4} to {new_ip}", "warn", now)
+                elif new_ip and new_ip.startswith("169.254."):
+                    st.add_event("ip", f"Self-assigned address {new_ip}: no DHCP answer", "warn", now)
+                elif new_ip:
+                    st.add_event("ip", f"Got IP address {new_ip}", "info", now)
+                else:
+                    st.add_event("ip", f"Lost IP address {st.ipv4}", "bad", now)
                 st.nb = {}
                 st.gw_ms = st.dns_ms = st.net_ms = PENDING
                 st.public_ip = None
@@ -704,6 +739,13 @@ class Backend:
                     st.bc_pps = (max(bc - pbc, 0) / dt) if isinstance(bc, num) and isinstance(pbc, num) else None
                     st.mc_pps = max(mc - pmc, 0) / dt
                 st.bc_prev = (bc, mc, now)
+                rate = st.bc_pps
+                if rate is not None and rate > 500 and not st.bc_storm:
+                    st.bc_storm = True
+                    st.add_event("bcast", f"Broadcast storm: {rate:,.0f} a second", "bad", now)
+                elif rate is not None and rate < 100 and st.bc_storm:
+                    st.bc_storm = False
+                    st.add_event("bcast", f"Broadcast back to {rate:,.0f} a second", "info", now)
             if "Duplicate" in N.as_list(data.get("V4State")) and not st.dup_mac:
                 st.dup_mac = "(flagged by Windows)"
 
@@ -725,6 +767,7 @@ class Backend:
         sn = self.sniffer
         if sn is not None and not getattr(sn, "running", True):
             with st.lock:
+                st.add_event("capture", "Packet capture stopped", "warn", time.time(), quiet=3600)
                 st.sniff_msg = ("Capture stopped — run ./install-linux.sh" if IS_LINUX
                                 else "Capture stopped — is Npcap installed?")
         if not up or not ip or ip.startswith("169.254."):
@@ -871,6 +914,7 @@ class Backend:
         self.sniff_gen += 1
         old, oldsock = self.sniffer, self.l2sock
         self.sniffer = self.l2sock = self.sniff_iface = None
+        self._wire_stop()
         threading.Thread(target=self._sniff_start, args=(self.sniff_gen, old, oldsock),
                          daemon=True).start()
 
@@ -943,6 +987,7 @@ class Backend:
             return
         self.sniffer, self.l2sock, self.sniff_iface = sn, sock, iface
         self._set_sniff(gen, "listening")
+        self._wire_start(gen, iface, name, mac)
 
     def send(self, frame):
         sock = self.l2sock
@@ -989,8 +1034,33 @@ class Backend:
             if src != my:
                 st.tagged.add(info["vlan"])
             return
-        if src == my and kind in ("CDP", "LLDP", "EAPOL", "DTP", "STP"):
+        if src == my and kind in ("CDP", "LLDP", "EAPOL", "DTP", "STP", "LACP", "PAUSE", "UDLD",
+                                  "PAGP", "VTP", "LOOP", "ICMP"):
             return                                      # our own announcements / probes
+        w = st.wire
+        if kind in ("LACP", "UDLD", "VTP", "PAGP", "LOOP"):
+            key = kind.lower()
+            if not w[key]:
+                text = {"LACP": "LACP heard: the switch port is set up for a port-channel",
+                        "PAGP": "PAgP heard: the switch port is trying to form a port-channel",
+                        "UDLD": "UDLD heard on this port", "VTP": "VTP heard: this is a trunk-capable port",
+                        "LOOP": "Loopback keepalive heard"}[kind]
+                st.add_event("proto", text, "warn" if kind in ("LACP", "PAGP") else "info", now, quiet=3600)
+            w[key] = dict(info, ts=now)
+            return
+        if kind == "PAUSE":
+            w["pause_frames"] += 1
+            w["pause_at"] = now
+            st.add_event("pause", "PAUSE frame: the link was told to stop sending", "warn", now, quiet=10)
+            return
+        if kind == "ICMP":
+            w["icmp"] = (w["icmp"] + [dict(info, ts=now)])[-12:]
+            if info["what"] == "redirect":
+                st.add_event("icmp", f"ICMP redirect from {info['from']}: use {info['use']}", "warn", now, quiet=60)
+            else:
+                st.add_event("icmp", f"Packet too big: {info['from']} reports a path MTU of {info['mtu']}", "warn",
+                             now, quiet=60)
+            return
         if kind in ("CDP", "LLDP"):
             st.nb[kind] = (info, now)
         elif kind == "DTP":
@@ -1000,6 +1070,9 @@ class Backend:
                 st.stp = dict(info, ts=now)
             if info.get("tc") or info.get("tcn"):
                 st.stp_tc_at = now
+                vlan = info.get("vlan")
+                st.add_event("stp", "Spanning-tree topology change" + (f" (VLAN {vlan})" if vlan else ""),
+                             "warn", now, quiet=30)
         elif kind == "EAPOL":
             if info.get("code") in ("Request", "Success", "Failure"):
                 st.dot1x = dict(info, ts=now)
@@ -1009,14 +1082,30 @@ class Backend:
             self._on_dhcp(info, now, my)
         elif kind == "RA":
             st.ra = dict(info, ts=now)
+            if src and src not in w["routers"] and len(w["routers"]) < 16:
+                extra = bool(w["routers"])
+                pfx = (info.get("prefixes") or [""])[0]
+                w["routers"][src] = {"ts": now, "prefix": pfx}
+                st.add_event("ra", ("Another machine is advertising itself as an IPv6 router: " if extra
+                                    else "IPv6 router heard: ") + src, "bad" if extra else "info", now, quiet=3600)
 
     def _on_arp(self, a, now, my):
         st = self.st
         ip = st.ipv4
+        moved = self.arpwatch.feed(a, now)
+        st.wire["gratuitous"] = self.arpwatch.gratuitous
+        if moved and moved[0] != ip and moved[0] != N.first_v4(st.d.get("Gateway")):
+            st.wire["conflicts"] = [dict(c, ip=i) for i, c in list(self.arpwatch.conflicts.items())[-12:]]
+            st.add_event("conflict", f"IP conflict: {moved[0]} answered from {moved[1]}, now {moved[2]}", "bad",
+                         now, quiet=30)
         if (ip and a["spa"] == ip and a["sha"] != my and a["sha"] != "00:00:00:00:00:00"):
+            if st.dup_mac != a["sha"]:
+                st.add_event("dup", f"Duplicate IP: {a['sha']} also claims {ip}", "bad", now, quiet=60)
             st.dup_mac = a["sha"]
         gw = N.first_v4(st.d.get("Gateway"))
         if gw and a["spa"] == gw:
+            if st.gw_mac and a["sha"] != st.gw_mac and a["sha"] != "00:00:00:00:00:00":
+                st.add_event("gwmac", f"Gateway {gw} changed MAC: {st.gw_mac} to {a['sha']}", "bad", now, quiet=10)
             st.gw_mac = a["sha"]
         sc = st.arp_scan
         if sc["range"] and a["spa"] != "0.0.0.0":
@@ -1035,6 +1124,8 @@ class Backend:
         if d["op"] != 2:
             return
         srv = d.get("server") or d.get("ip_src")
+        if srv not in st.dhcp_seen and st.dhcp_seen:
+            st.add_event("dhcp", f"Another DHCP server answered: {srv}", "bad", now, quiet=300)
         st.dhcp_seen[srv] = {"mac": d.get("src"), "ts": now, "msg": d.get("msg")}
         sc = st.dhcp_scan
         if sc and d["xid"] == sc["xid"] and d["msg"] == "OFFER":
@@ -1197,7 +1288,20 @@ class Backend:
             running = p["running"]
             fresh = new_ping()
             fresh["kind"], fresh["label"], fresh["running"] = PING_TARGETS[i][0], PING_TARGETS[i][1], running
+            fresh["span"] = p["span"]
             self.st.ping = fresh
+
+    PING_SPANS = (30, 300, 1800)
+
+    def ping_next_span(self):
+        with self.st.lock:
+            p, opts = self.st.ping, self.PING_SPANS
+            p["span"] = opts[(opts.index(p["span"]) + 1) % len(opts)] if p["span"] in opts else opts[0]
+
+    def event(self, kind, text, sev="warn", quiet=0.0):
+        """Put something on the event timeline. Use st.add_event when st.lock is already held."""
+        with self.st.lock:
+            self.st.add_event(kind, text, sev, time.time(), quiet)
 
     def _ping_loop(self, ev):
         st = self.st
@@ -1223,7 +1327,7 @@ class Backend:
                     p["sent"] += 1
                     if status == "ok":
                         p["recv"] += 1
-                        p["rtts"].append(rtt)
+                        p["samples"].append((t0, rtt))
                         p["min"] = rtt if p["min"] is None else min(p["min"], rtt)
                         p["max"] = rtt if p["max"] is None else max(p["max"], rtt)
                         p["sum"] += rtt
@@ -1233,7 +1337,7 @@ class Backend:
                         p["last"] = rtt
                         p["log"].appendleft((f"#{p['sent']}  reply  {fmt_ms(rtt)}", OK))
                     else:
-                        p["rtts"].append(None)
+                        p["samples"].append((t0, None))
                         p["log"].appendleft((f"#{p['sent']}  {status}", BAD))
                 ev.wait(max(0.0, 0.25 - (time.time() - t0)))
         finally:
@@ -1487,6 +1591,237 @@ class Backend:
                     if ports is not None:
                         d["ports"], d["services_checked"] = ports, True
         self.st.say(err or f"{ip}: {len(ports)} of {len(S.ALL_PORTS)} common services answer", 4)
+
+    # ---------------------------------------------------------- wire report
+    WIRE_BUSY = 5000                # frames a second at which counting is paused to protect the CPU
+
+    def wire_reset(self):
+        """Start the report again from now."""
+        with self.st.lock:
+            keep_nic = self.st.wire["nic"]
+            self.st.wire = N.new_wire()
+            self.st.wire["nic"] = keep_nic
+        self.arpwatch = N.ArpWatch()
+        self.nic_base = None
+        ww = self.wirewatch
+        if ww is not None:
+            self.wirewatch = N.WireWatch(ww.local)
+        self.st.say("Wire report restarted", 3)
+
+    def _wire_stop(self):
+        sn, self.wire_sniffer, self.wirewatch = self.wire_sniffer, None, None
+        if sn is not None:
+            try:
+                sn.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _wire_local_macs(self, name, mac):
+        return (N.linux_local_macs(name) if IS_LINUX else set()) | {mac}
+
+    def _wire_start(self, gen, iface, name, mac):
+        """A second, count-only listener for everything not addressed to this box."""
+        try:
+            from scapy.all import AsyncSniffer
+            self.wirewatch = N.WireWatch(self._wire_local_macs(name, mac))
+            sn = AsyncSniffer(iface=iface, filter=N.wire_bpf(mac), store=False,
+                              prn=lambda pkt: self._wire_feed(bytes(pkt)))
+            sn.start()
+            self.wire_sniffer = sn
+        except Exception:  # noqa: BLE001
+            log_error("Wire report listener failed to start")
+            self.wirewatch = None
+
+    def _wire_feed(self, raw):
+        ww = self.wirewatch
+        if ww is not None:
+            ww.feed(raw)
+
+    def wire_loop(self):
+        """Every second: flooding and talker rates. Every five: the adapter's own settings and
+        counters. Runs for the life of the app."""
+        n = 0
+        resume_at = 0.0
+        while True:
+            time.sleep(1)
+            n += 1
+            try:
+                now = time.time()
+                ww = self.wirewatch
+                st = self.st
+                with st.lock:
+                    name, up, mac = st.sel, st.link, self.my_mac()
+                if ww is None and resume_at and now >= resume_at and self.sniff_iface is not None:
+                    resume_at = 0.0
+                    self._wire_start(self.sniff_gen, self.sniff_iface, name, mac)
+                    with st.lock:
+                        st.wire["paused"] = False
+                elif ww is not None:
+                    ww.tick(now)
+                    snap = ww.snapshot()
+                    with st.lock:
+                        was = (st.wire["talk"] or {}).get("flood_pps", 0)
+                        st.wire["talk"] = snap
+                        if snap["flood_pps"] >= 20 > was:
+                            st.add_event("flood", f"Flooding: {snap['flood_pps']:,.0f} frames a second for other "
+                                         "machines are reaching this port", "warn", now, quiet=20)
+                    if snap["pps"] > self.WIRE_BUSY:
+                        self._wire_stop()
+                        resume_at = now + 30
+                        with st.lock:
+                            st.wire["paused"] = True
+                            st.add_event("flood", f"Over {self.WIRE_BUSY:,} frames a second not addressed to this "
+                                         "box: a mirror port, a hub, or a severe flood", "warn", now, quiet=120)
+                if n % 5 == 0 and name and up:
+                    self._nic_poll(name)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _nic_report(self, name):
+        return N.linux_nic_report(name) if IS_LINUX else None
+
+    def _nic_poll(self, name):
+        rep = self._nic_report(name)
+        st = self.st
+        now = time.time()
+        if rep is None:
+            return
+        pause, errors = rep["stats"]
+        cur = dict(pause, **errors)
+        with st.lock:
+            if st.sel != name:
+                return
+            old_eee = ((st.wire["nic"] or {}).get("eee") or {}).get("active")
+            st.wire["nic"] = rep
+            if self.nic_base is None or self.nic_base[0] != name:
+                self.nic_base = (name, cur, cur)
+            _, base, last = self.nic_base
+            st.wire["rises"] = N.counter_rises(base, cur)
+            step = N.counter_rises(last, cur)
+            self.nic_base = (name, base, cur)
+            for k, v in sorted(step.items()):
+                if N.PAUSE_STAT.search(k):
+                    st.add_event("pause", f"PAUSE frames counted by the adapter ({k})", "warn", now, quiet=15)
+                else:
+                    st.add_event("errors", f"Adapter error counter rising: {k} +{v:,}", "bad", now, quiet=15)
+            if rep["eee"].get("active") and not old_eee:
+                st.add_event("eee", "Energy Efficient Ethernet is active on this link", "warn", now, quiet=3600)
+            best = N.downshift(rep["link"])
+            if best:
+                st.add_event("link", f"Linked at {N.fmt_speed(rep['link']['speed'])} although both ends offer "
+                             f"{N.fmt_speed(best)}: suspect the cable", "bad", now, quiet=3600)
+
+    # ---------------------------------------------------------- tick-rate test
+    TICK_SPANS = (30, 300)
+    TICK_COLS = 240
+
+    def tick_toggle(self):
+        with self.st.lock:
+            running, rate, src = self.st.tick["running"], self.st.tick["rate"], self.st.ipv4
+        if running:
+            self.stops["tick"].set()
+            return
+        target = N.parse_tick_server(self.settings.get("tick_server"))
+        if not target:
+            self.st.say("Set the reflector's address first (the Server button)", 5)
+            return
+        if not src:
+            self.st.say("Need an IP address", 3)
+            return
+        ev = self._new_stop("tick")
+        with self.st.lock:
+            self.st.tick.update(running=True, msg="", sum=None, cols=[], counters={},
+                                target=f"{target[0]}:{target[1]}", impacts={})
+        threading.Thread(target=self._tick_run, args=(ev, src, target, rate), daemon=True).start()
+
+    def tick_next_rate(self):
+        with self.st.lock:
+            t, opts = self.st.tick, N.TICK_RATES
+            if not t["running"]:
+                t["rate"] = opts[(opts.index(t["rate"]) + 1) % len(opts)] if t["rate"] in opts else opts[0]
+
+    def tick_next_span(self):
+        with self.st.lock:
+            t, opts = self.st.tick, self.TICK_SPANS
+            t["span"] = opts[(opts.index(t["span"]) + 1) % len(opts)] if t["span"] in opts else opts[0]
+
+    def tick_set_server(self, text):
+        text = (text or "").strip()
+        if text and not N.parse_tick_server(text):
+            self.st.say("Enter an address like 10.1.2.3, optionally followed by a port", 5)
+            return
+        self.settings.set("tick_server", text)
+
+    def _tick_open(self, src, target, rate):
+        t = N.TickTest(src, target[0], target[1], rate)
+        t.start()
+        return t.buf, t
+
+    def _tick_run(self, ev, src, target, rate):
+        st = self.st
+        try:
+            buf, test = self._tick_open(src, target, rate)
+        except OSError as e:
+            with st.lock:
+                st.tick.update(running=False, msg=f"Couldn't start: {e}"[:80])
+            return
+        t0 = time.time()
+        while not ev.wait(0.5):
+            self._tick_publish(buf, rate, getattr(test, "pace_err", 0.0), t0)
+        if test is not None:
+            test.stop()
+        self._tick_publish(buf, rate, getattr(test, "pace_err", 0.0), t0)
+        with st.lock:
+            st.tick["running"] = False
+
+    def _tick_publish(self, buf, rate, pace, t0):
+        """Twice a second: boil the run down to what the screen needs. The packets themselves
+        stay here; copying tens of thousands of them into the UI each refresh would be slow."""
+        st = self.st
+        now = time.time()
+        with st.lock:
+            span, events = st.tick["span"], list(st.events)
+        samples = buf.samples(now)
+        recent = [x for x in samples if x[0] >= now - span]
+        summ = N.tick_summary(recent, rate)
+        c = buf.counters()
+        msg = ""
+        if c["sent"] > rate * 2 and c["recv"] == 0 and now - t0 > 2:
+            msg = "No replies. Is the reflector running there, and is its firewall open?"
+        impacts = {e["ts"]: N.impact_text(N.event_impact(samples, e["ts"], before=10, after=3),
+                                          "the test", "packet")
+                   for e in events[-25:]}
+        with st.lock:
+            st.tick.update(sum=summ, counters=c, pace=pace, t_end=now, msg=msg, impacts=impacts,
+                           cols=N.bucket_samples(samples, now, span, self.TICK_COLS),
+                           normal=summ["p50"] or 0.0)
+
+    def tick_reflect_toggle(self):
+        r = getattr(self, "reflector", None)
+        if r is not None:
+            r.stop()
+            self.reflector = None
+            with self.st.lock:
+                self.st.tick.update(reflecting=False)
+            self.st.say("Reflector stopped", 3)
+            return
+        try:
+            r = N.Reflector(N.TICK_PORT)
+        except OSError as e:
+            self.st.say(f"Can't listen on UDP {N.TICK_PORT}: {e}"[:70], 5)
+            return
+        r.start()
+        self.reflector = r
+        with self.st.lock:
+            self.st.tick.update(reflecting=True, reflected=0, peers=[])
+        self.st.say(f"Reflecting on UDP port {N.TICK_PORT}", 4)
+
+        def watch():
+            while self.reflector is r:
+                with self.st.lock:
+                    self.st.tick.update(reflected=r.count, peers=sorted(r.peers))
+                time.sleep(1)
+        threading.Thread(target=watch, daemon=True).start()
 
     # ---------------------------------------------------------- multicast browser
     MCAST_PROBE_GROUP = "239.192.137.251"       # joined for a moment to make a querier speak up
@@ -1759,6 +2094,41 @@ class DemoBackend(Backend):
         self.l2sock = object()
         threading.Thread(target=self.loop, daemon=True).start()
         threading.Thread(target=self.probe_loop, daemon=True).start()
+        threading.Thread(target=self._demo_wire, daemon=True).start()
+
+    def wire_reset(self):
+        self._demo_wire(once=True)
+        self.st.say("Wire report restarted", 3)
+
+    def _demo_wire(self, once=False):
+        """A port with a few things wrong on it, so the wire report has something to show."""
+        while True:
+            if not once:
+                time.sleep(6)
+            now = time.time()
+            with self.st.lock:
+                w = self.st.wire
+                if once:
+                    w = self.st.wire = N.new_wire()
+                w["nic"] = {"pause": {"autoneg": True, "rx": True, "tx": False},
+                            "eee": {"supported": True, "enabled": True, "active": True, "partner": True},
+                            "link": {"speed": 1000, "duplex": "Full", "ours": [10, 100, 1000, 2500],
+                                     "partner": [10, 100, 1000]},
+                            "stats": ({"rx_pause": 1840}, {"rx_crc_errors": 0, "align_errors": 0})}
+                w["rises"] = {"rx_pause": int(now - w["since"]) // 4 + 3}
+                w["talk"] = {"talkers": [
+                    {"mac": "9c:76:13:aa:01:02", "bc": 5120, "mc": 240, "bytes": 0, "bc_pps": 84.0, "mc_pps": 3.0},
+                    {"mac": "48:a6:b8:c1:d2:e3", "bc": 310, "mc": 4100, "bytes": 0, "bc_pps": 1.0, "mc_pps": 22.0},
+                    {"mac": "d8:31:34:aa:bb:cc", "bc": 120, "mc": 980, "bytes": 0, "bc_pps": 0.0, "mc_pps": 6.0}],
+                    "n_talkers": 14, "flood": 412, "flood_pps": 0.0, "pps": 140.0, "flood_dst": ["ec:b5:fa:12:34:56"]}
+                w["conflicts"] = [{"ip": "10.20.30.88", "macs": ["3c:22:fb:10:20:30", "a4:83:e7:44:55:66"], "ts": now}]
+                w["routers"] = {"70:db:98:1a:00:01": {"ts": now, "prefix": "2001:db8:30::/64"},
+                                "a4:83:e7:44:55:66": {"ts": now, "prefix": "fd00:1234::/64"}}
+                w["udld"] = {"op": "probe", "device": "FOC2145Z0AB", "port": "Gi1/0/23", "ts": now}
+                w["icmp"] = [{"what": "fragneeded", "from": "10.20.0.1", "to": "10.20.30.147", "mtu": 1400,
+                              "about": "172.16.9.20", "ts": now}]
+            if once:
+                return
 
     def send(self, frame):
         return True
@@ -1812,7 +2182,16 @@ class DemoBackend(Backend):
         if ttl < 6:
             hops = ["10.20.30.2", "10.20.0.1", "172.16.1.1", "68.85.10.1", "162.158.4.1"]
             return ("ttl", hops[ttl - 1], random.uniform(1, 4) * ttl)
-        if random.random() < 0.02:
+        # Every 23 s the demo network has a spanning-tree change that costs a second of lag, and
+        # once in between a gateway MAC change that costs nothing.
+        phase = time.time() % 23
+        if phase < 1.2:
+            self.event("stp", "Spanning-tree topology change (VLAN 30)", "warn", quiet=10)
+            return ("timeout", None, None) if random.random() < 0.45 else ("ok", dst, random.uniform(60, 220))
+        if 11 < phase < 12:
+            self.event("gwmac", "Gateway 10.20.30.1 changed MAC: 00:00:0c:07:ac:1e to 70:db:98:1a:00:01",
+                       "bad", quiet=10)
+        if random.random() < 0.004:
             return ("timeout", None, None)
         return ("ok", dst, random.uniform(0.4, 2.5))
 
@@ -1882,6 +2261,39 @@ class DemoBackend(Backend):
 
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
+
+    def _tick_open(self, src, target, rate):
+        """A made-up path: steady 1.2 ms, with the demo network's spanning-tree glitch in it."""
+        buf = N.TickBuffer()
+        stop = self.stops["tick"]
+
+        def feed():
+            due = time.time()
+            while not stop.is_set():
+                now = time.time()
+                while due <= now:
+                    seq = buf.add_sent(due)
+                    phase = due % 23
+                    if phase < 1.2:
+                        self.event("stp", "Spanning-tree topology change (VLAN 30)", "warn", quiet=10)
+                        if random.random() < 0.5:
+                            buf.add_reply(seq, random.uniform(20, 90))
+                    elif random.random() > 0.0008:
+                        buf.add_reply(seq, max(0.3, random.gauss(1.2, 0.12)))
+                    due += 1.0 / rate
+                time.sleep(0.05)
+        threading.Thread(target=feed, daemon=True).start()
+        return buf, None
+
+    def tick_toggle(self):
+        if not self.settings.get("tick_server"):
+            self.settings.data["tick_server"] = "10.20.30.200"
+        super().tick_toggle()
+
+    def tick_reflect_toggle(self):
+        with self.st.lock:
+            on = not self.st.tick["reflecting"]
+            self.st.tick.update(reflecting=on, reflected=18240 if on else 0, peers=["10.20.30.61"] if on else [])
 
     def mcast_start(self):
         with self.st.lock:
@@ -2384,7 +2796,8 @@ class ToolView(tk.Frame):
         self.sub.pack(fill="x")
         self.chart = None
         if chart:
-            self.chart = tk.Canvas(self, bg=PANEL, highlightthickness=0, height=int(ui.H * 0.15))
+            frac = chart if isinstance(chart, float) else 0.15
+            self.chart = tk.Canvas(self, bg=PANEL, highlightthickness=0, height=int(ui.H * frac))
             self.chart.pack(fill="x", pady=(ui.pad // 2, 0))
         self.list = ListView(self, ui)
         self.list.pack(fill="both", expand=True, pady=(ui.pad // 2, 0))
@@ -2571,7 +2984,13 @@ class UI:
         self.build_tools_grid()
         self.tools = {
             "ping": ToolView(self.body, self, "Ping", [("Start", self.be.ping_toggle),
-                                                     ("Target ›", self.be.ping_next_target)], chart=True),
+                                                     ("Target ›", self.be.ping_next_target),
+                                                     ("30 s", self.be.ping_next_span)], chart=0.24),
+            "tick": ToolView(self.body, self, "Tick test", [("Start", self.be.tick_toggle),
+                                                           ("64/s", self.be.tick_next_rate),
+                                                           ("30 s", self.be.tick_next_span),
+                                                           ("Server", self.tick_server_dialog),
+                                                           ("Reflect", self.be.tick_reflect_toggle)], chart=0.24),
             "trace": ToolView(self.body, self, "Traceroute", [("Run", self.be.trace_toggle),
                                                              ("Target ›", self.be.trace_next_target)]),
             "speed": ToolView(self.body, self, "Speed test", [("iperf3", self.be.speed_iperf),
@@ -2581,6 +3000,7 @@ class UI:
             "mdns": ToolView(self.body, self, "mDNS browser", [("Scan", self.be.mdns_scan),
                                                               ("Clear", self.be.mdns.reset)]),
             "blink": ToolView(self.body, self, "Port finder", [("Start", self.be.blink_toggle)]),
+            "wire": ToolView(self.body, self, "Wire report", [("Restart", self.be.wire_reset)]),
             "mcast": ToolView(self.body, self, "Multicast", [("Stop", self.be.mcast_toggle),
                                                            ("Join…", self.mcast_join_dialog),
                                                            ("Querier", self.be.mcast_probe)]),
@@ -2724,12 +3144,13 @@ class UI:
     def build_tools_grid(self):
         page = tk.Frame(self.body, bg=BG)
         self.views["TOOLS"] = page
-        items = [("Ping", lambda: self.show("ping")), ("Traceroute", lambda: self.show("trace")),
-                 ("Speed test", lambda: self.show("speed")), ("ARP table", self.open_arp),
-                 ("ARP scan", lambda: self.show("arpscan")), ("mDNS browser", self.open_mdns),
-                 ("Port finder", lambda: self.show("blink")), ("Capture", self.open_capture),
-                 ("Multicast", self.open_mcast), ("Port log", lambda: self.show("log")), ("Re-run checks", self.be.rerun_checks),
-                 ("Settings", lambda: self.show("settings"))]
+        items = [("Ping", lambda: self.show("ping")), ("Tick test", lambda: self.show("tick")),
+                 ("Traceroute", lambda: self.show("trace")), ("Speed test", lambda: self.show("speed")),
+                 ("Wire report", lambda: self.show("wire")), ("Multicast", self.open_mcast),
+                 ("ARP table", self.open_arp), ("ARP scan", lambda: self.show("arpscan")),
+                 ("mDNS browser", self.open_mdns), ("Capture", self.open_capture),
+                 ("Port finder", lambda: self.show("blink")), ("Port log", lambda: self.show("log")),
+                 ("Re-run checks", self.be.rerun_checks), ("Settings", lambda: self.show("settings"))]
         for c in range(2):
             page.columnconfigure(c, weight=1, uniform="c")
         for r in range((len(items) + 1) // 2):
@@ -2794,6 +3215,12 @@ class UI:
         self.show("mdns")
         if not self.be.mdns.snapshot()["last_scan"]:
             self.be.mdns_scan()
+
+    def tick_server_dialog(self):
+        Keyboard(self, "Reflector address for the tick test", self.be.settings.get("tick_server"),
+                 self.be.tick_set_server,
+                 f"The machine running 'porkchopcheck --reflector', or another PorkChopCheck with "
+                 f"Reflect on. Port {N.TICK_PORT} unless you add another after a space.")
 
     def open_mcast(self):
         self.show("mcast")
@@ -3128,9 +3555,13 @@ class UI:
         return (fmt_ms(v), OK)
 
     # ---------------------------------------------------------- tool renders
+    SEV_COLOR = {"bad": BAD, "warn": WARN, "info": HDR}
+
     def render_ping(self, s, v, now):
         p = s["ping"]
+        samples, span = list(p["samples"]), p["span"]
         v.set_action(0, "Stop" if p["running"] else "Start", RED if p["running"] else BLUE)
+        v.set_action(2, {30: "30 s", 300: "5 min", 1800: "30 min"}.get(span, f"{span} s"))
         tgt = p["target"] or "(no address yet)"
         if p["sent"]:
             loss = 100 * (p["sent"] - p["recv"]) / p["sent"]
@@ -3138,32 +3569,135 @@ class UI:
             jit = p["jit"] / p["jn"] if p["jn"] else 0
             color = OK if loss == 0 else WARN if loss < 5 else BAD
             summ = f"{loss:.1f}% loss · avg {fmt_ms(avg) or '—'} · jitter {jit:.1f} ms"
+            rtts = [r for _, r in samples]
+            p99 = N.percentile(rtts, 99)
             sub = (f"{p['label']} {tgt} · sent {p['sent']} · min {fmt_ms(p['min']) or '—'}"
-                   f" · max {fmt_ms(p['max']) or '—'}")
+                   f" · 99% under {fmt_ms(p99) or '—'} · max {fmt_ms(p['max']) or '—'}")
         else:
             color, summ = FG, f"{p['label']}: {tgt}"
-            sub = "Tap Start — 4 pings a second. Target › cycles gateway / DNS / switch / internet."
+            sub = "Tap Start — 4 pings a second. Port events are marked on the graph as they happen."
         v.set_summary(summ, color, sub)
-        self.draw_chart(v.chart, list(p["rtts"]))
-        v.list.set_rows([(t, c, "mono") for t, c in p["log"]], "")
+        t_end = now if p["running"] or not samples else samples[-1][0]
+        events = list(s["events"])
+        ncol = 120 if span <= 30 else max(60, v.chart.winfo_width() // 3)
+        normal = N.percentile([r for _, r in samples if r is not None], 50) or 0
+        self.draw_timeline(v.chart, N.bucket_samples(samples, t_end, span, ncol), normal, events, t_end, span)
+        rows = [("Port events, newest first", HDR, "hdr")]
+        for e in reversed(events[-25:]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+            went_on = e["last"] - e["ts"]
+            lasted = f"  (kept up for {went_on:.0f} s)" if went_on >= 2 else ""
+            rows.append((f"{stamp}  {e['text']}{lasted}", self.SEV_COLOR.get(e["sev"], FG), "row"))
+            rows.append(("              " + N.impact_text(N.event_impact(samples, e["ts"])), DIM, "dim"))
+        if not events:
+            rows.append(("None yet. Link drops, speed changes, spanning-tree changes, gateway MAC changes, "
+                         "broadcast storms, duplicate IPs and extra DHCP servers show up here and on the graph.",
+                         DIM, "dim"))
+        rows.append(("Last pings", HDR, "hdr"))
+        rows += [(t, c, "mono") for t, c in list(p["log"])[:8]]
+        v.list.set_rows(rows, "")
 
-    def draw_chart(self, c, rtts):
+    def render_tick(self, s, v, now):
+        t = s["tick"]
+        run, rate, span, summ = t["running"], t["rate"], t["span"], t["sum"]
+        v.set_action(0, "Stop" if run else "Start", RED if run else BLUE)
+        v.set_action(1, f"{rate}/s", GREY if run else BLUE)
+        v.set_action(2, {30: "30 s", 300: "5 min"}.get(span, f"{span} s"))
+        v.set_action(4, "Reflecting" if t["reflecting"] else "Reflect", GREEN if t["reflecting"] else BLUE)
+        server = self.be.settings.get("tick_server")
+        tick_ms = 1000.0 / rate
+        if summ and summ["n"]:
+            head, level = N.tick_verdict(summ, rate)
+            color = {"ok": OK, "warn": WARN, "bad": BAD}.get(level, FG)
+            c = t["counters"]
+            sub = t["msg"] or (f"{t['target']} · {rate} a second · sent {c.get('sent', 0):,}"
+                               f" · longest gap {summ['burst']} · late {summ['late']}"
+                               f" · out of order {c.get('reorder', 0)}")
+            v.set_summary(head, color, sub, BAD if t["msg"] else DIM)
+        elif run:
+            v.set_summary("Waiting for replies…", FG, t["msg"] or t["target"], BAD if t["msg"] else DIM)
+        else:
+            v.set_summary("Game-rate UDP test", FG, t["msg"] or (
+                f"Reflector: {server}. Tap Start." if server else
+                "Tap Server to set where the reflector is, then Start."), BAD if t["msg"] else DIM)
+        events = list(s["events"])
+        # A reply that takes one tick longer than usual arrives a tick late: that is the amber line.
+        self.draw_timeline(v.chart, t["cols"], t["normal"], events, t["t_end"] or now, span,
+                           slow=t["normal"] + tick_ms, cap=max(t["normal"] + 3 * tick_ms, 3 * t["normal"] + 5))
+        rows = []
+        if summ and summ["n"] and summ["min"] is not None:
+            rows += [("Reply times over the " + ("last 30 s" if span == 30 else "last 5 min"), HDR, "hdr"),
+                     (f"fastest {summ['min']:.1f} · typical {summ['p50']:.1f} · 95% under {summ['p95']:.1f} · "
+                      f"99% under {summ['p99']:.1f} · slowest {summ['max']:.1f} ms", FG, "row"),
+                     (f"{summ['lost']} of {summ['n']:,} lost · longest run of lost packets {summ['burst']} · "
+                      f"{summ['late']} replies over a tick ({tick_ms:.1f} ms) late · "
+                      f"{t['counters'].get('dup', 0)} duplicated · this box's own send timing is within "
+                      f"{t['pace']:.2f} ms", DIM, "dim")]
+        if t["reflecting"]:
+            rows += [("Reflector", HDR, "hdr"),
+                     (f"Answering on UDP port {N.TICK_PORT}: {t['reflected']:,} packets returned"
+                      + (f" to {', '.join(t['peers'][:3])}" if t["peers"] else ""), OK, "row")]
+        rows.append(("Port events, newest first", HDR, "hdr"))
+        for e in reversed(events[-25:]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+            rows.append((f"{stamp}  {e['text']}", self.SEV_COLOR.get(e["sev"], FG), "row"))
+            imp = t["impacts"].get(e["ts"])
+            if imp:
+                rows.append(("              " + imp, DIM, "dim"))
+        if not events:
+            rows.append(("None yet.", DIM, "dim"))
+        rows.append(("How to use it", HDR, "hdr"))
+        rows.append((f"Run 'porkchopcheck --reflector' on the game server or any machine at the far end, or tap "
+                     f"Reflect on a second PorkChopCheck. Then set its address with Server and tap Start. "
+                     f"This sends {N.TICK_SIZE}-byte UDP packets at the game's rate and times each one.", FG, "row"))
+        v.list.set_rows(rows, "")
+
+    def draw_timeline(self, c, cols, normal, events, t_end, span, slow=None, cap=None):
+        """Latency bars with lost packets in red, and under them a lane marking each port event.
+        `cols` is N.bucket_samples output; `normal` the usual reply time, for colouring. With
+        `cap`, the scale stops there so one huge spike doesn't flatten everything else; bars
+        that go past it are drawn full height and the scale label gets a plus."""
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 20 or not rtts:
+        if w < 20 or not cols:
             return
-        n = 120
-        bw = w / n
-        vals = [r for r in rtts if r is not None]
+        lane = max(10, int(h * 0.2))
+        ph = h - lane
+        ncol = len(cols)
+        bw = w / ncol
+        vals = [r for r, _, _ in cols if r is not None]
+        slow = slow if slow is not None else max(20, 3 * normal)
         top = max(max(vals) if vals else 1, 2) * 1.15
-        for i, r in enumerate(rtts):
-            x = (n - len(rtts) + i) * bw
+        clipped = cap is not None and top > cap
+        if clipped:
+            top = cap
+        for i, (r, lost, n) in enumerate(cols):
+            x = i * bw
+            if not n:
+                continue
             if r is None:
-                c.create_rectangle(x, 0, x + bw - 1, h, fill=BAD, width=0)
-            else:
-                bh = max(2, h * r / top)
-                c.create_rectangle(x, h - bh, x + bw - 1, h, fill=OK if r < 20 else WARN, width=0)
-        c.create_text(6, 4, anchor="nw", text=f"{top:.0f} ms", fill=DIM, font=self.font(self.sz["rowsm"]))
+                c.create_rectangle(x, 0, x + bw - 1, ph, fill=BAD, width=0)
+                continue
+            bh = min(ph, max(2, ph * r / top))
+            c.create_rectangle(x, ph - bh, x + max(1, bw - 1), ph, fill=OK if r < slow else WARN, width=0)
+            if lost:
+                c.create_rectangle(x, 0, x + bw - 1, max(3, ph * 0.12), fill=BAD, width=0)
+        c.create_line(0, ph, w, ph, fill=GREY)
+        t0 = t_end - span
+        for e in events:
+            if e["last"] < t0 or e["ts"] > t_end:
+                continue
+            x = max(1, min(w - 2, (max(e["ts"], t0) - t0) / span * w))
+            col = self.SEV_COLOR.get(e["sev"], FG)
+            c.create_line(x, 0, x, ph, fill=col, dash=(3, 3))
+            c.create_polygon(x, ph + 2, x - lane * 0.45, h - 1, x + lane * 0.45, h - 1, fill=col, outline="")
+        font = self.font(self.sz["rowsm"])
+        label = {30: "last 30 s", 300: "last 5 min", 1800: "last 30 min"}.get(span, "")
+        tag = c.create_text(6, 4, anchor="nw", fill=FG, font=font,
+                            text=f"{top:.0f}{'+' if clipped else ''} ms  ·  {label}")
+        box = c.bbox(tag)
+        if box:
+            c.tag_lower(c.create_rectangle(box[0] - 4, box[1] - 2, box[2] + 4, box[3] + 2, fill=BG, width=0), tag)
 
     def render_trace(self, s, v, now):
         t = s["trace"]
@@ -3256,6 +3790,25 @@ class UI:
                           f"Multicast announcements seen: {mc} · replies: {m['unicast_replies']}")
         rows = [(t, HDR if k == "hdr" else FG, k) for t, k in N.mdns_rows(m)]
         v.list.set_rows(rows, "Tap Scan to browse Bonjour / mDNS services")
+
+    LEVEL_COLOR = {"ok": OK, "info": FG, "warn": WARN, "bad": BAD}
+
+    def render_wire(self, s, v, now):
+        w = s["wire"]
+        oui = self.be.oui
+        findings = N.wire_findings(w, lambda mac: (oui.lookup(mac) if oui else "") or "", IS_LINUX)
+        head, level = N.wire_headline(findings)
+        mins = max(0, now - w["since"]) / 60
+        v.set_summary(head, self.LEVEL_COLOR[level],
+                      f"What's on this port that the other pages don't show · watching for {mins:.0f} min"
+                      + (f" · {s['sniff_msg']}" if s["sniff_msg"] != "listening" else ""))
+        rows, last = [], None
+        for sec, lv, text in findings:
+            if sec != last:
+                rows.append((sec, HDR, "hdr"))
+                last = sec
+            rows.append((("✓ " if lv == "ok" else "• ") + text, self.LEVEL_COLOR[lv] if lv != "ok" else DIM, "row"))
+        v.list.set_rows(rows)
 
     def render_mcast(self, s, v, now):
         m = s["mcast"]

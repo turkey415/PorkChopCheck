@@ -128,6 +128,207 @@ rows = N.list_captures(cap_dir)
 check("capture list: only .pcap files, with sizes", [r[0] for r in rows] == [os.path.basename(cap)] and rows[0][1] == w.bytes)
 check("capture list: a missing folder is just empty", N.list_captures(os.path.join(tmp, "nope")) == [])
 check("fmt_bytes", [N.fmt_bytes(n) for n in (0, 999, 1024, 1536, 5 << 20, 3 << 30)] == ["0 B", "999 B", "1.0 kB", "1.5 kB", "5.0 MB", "3.0 GB"])
+# event timeline: the log, the chart columns and what ping did around an event
+import collections
+evs = collections.deque(maxlen=4)
+e1 = N.add_event(evs, "stp", "Spanning-tree topology change", "warn", 100.0, quiet=30)
+e2 = N.add_event(evs, "stp", "Spanning-tree topology change", "warn", 112.0, quiet=30)
+check("events: a repeat inside the quiet time is counted, not added", e2 is e1 and len(evs) == 1 and (e1["count"], e1["ts"], e1["last"]) == (2, 100.0, 112.0))
+N.add_event(evs, "link", "Link down", "bad", 113.0)
+check("events: a different event is its own entry", [e["kind"] for e in evs] == ["stp", "link"])
+N.add_event(evs, "stp", "Spanning-tree topology change", "warn", 130.0, quiet=30)
+check("events: the quiet time runs from the last repeat", len(evs) == 2 and evs[0]["count"] == 3)
+N.add_event(evs, "stp", "Spanning-tree topology change", "warn", 200.0, quiet=30)
+check("events: after the quiet time it is a new entry", len(evs) == 3 and evs[-1]["count"] == 1 and evs[-1]["ts"] == 200.0)
+N.add_event(evs, "link", "Link down", "bad", 201.0); N.add_event(evs, "link", "Link down", "bad", 202.0)
+check("events: with no quiet time every one is logged, and the log is capped", len(evs) == 4 and [e["ts"] for e in evs][-2:] == [201.0, 202.0])
+check("percentile: nearest rank", (N.percentile([1, 2, 3, 4, 100], 50), N.percentile([1, 2, 3, 4, 100], 95), N.percentile(range(1, 101), 99), N.percentile([7], 99)) == (3, 100, 99, 7))
+check("percentile: ignores lost pings, None when empty", N.percentile([None, 5, None], 50) == 5 and N.percentile([], 50) is None and N.percentile([None], 99) is None)
+smp = [(t / 4, 3.0) for t in range(400)]          # 100 s of steady 3 ms pings, 4 a second
+smp[200] = (50.0, None); smp[201] = (50.25, None); smp[202] = (50.5, 180.0)
+cols = N.bucket_samples(smp, 60.0, 30.0, 6)
+check("chart columns: worst reply, lost count, sent count", cols[4] == (180.0, 2, 20) and cols[0] == (3.0, 0, 20), cols)
+check("chart columns: nothing outside the window, empty columns stay empty", N.bucket_samples(smp, 200.0, 30.0, 6) == [(None, 0, 0)] * 6)
+check("chart columns: a column of only lost pings has no reply time", N.bucket_samples([(1.0, None), (1.1, None)], 2.0, 2.0, 2) == [(None, 0, 0), (None, 2, 2)])
+imp = N.event_impact(smp, 50.0)
+check("impact: loss and a spike around the event", imp == {"lost": 2, "peak": 180.0, "normal": 3.0, "hit": True}, imp)
+check("impact text: loss and peak", N.impact_text(imp) == "2 pings lost · peak 180 ms, normally 3 ms")
+check("impact: a quiet moment is no effect", N.impact_text(N.event_impact(smp, 20.0)) == "no effect on ping")
+check("impact: no pings then", N.event_impact(smp, 500.0) is None and N.impact_text(None) == "ping wasn't running")
+slow = [(t / 4, 40.0 + (t % 3)) for t in range(400)]
+check("impact: a steady slow link is not a spike", N.event_impact(slow, 50.0)["hit"] is False)
+one = [(t / 4, 3.0) for t in range(400)]; one[200] = (50.0, None)
+check("impact text: one lost ping, singular", N.impact_text(N.event_impact(one, 50.0)) == "1 ping lost")
+# wire report: the extra protocols, flooding and talkers, address conflicts, adapter readings
+ETH = lambda dst, et, body, src="70db981a0001": bytes.fromhex(dst + src) + struct.pack("!H", et) + body
+lacp = bytes([1, 1, 1, 20]) + struct.pack("!H", 32768) + bytes.fromhex("70db981a0000") + struct.pack("!HHH", 13, 255, 23) + bytes([0x3F]) + bytes(90)
+k, i = N.classify(ETH("0180c2000002", 0x8809, lacp))[0]
+check("classify: LACP with the switch's system, key and state", k == "LACP" and (i["system"], i["key"], i["port"], i["active"], i["fast"], i["in_sync"]) == ("70:db:98:1a:00:00", 13, 23, True, True, True), i)
+check("classify: a marker PDU on the same ethertype is not LACP", N.classify(ETH("0180c2000002", 0x8809, bytes([2, 1]) + bytes(40))) == [])
+k, i = N.classify(ETH("0180c2000001", 0x8808, struct.pack("!HH", 1, 0xFFFF) + bytes(42)))[0]
+check("classify: 802.3x PAUSE with its quanta", (k, i["kind"], i["quanta"]) == ("PAUSE", "PAUSE", 0xFFFF))
+k, i = N.classify(ETH("0180c2000001", 0x8808, struct.pack("!HH8H", 0x0101, 0xFF, 0, 0, 0, 500, 0, 0, 0, 0) + bytes(20)))[0]
+check("classify: priority flow control", (k, i["kind"], i["quanta"]) == ("PAUSE", "PFC", 500))
+check("classify: Cisco loopback keepalive", N.classify(ETH("70db981a0001", 0x9000, bytes(46)))[0][0] == "LOOP")
+snap_ = lambda pid, body: ETH("01000ccccccc", 8 + len(body), bytes.fromhex("aaaa0300000c") + struct.pack("!H", pid) + body)
+udld = bytes([0x21, 0, 0, 0]) + struct.pack("!HH", 1, 15) + b"FOC2145Z0AB" + struct.pack("!HH", 2, 12) + b"Gi1/0/23"
+k, i = N.classify(snap_(0x0111, udld))[0]
+check("classify: UDLD with device and port", (k, i["op"], i["device"], i["port"]) == ("UDLD", "probe", "FOC2145Z0AB", "Gi1/0/23"), i)
+k, i = N.classify(snap_(0x2003, bytes([2, 1, 0, 6]) + b"CAMPUS".ljust(32, b"\x00") + bytes(8)))[0]
+check("classify: VTP with its domain", (k, i["domain"], i["version"]) == ("VTP", "CAMPUS", 2), i)
+check("classify: PAgP", N.classify(snap_(0x0104, bytes(20)))[0][0] == "PAGP")
+check("classify: truncated UDLD and VTP don't raise", N.classify(snap_(0x0111, b"\x21"))  == [] and N.classify(snap_(0x2003, b"\x02"))[0][1] == {"kind": "VTP", "src": "70:db:98:1a:00:01", "dst": "01:00:0c:cc:cc:cc", "vlan_tag": None})
+def ip4(src, dst, proto, body):
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(body), 0, 0, 64, proto, 0, socket.inet_aton(src), socket.inet_aton(dst))
+    return h[:10] + struct.pack("!H", N.checksum(h)) + h[12:] + body
+inner = ip4("10.20.30.147", "172.16.9.20", 6, bytes(8))
+red = ETH("001122334455", 0x0800, ip4("10.20.30.1", "10.20.30.147", 1, bytes([5, 1, 0, 0]) + socket.inet_aton("10.20.30.2") + inner))
+k, i = N.classify(red)[0]
+check("classify: ICMP redirect names the better gateway", (k, i["what"], i["from"], i["use"], i["about"]) == ("ICMP", "redirect", "10.20.30.1", "10.20.30.2", "172.16.9.20"), i)
+frag = ETH("001122334455", 0x0800, ip4("10.20.0.1", "10.20.30.147", 1, bytes([3, 4, 0, 0, 0, 0]) + struct.pack("!H", 1400) + inner))
+k, i = N.classify(frag)[0]
+check("classify: fragmentation needed carries the path MTU", (i["what"], i["mtu"], i["about"]) == ("fragneeded", 1400, "172.16.9.20"), i)
+check("classify: an ordinary ping reply is not a notice", N.classify(ETH("001122334455", 0x0800, ip4("10.20.30.1", "10.20.30.147", 1, bytes([0, 0, 0, 0, 0, 1, 0, 1])))) == [])
+aw = N.ArpWatch()
+arp = lambda ip, mac, tpa="10.20.30.1": {"op": 2, "sha": mac, "spa": ip, "tha": "00:00:00:00:00:00", "tpa": tpa}
+check("arp watch: first sighting and a repeat are quiet", aw.feed(arp("10.20.30.88", "3c:22:fb:10:20:30"), 1.0) is None and aw.feed(arp("10.20.30.88", "3c:22:fb:10:20:30"), 2.0) is None and not aw.conflicts)
+check("arp watch: a second MAC for the same IP is a conflict", aw.feed(arp("10.20.30.88", "a4:83:e7:44:55:66"), 3.0) == ("10.20.30.88", "3c:22:fb:10:20:30", "a4:83:e7:44:55:66") and aw.conflicts["10.20.30.88"]["macs"] == ["3c:22:fb:10:20:30", "a4:83:e7:44:55:66"])
+aw.feed(arp("10.20.30.88", "3c:22:fb:10:20:30"), 4.0)
+check("arp watch: flipping back doesn't list a MAC twice", aw.conflicts["10.20.30.88"]["macs"] == ["3c:22:fb:10:20:30", "a4:83:e7:44:55:66"] and aw.conflicts["10.20.30.88"]["ts"] == 4.0)
+aw.feed(arp("10.20.30.50", "aa:bb:cc:00:00:01", tpa="10.20.30.50"), 5.0)
+check("arp watch: gratuitous ARP counted, probes from 0.0.0.0 ignored", aw.gratuitous == 1 and aw.feed(arp("0.0.0.0", "aa:bb:cc:00:00:02"), 6.0) is None and "0.0.0.0" not in aw.owner)
+ww = N.WireWatch(["FC-9D-05-07-AD-E3", "52:54:00:51:66:96"], now=0.0)
+me, vm = "fc9d0507ade3", "525400516696"
+for _ in range(100):
+    ww.feed(ETH("ffffffffffff", 0x0806, bytes(46), src="9c7613aa0102"))
+for _ in range(30):
+    ww.feed(ETH("01005e0000fb", 0x0800, bytes(60), src="48a6b8c1d2e3"))
+for _ in range(40):
+    ww.feed(ETH("ecb5fa123456", 0x0800, bytes(60), src="d83134aabbcc"))      # for someone else: flooded
+ww.feed(ETH(vm, 0x0800, bytes(60), src="d83134aabbcc"))                     # for our VM: fine
+ww.feed(ETH("ffffffffffff", 0x0806, bytes(46), src=me))                     # our own broadcast: ignored
+ww.feed(b"\x00")
+ww.tick(2.0)
+ws = ww.snapshot()
+check("wire watch: loudest sender first, with rates", (ws["talkers"][0]["mac"], ws["talkers"][0]["bc"], ws["talkers"][0]["bc_pps"]) == ("9c:76:13:aa:01:02", 100, 50.0) and ws["talkers"][1]["mc_pps"] == 15.0, ws["talkers"])
+check("wire watch: flooded frames counted, ours and our VM's are not", (ws["flood"], ws["flood_pps"], ws["flood_dst"]) == (40, 20.0, ["ec:b5:fa:12:34:56"]) and ws["n_talkers"] == 2, ws)
+ww.tick(4.0)
+check("wire watch: rates fall to zero when it goes quiet", ww.snapshot()["flood_pps"] == 0 and ww.snapshot()["talkers"][0]["bc_pps"] == 0)
+check("wire filter: with and without a MAC", N.wire_bpf("FC-9D-05-07-AD-E3") == "ether multicast or not ether dst fc:9d:05:07:ad:e3" and N.wire_bpf("") == "ether multicast")
+PAUSE_OUT = "Pause parameters for enp14s0:\nAutonegotiate:\ton\nRX:\t\ton\nTX:\t\toff\n"
+check("ethtool -a", N.parse_ethtool_pause(PAUSE_OUT) == {"autoneg": True, "rx": True, "tx": False} and N.parse_ethtool_pause("netlink error: Operation not supported") == {})
+EEE_INACTIVE = "EEE settings for enp14s0:\n\tEEE status: enabled - inactive\n\tTx LPI: 2 (us)\n\tSupported EEE link modes:  100baseT/Full\n\t                           1000baseT/Full\n\tAdvertised EEE link modes:  100baseT/Full\n\tLink partner advertised EEE link modes:  Not reported\n"
+check("ethtool --show-eee: enabled but not in use", N.parse_ethtool_eee(EEE_INACTIVE) == {"supported": True, "enabled": True, "active": False, "partner": False}, N.parse_ethtool_eee(EEE_INACTIVE))
+check("ethtool --show-eee: active", N.parse_ethtool_eee(EEE_INACTIVE.replace("enabled - inactive", "enabled - active").replace("Not reported", "1000baseT/Full")) == {"supported": True, "enabled": True, "active": True, "partner": True})
+check("ethtool --show-eee: disabled, unsupported, no output", N.parse_ethtool_eee("\tEEE status: disabled\n")["enabled"] is False and N.parse_ethtool_eee("\tEEE status: not supported\n") == {"supported": False, "enabled": False, "active": False} and N.parse_ethtool_eee("") == {})
+LINK_OUT = """Settings for enp3s0:
+\tSupported ports: [ TP ]
+\tSupported link modes:   10baseT/Half 10baseT/Full
+\t                        100baseT/Half 100baseT/Full
+\t                        1000baseT/Full
+\tAdvertised link modes:  10baseT/Half 10baseT/Full
+\t                        100baseT/Half 100baseT/Full
+\t                        1000baseT/Full
+\tAdvertised pause frame use: Symmetric Receive-only
+\tLink partner advertised link modes:  10baseT/Half 10baseT/Full
+\t                                     100baseT/Half 100baseT/Full
+\t                                     1000baseT/Full
+\tLink partner advertised auto-negotiation: Yes
+\tSpeed: 100Mb/s
+\tDuplex: Full
+"""
+lk = N.parse_ethtool_link(LINK_OUT)
+check("ethtool: what each end offered and what was agreed", lk == {"speed": 100, "duplex": "Full", "ours": [10, 100, 1000], "partner": [10, 100, 1000]}, lk)
+check("downshift: both offer 1 Gb but it linked at 100 Mb", N.downshift(lk) == 1000)
+check("downshift: none at full speed, or when the partner offers less, or isn't reported", N.downshift(dict(lk, speed=1000)) is None
+      and N.downshift({"speed": 100, "ours": [10, 100, 1000], "partner": [10, 100]}) is None and N.downshift({"speed": 100, "ours": [10, 100, 1000], "partner": []}) is None)
+STATS_OUT = "NIC statistics:\n     tx_packets: 1107860\n     rx_errors: 0\n     rx_missed: 2\n     align_errors: 0\n     rx_crc_errors: 7\n     rx_pause: 1840\n     tx_flow_control_xoff: 3\n     [0]: rx_xdp_drop: 0\n     unicast: 1984818\n"
+pz, er = N.parse_nic_stats(STATS_OUT)
+check("ethtool -S: pause and error counters picked out by name", pz == {"rx_pause": 1840, "tx_flow_control_xoff": 3} and er == {"rx_errors": 0, "rx_missed": 2, "align_errors": 0, "rx_crc_errors": 7}, (pz, er))
+check("counter rises", N.counter_rises({"a": 1, "b": 5, "c": 9}, {"a": 4, "b": 5, "c": 2, "d": 7}) == {"a": 3})
+clean = N.new_wire(); clean["nic"] = {"pause": {"rx": False, "tx": False}, "eee": {"supported": True, "enabled": False, "active": False},
+                                     "link": dict(lk, speed=1000), "stats": ({}, {"rx_errors": 0})}
+clean["talk"] = {"talkers": [], "n_talkers": 0, "flood": 0, "flood_pps": 0.0, "pps": 0.0, "flood_dst": []}
+cf = N.wire_findings(clean)
+check("wire report: a clean port has nothing to flag", N.wire_headline(cf) == ("Nothing unusual on the wire", "ok") and all(lv in ("ok", "info") for _, lv, _ in cf), cf)
+sick = N.new_wire()
+sick.update(nic={"pause": {"rx": True, "tx": False}, "eee": {"supported": True, "enabled": True, "active": True}, "link": lk, "stats": ({"rx_pause": 9}, {"rx_crc_errors": 7})},
+            rises={"rx_pause": 4, "rx_crc_errors": 3}, lacp={"kind": "LACP", "system": "70:db:98:1a:00:00", "key": 13, "active": True, "fast": False},
+            talk={"talkers": [{"mac": "9c:76:13:aa:01:02", "bc": 9000, "mc": 0, "bytes": 0, "bc_pps": 300.0, "mc_pps": 0.0}], "n_talkers": 1, "flood": 500, "flood_pps": 60.0, "pps": 400.0, "flood_dst": ["ec:b5:fa:12:34:56"]},
+            conflicts=[{"ip": "10.20.30.88", "macs": ["3c:22:fb:10:20:30", "a4:83:e7:44:55:66"], "ts": 1}],
+            routers={"70:db:98:1a:00:01": {"prefix": "2001:db8:30::/64"}, "a4:83:e7:44:55:66": {"prefix": ""}},
+            icmp=[{"what": "redirect", "from": "10.20.30.1", "use": "10.20.30.2", "about": "172.16.9.20"}], pause_frames=2)
+sf = N.wire_findings(sick, vendor=lambda m: "Ring LLC" if m.startswith("9c:76") else "")
+txt = " | ".join(t for _, _, t in sf)
+for needle in ("PAUSE frames counted since the report started: rx_pause +4", "Energy Efficient Ethernet is active", "Linked at 100 Mbps although both ends offer 1 Gbps",
+               "Error counters rising: rx_crc_errors +3", "60 frames a second meant for other machines", "9c:76:13:aa:01:02 (Ring LLC): 300 broadcast",
+               "10.20.30.88 is claimed by 3c:22:fb:10:20:30 and a4:83:e7:44:55:66", "More than one machine is doing this", "LACP (switch 70:db:98:1a:00:00, key 13, active, slow timer)",
+               "2 PAUSE frames seen on the wire", "use 10.20.30.2 instead"):
+    check(f"wire report flags: {needle[:44]}", needle in txt, txt[:300])
+hl = N.wire_headline(sf)
+check("wire report: headline counts what needs a look and takes the worst level", hl[1] == "bad" and hl[0].endswith("things worth a look") and int(hl[0].split()[0]) == sum(1 for _, lv, _ in sf if lv in ("warn", "bad")), hl)
+check("wire report: without ethtool data it says why", "Linux only" in N.wire_findings(N.new_wire(), platform_linux=False)[0][2] and "ethtool is not installed" in N.wire_findings(N.new_wire())[0][2])
+busy = N.new_wire(); busy["paused"] = True
+check("wire report: too busy to count is said plainly", any("Too much traffic to count" in t for _, _, t in N.wire_findings(busy)))
+# tick-rate test: packets, the buffer, the figures, the verdict, and a real run over loopback
+pk = N.tick_packet(0xDEADBEEF, 41)
+check("tick packet: marker, session, sequence, padded to size", len(pk) == N.TICK_SIZE and N.parse_tick(pk) == (0xDEADBEEF, 41))
+check("tick packet: anything else is not ours", N.parse_tick(b"PCC1") is None and N.parse_tick(b"XXXX" + bytes(20)) is None and N.parse_tick(b"") is None)
+check("tick server: address forms", [N.parse_tick_server(t) for t in ("10.1.2.3", " 10.1.2.3:27015 ", "10.1.2.3 27015", "cs-server.lan")] ==
+      [("10.1.2.3", N.TICK_PORT), ("10.1.2.3", 27015), ("10.1.2.3", 27015), ("cs-server.lan", N.TICK_PORT)])
+for bad in ("", None, "10.1.2.3:0", "10.1.2.3:99999", "host; rm -rf /", "-oProxyCommand=x", "a b c"):
+    check(f"tick server refused: {bad!r}", N.parse_tick_server(bad) is None)
+tb = N.TickBuffer()
+seqs = [tb.add_sent(100.0 + i / 64) for i in range(10)]
+for q in (0, 1, 2, 4, 3, 6, 6, 9):               # 5, 7 and 8 never answered; 3 late and out of order; 6 twice
+    tb.add_reply(q, 1.5)
+tb.add_reply(999, 1.0)
+check("tick buffer: counters", tb.counters() == {"sent": 10, "recv": 7, "reorder": 1, "dup": 1}, tb.counters())
+check("tick buffer: unanswered packets wait out their timeout before counting as lost",
+      len(tb.samples(100.2)) == 7 and len(tb.samples(102.0)) == 10)
+sm = N.tick_summary(tb.samples(102.0), 64)
+check("tick summary: loss and the longest run of lost packets", (sm["n"], sm["lost"], sm["burst"]) == (10, 3, 2) and abs(sm["loss_pct"] - 30) < 1e-9, sm)
+tb2 = N.TickBuffer(); tb2.MAX = 4
+for i in range(10):
+    tb2.add_sent(200.0 + i)
+check("tick buffer: old packets fall off the front and sequence numbers carry on", (tb2.base, len(tb2.rows), tb2.add_sent(300.0)) == (6, 4, 10), (tb2.base, len(tb2.rows)))
+tb2.add_reply(10, 2.0); tb2.add_reply(3, 2.0)
+check("tick buffer: a reply for a packet no longer held is ignored", tb2.rows[-1][1] == 2.0 and tb2.counters()["recv"] == 1)
+steady = [(i / 64, 1.2 + (0.05 if i % 2 else 0)) for i in range(640)]
+ss = N.tick_summary(steady, 64)
+check("tick summary: a clean run", (ss["lost"], ss["burst"], ss["late"]) == (0, 0, 0) and abs(ss["jitter"] - 0.05) < 1e-9 and ss["p50"] == 1.2 and ss["max"] == 1.25, ss)
+check("tick verdict: clean is ok", N.tick_verdict(ss, 64) == ("0.00% loss · 1.2 ms · jitter 0.05 ms", "ok"))
+late = list(steady); late[100] = (late[100][0], 1.2 + 16.0)
+check("tick summary: a reply over one tick slow is late", N.tick_summary(late, 64)["late"] == 1 and N.tick_summary(late, 128)["late"] == 1)
+check("tick verdict: one late reply is a warning", N.tick_verdict(N.tick_summary(late, 64), 64)[1] == "warn")
+gap = list(steady)
+for i in (200, 201, 202):
+    gap[i] = (gap[i][0], None)
+check("tick verdict: three lost in a row is bad even under 1% loss", N.tick_summary(gap, 64)["burst"] == 3 and N.tick_summary(gap, 64)["loss_pct"] < 1 and N.tick_verdict(N.tick_summary(gap, 64), 64)[1] == "bad")
+jittery = [(i / 64, 1.0 + (10.0 if i % 2 else 0)) for i in range(640)]
+check("tick verdict: jitter over half a tick is bad", N.tick_verdict(N.tick_summary(jittery, 64), 64)[1] == "bad")
+check("tick verdict: nothing back at all", N.tick_verdict(N.tick_summary([(i / 64, None) for i in range(64)], 64), 64) == ("No replies", "bad"))
+check("tick verdict: nothing sent yet", N.tick_verdict(N.tick_summary([], 64), 64)[1] == "wait")
+import time as _t
+rf = N.Reflector(0, "127.0.0.1"); rport = rf.sock.getsockname()[1]; rf.start()
+tt = N.TickTest("127.0.0.1", "127.0.0.1", rport, 128); tt.start(); _t.sleep(1.3); tt.stop(); _t.sleep(0.3)
+cn = tt.buf.counters()
+check("live run on loopback: about 128 a second, every packet back", 140 <= cn["sent"] <= 190 and cn["recv"] >= cn["sent"] - 2 and cn["dup"] == 0, cn)
+check("live run: reply times are sane and the reflector counted them", 0 < N.tick_summary(tt.buf.samples(_t.time() + 2), 128)["p50"] < 50 and rf.count >= cn["recv"] and "127.0.0.1" in rf.peers)
+junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); junk.settimeout(0.4); junk.sendto(b"not a test packet", ("127.0.0.1", rport))
+try:
+    junk.recvfrom(100); echoed = True
+except socket.timeout:
+    echoed = False
+check("reflector ignores anything without the test marker", echoed is False)
+junk.close(); rf.stop()
+try:
+    N.TickTest("127.0.0.1", "no-such-host.invalid", 1, 64); opened = True
+except OSError:
+    opened = False
+check("tick test: an unknown host fails cleanly", opened is False)
+check("impact text names what was running", N.impact_text(N.event_impact(smp, 50.0), "the test", "packet") == "2 packets lost · peak 180 ms, normally 3 ms"
+      and N.impact_text(None, "the test", "packet") == "the test wasn't running")
 # multicast browser: names, frames, IGMP, the tracker and the querier verdict
 MAC = "00:11:22:33:44:55"
 check("mcast names: exact, range, unknown", (N.mcast_name("224.0.0.251"), N.mcast_name("239.69.4.4"), N.mcast_name("239.1.2.3")) == ("mDNS", "Dante / AES67 audio", ""))
