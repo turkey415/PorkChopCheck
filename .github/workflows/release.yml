@@ -1,0 +1,80 @@
+# Push a tag like v2.1.0 and this builds + publishes a GitHub Release with:
+#   PorkChopCheck-<tag>-windows-exe.zip     single .exe, no Python needed (Npcap still required)
+#   PorkChopCheck-<tag>-windows-python.zip  the .py files + launcher, for people who have Python
+#   PorkChopCheck-<tag>-linux.tar.gz        .py files + install-linux.sh (Nobara / Fedora / Ubuntu)
+# Tags with a dash (v2.1.0-beta.1) are marked as pre-releases.
+# "Run workflow" on the Actions tab does a test build without publishing anything.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tests/test_pc_net.py
+      - run: python tests/test_linux.py
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller -r requirements.txt
+      - run: pyinstaller --onefile --noconsole --uac-admin --name PorkChopCheck --collect-submodules scapy porkchopcheck.py
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path dist/PorkChopCheck.exe, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-exe.zip"
+          Compress-Archive -Path porkchopcheck.py, pc_net.py, PorkChopCheck.bat, requirements.txt, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-python.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        run: |
+          d="PorkChopCheck-${GITHUB_REF_NAME}-linux"
+          mkdir -p "out/$d"
+          cp porkchopcheck.py pc_net.py install-linux.sh requirements.txt README.md LICENSE "out/$d/"
+          chmod +x "out/$d/install-linux.sh"
+          tar -C out -czf "out/$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*.tar.gz
+
+  release:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

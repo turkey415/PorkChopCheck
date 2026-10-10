@@ -24,6 +24,7 @@ import time
 import urllib.request
 
 IS_WIN = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 
 
@@ -145,12 +146,33 @@ def pad60(frame):
 
 
 def is_admin():
-    if not IS_WIN:
+    """Windows: elevated. Linux: root, or CAP_NET_RAW + CAP_NET_ADMIN (see install-linux.sh)."""
+    if IS_WIN:
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:  # noqa: BLE001
+            return False
+    if IS_LINUX:
+        return has_net_caps()
+    return True
+
+
+def has_net_caps():
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         return True
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:  # noqa: BLE001
+    m = re.search(r"^CapEff:\s*([0-9a-f]+)", _read("/proc/self/status", ""), re.M)
+    if not m:
         return False
+    caps = int(m.group(1), 16)
+    return bool(caps & (1 << 12)) and bool(caps & (1 << 13))     # NET_ADMIN, NET_RAW
+
+
+def _read(path, default=None):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return default
 
 
 # ====================================================================== constants
@@ -908,11 +930,24 @@ def _sub_echo(dst, src, ttl, timeout_ms):
     if IS_WIN:
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), "-i", str(ttl)] + (["-S", src] if src else [])
     else:
-        cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), "-t", str(ttl)]
+        cmd = ["ping", "-n", "-c", "1", "-W", str(max(1, round(timeout_ms / 1000))), "-t", str(ttl)]
+        cmd += ["-I", src] if src else []
+    t = time.perf_counter()
     _, out, _ = run(cmd + [dst], timeout=5)
+    return parse_ping_output(out, dst, (time.perf_counter() - t) * 1000)
+
+
+def parse_ping_output(out, dst, elapsed_ms=None):
+    """Turn Windows or Linux ping text into (status, responder_ip, rtt_ms)."""
     m = re.search(r"time[=<]\s*([\d.]+)\s*ms", out, re.I)
     if "ttl=" in out.lower() and m:
         return ("ok", dst, float(m.group(1)))
+    m = re.search(r"from\s+([\d.]+)\S*\s.*?(time to live exceeded|ttl expired)", out, re.I)
+    if m:
+        return ("ttl", m.group(1), elapsed_ms)
+    m = re.search(r"from\s+([\d.]+)\S*\s.*?unreachable", out, re.I)
+    if m:
+        return ("unreach", m.group(1), None)
     return ("timeout", None, None)
 
 
@@ -1237,3 +1272,214 @@ class PortLog:
 def _port_sort(port):
     """Gi1/0/10 sorts after Gi1/0/9."""
     return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", str(port))]
+
+
+# ====================================================================== Linux platform layer
+# Everything Windows gets from PowerShell, Linux gets from /sys, `ip -j`, NetworkManager and ethtool.
+SYS_NET = "/sys/class/net"
+
+
+def _json_cmd(cmd, timeout=5):
+    _, out, _ = run(cmd, timeout)
+    try:
+        return json.loads(out) if out.strip() else []
+    except ValueError:
+        return []
+
+
+def linux_adapters():
+    """Physical wired NICs only: no loopback, Wi-Fi, bridges, veth, docker or VPN interfaces."""
+    out = []
+    try:
+        names = sorted(os.listdir(SYS_NET))
+    except OSError:
+        return out
+    for n in names:
+        p = os.path.join(SYS_NET, n)
+        if _read(p + "/type") != "1" or not os.path.exists(p + "/device"):
+            continue
+        if os.path.exists(p + "/wireless") or os.path.exists(p + "/phy80211"):
+            continue
+        out.append({"name": n, "desc": linux_describe(n), "mac": norm_mac(_read(p + "/address", "")),
+                    "up": _read(p + "/carrier") == "1"})
+    return out
+
+
+def linux_describe(n):
+    p = os.path.join(SYS_NET, n)
+    props = {}
+    if shutil.which("udevadm"):
+        _, out, _ = run(["udevadm", "info", "-q", "property", "-p", p], 5)
+        props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    desc = " ".join(x for x in (props.get("ID_VENDOR_FROM_DATABASE", ""),
+                                props.get("ID_MODEL_FROM_DATABASE", "")) if x)
+    if not desc:
+        drv = p + "/device/driver"
+        desc = os.path.basename(os.path.realpath(drv)) if os.path.exists(drv) else n
+    if "/usb" in os.path.realpath(p + "/device"):
+        desc += " (USB)"
+    return desc[:80]
+
+
+def linux_link(n):
+    """(link_up, speed_mbps). carrier is the real cable state; psutil's isup is only admin-up."""
+    p = os.path.join(SYS_NET, n)
+    up = _read(p + "/carrier") == "1"
+    try:
+        speed = int(_read(p + "/speed", "0") or 0)
+    except ValueError:
+        speed = 0
+    return up, max(speed, 0) if up else 0
+
+
+def parse_nmcli(text):
+    """Parse `nmcli -t -f GENERAL.CONNECTION,IP4.GATEWAY,IP4.DNS,IP4.DOMAIN,DHCP4 device show IF`."""
+    d = {"dns": [], "domain": [], "dhcp": {}}
+    for line in text.splitlines():
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        val = val.replace("\\:", ":").replace("\\\\", "\\").strip()
+        k = key.split("[")[0]
+        if k == "GENERAL.CONNECTION":
+            d["connection"] = val
+        elif k == "IP4.GATEWAY" and val and val != "--":
+            d["gateway"] = val
+        elif k == "IP4.DNS" and val:
+            d["dns"].append(val)
+        elif k == "IP4.DOMAIN" and val:
+            d["domain"].append(val)
+        elif k == "DHCP4.OPTION" and "=" in val:
+            ok, _, ov = val.partition("=")
+            d["dhcp"][ok.strip()] = ov.strip()
+    return d
+
+
+def parse_ip_gateways(js):
+    return [r["gateway"] for r in as_list(js) if isinstance(r, dict) and is_ipv4(r.get("gateway"))]
+
+
+def parse_ip_neigh(js):
+    rows = []
+    for r in as_list(js):
+        if not isinstance(r, dict):
+            continue
+        ip, mac = r.get("dst"), r.get("lladdr")
+        state = (r.get("state") or [""])[0]
+        if is_ipv4(ip) and mac and state not in ("FAILED", "INCOMPLETE"):
+            rows.append((ip, norm_mac(mac), state.title()))
+    return rows
+
+
+def parse_ip6(js):
+    out = []
+    for link in as_list(js):
+        for a in (link.get("addr_info", []) if isinstance(link, dict) else []):
+            if a.get("family") != "inet6" or a.get("temporary"):
+                continue
+            if a.get("scope") == "link":
+                origin = "WellKnown"
+            elif a.get("mngtmpaddr") or a.get("dynamic"):
+                origin = "RouterAdvertisement"
+            else:
+                origin = "Manual"
+            out.append({"IPAddress": a.get("local"), "Origin": origin})
+    return out
+
+
+def parse_ethtool_bcast(text):
+    for line in text.splitlines():
+        name, _, v = line.strip().partition(":")
+        if name.strip() in ("rx_broadcast", "rx_bcast", "rx_broadcast_packets", "rx_bcast_packets",
+                            "rx_broadcast_pkts"):
+            try:
+                return int(v.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def parse_resolvectl(text):
+    _, _, rest = text.partition("):")
+    return [x for x in rest.split() if is_ipv4(x)]
+
+
+def linux_dns(name):
+    if shutil.which("resolvectl"):
+        _, out, _ = run(["resolvectl", "dns", name], 5)
+        dns = parse_resolvectl(out)
+        if dns:
+            return dns
+    dns = re.findall(r"^\s*nameserver\s+(\S+)", _read("/etc/resolv.conf", ""), re.M)
+    return [x for x in dns if is_ipv4(x) and not x.startswith("127.")]
+
+
+def fmt_epoch(ts):
+    s = time.strftime("%b %d %I:%M %p", time.localtime(int(ts)))
+    return re.sub(r"\b0(\d)", r"\1", s)
+
+
+def linux_detail(name):
+    """Same keys the Windows PowerShell query returns, so the UI doesn't care which OS it's on."""
+    p = os.path.join(SYS_NET, name)
+    d = {"FullDuplex": {"full": True, "half": False}.get(_read(p + "/duplex")),
+         "Mac": _read(p + "/address")}
+    d["Gateway"] = parse_ip_gateways(_json_cmd(["ip", "-j", "-4", "route", "show", "default", "dev", name]))
+    nm = {}
+    if shutil.which("nmcli"):
+        _, out, _ = run(["nmcli", "-t", "-f", "GENERAL.CONNECTION,IP4.GATEWAY,IP4.DNS,IP4.DOMAIN,DHCP4",
+                         "device", "show", name], 5)
+        nm = parse_nmcli(out)
+    dhcp = nm.get("dhcp", {})
+    if not d["Gateway"] and nm.get("gateway"):
+        d["Gateway"] = [nm["gateway"]]
+    d["Dns"] = nm.get("dns") or linux_dns(name)
+    d["Domain"] = (nm.get("domain") or [""])[0]
+    d["DhcpServer"] = dhcp.get("dhcp_server_identifier")
+    if str(dhcp.get("expiry", "")).isdigit():
+        d["LeaseExpires"] = fmt_epoch(dhcp["expiry"])
+    if dhcp:
+        d["DhcpEnabled"] = True
+    elif nm.get("connection") and nm["connection"] != "--":
+        _, m, _ = run(["nmcli", "-g", "ipv4.method", "connection", "show", nm["connection"]], 5)
+        d["DhcpEnabled"] = {"auto": True, "manual": False}.get(m.strip())
+    gw = first_v4(d["Gateway"])
+    if gw:
+        rows = parse_ip_neigh(_json_cmd(["ip", "-j", "-4", "neigh", "show", gw, "dev", name]))
+        if rows:
+            d["GwMac"] = rows[0][1]
+    try:
+        d["RxMcast"] = int(_read(p + "/statistics/multicast", "0") or 0)
+    except ValueError:
+        pass
+    if shutil.which("ethtool"):
+        _, out, _ = run(["ethtool", "-S", name], 5)
+        b = parse_ethtool_bcast(out)
+        if b is not None:
+            d["RxBcast"] = b
+    d["V6"] = parse_ip6(_json_cmd(["ip", "-j", "-6", "addr", "show", "dev", name]))
+    return d
+
+
+def linux_neigh(name):
+    return parse_ip_neigh(_json_cmd(["ip", "-j", "-4", "neigh", "show", "dev", name]))
+
+
+def linux_set_link(name, up):
+    return run(["ip", "link", "set", "dev", name, "up" if up else "down"], 15)[0] == 0
+
+
+def linux_renew(name):
+    """Drop and re-request the DHCP lease. Returns (ok, error_text)."""
+    if shutil.which("nmcli"):
+        run(["nmcli", "device", "disconnect", name], 20)
+        code, out, err = run(["nmcli", "device", "connect", name], 60)
+        return code == 0, (err or out).strip()[:80]
+    if shutil.which("dhclient"):
+        run(["dhclient", "-r", name], 20)
+        code, out, err = run(["dhclient", "-1", name], 60)
+        return code == 0, (err or out).strip()[:80]
+    if shutil.which("networkctl"):
+        code, out, err = run(["networkctl", "renew", name], 20)
+        return code == 0, (err or out).strip()[:80]
+    return False, "no DHCP client tool (nmcli / dhclient / networkctl)"

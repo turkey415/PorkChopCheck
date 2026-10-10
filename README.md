@@ -2,14 +2,44 @@
 
 A great tool to check your network and ports on your network. CDP, LLDP, and so much more.
 
+Full-screen, big-text, touch-friendly switch-port tester. Plug it into a jack and it tells you what's on the other end. It runs on **Windows 10/11** and **Linux (Nobara, Fedora, Ubuntu)** from the same code.
 
-Full-screen, big-text, touch-friendly switch-port tester for a small Windows 11 box.
+## Download
 
-**Files:** `porkchopcheck.py` (the app) and `pc_net.py` (the network engine) must sit in the same folder, for example `C:\PorkChopCheck`.
+Grab the latest build from **[Releases](https://github.com/turkey415/porkchopcheck/releases)**:
 
-## Starting it
+| File | For |
+|---|---|
+| `PorkChopCheck-<version>-windows-exe.zip` | Windows, easiest. One `.exe`, no Python needed. Install [Npcap](https://npcap.com) first. |
+| `PorkChopCheck-<version>-windows-python.zip` | Windows, if you'd rather run the Python source |
+| `PorkChopCheck-<version>-linux.tar.gz` | Nobara / Fedora / Ubuntu |
 
-Double-click `porkchopcheck.py` or `PorkChopCheck.bat`. It asks for admin once through a UAC prompt, then opens fullscreen. Admin is needed for DHCP renew, link bounce, and the port finder.
+## Windows setup
+
+**The .exe:**
+1. Install Npcap from npcap.org, keeping the defaults.
+2. Unzip the exe zip anywhere and run `PorkChopCheck.exe`. It asks for admin once, then opens fullscreen.
+
+**From source:**
+1. Install Python 3.12 or newer, and Npcap.
+2. In a terminal in the unzipped folder, run `py -m pip install -r requirements.txt`.
+3. Double-click `porkchopcheck.py` or `PorkChopCheck.bat`.
+
+If it won't start, the error is saved to `crash.log` in the same folder and shown in a pop-up.
+
+## Linux setup (Nobara / Fedora)
+
+```bash
+tar xzf PorkChopCheck-*-linux.tar.gz
+cd PorkChopCheck-*-linux
+./install-linux.sh
+```
+
+Then launch **PorkChopCheck** from the app menu, or run `porkchopcheck`. On a small touchscreen, use `porkchopcheck --fullscreen`.
+
+The installer uses `dnf` to add Tk, libpcap, iproute, ethtool, and iperf3. It then creates a private Python for the app and gives *only that Python* permission to capture packets and bring the link up and down. You never run it as root. To remove it, run `./install-linux.sh --uninstall`.
+
+On Linux the app reads link and IP details from `/sys`, `ip`, and NetworkManager (`nmcli`). Linux drivers usually pass VLAN tags and LLDP frames through, so trunk and LLDP detection tend to work even better than on Windows.
 
 ## Pages
 
@@ -28,21 +58,17 @@ The banner turns red or amber for: no link, duplicate IP, 802.1X with no access,
 
 ## Port log
 
-Every time CDP/LLDP names the switch and port, PorkChopCheck logs it automatically to `data\ports.csv`. That file keeps one row per switch+port and is updated to the latest result. Tap **SAVE** to add a label like "Room 204 jack B". Every save also goes to `data\history.csv`. Both open in Excel.
+Every time CDP/LLDP names the switch and port, PorkChopCheck logs it automatically to `data/ports.csv`. That file keeps one row per switch+port and is updated to the latest result. Tap **SAVE** to add a label like "Room 204 jack B". Every save also goes to `data/history.csv`. Both open in Excel or LibreOffice.
 
 ## Announcing itself
 
 By default, PorkChopCheck sends LLDP and CDP every 30 s, so `show cdp neighbors` or `show lldp neighbors` on the switch shows `PorkChopCheck-<pcname>` on the right port. You can turn this off or rename it in Settings.
 
-## One-time setup
+## Optional extras
 
-1. Install Python 3.12 or newer.
-2. Install Npcap from npcap.org, keeping the defaults.
-3. In a terminal in `C:\PorkChopCheck`, run `py -m pip install -r requirements.txt`.
-4. **Optional, for LAN speed tests:** download iperf3 for Windows and put `iperf3.exe` in `C:\PorkChopCheck`. On another PC or server, run `iperf3 -s`. Then set that machine's address under Tools › Settings.
-5. **Optional, for MAC vendor names:** they download by themselves the first time the box has internet. You can also use Settings › Download MAC vendor list.
-
-To preview every screen with fake data, run `py porkchopcheck.py --demo`. Demo mode uses its own `data_demo` folder.
+- **LAN speed tests:** run `iperf3 -s` on another machine and set its address under Tools › Settings. On Windows, put `iperf3.exe` next to the app. On Linux, the installer adds iperf3.
+- **MAC vendor names** download by themselves the first time the box has internet. You can also use Settings › Download MAC vendor list.
+- **Preview mode:** `porkchopcheck --demo` (or `py porkchopcheck.py --demo`) shows every screen with fake data and uses its own `data_demo` folder.
 
 ## Notes
 
@@ -55,25 +81,38 @@ To preview every screen with fake data, run `py porkchopcheck.py --demo`. Demo m
 
 ## Screenshots
 
-Demo-mode renders (`py porkchopcheck.py --demo`). Fonts on a real Windows box are larger and smoother.
+Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ![Main pages](docs/screenshots/main-pages.png)
 ![Tools](docs/screenshots/tools.png)
 ![Save and settings](docs/screenshots/save-settings.png)
 
+## Releasing a new version (maintainers)
+
+```bash
+git tag v2.1.0 && git push origin v2.1.0
+```
+
+GitHub Actions runs the tests, builds the Windows `.exe`, the Windows zip, and the Linux tarball, and publishes them as a release. A tag with a dash, like `v2.1.0-beta.1`, is published as a pre-release.
+
 ## Tests
 
-`python tests/test_pc_net.py` round-trips every packet decoder/builder (CDP, LLDP, DTP, STP, EAPOL, ARP, DHCP, mDNS, IPv6 RA) plus the port log. No hardware needed.
+No hardware needed:
+
+```bash
+python tests/test_pc_net.py   # every packet decoder/builder + the port log
+python tests/test_linux.py    # Linux parsers for ip / nmcli / ethtool / ping output
+```
 
 ## Contributing
 
 Pull requests are welcome! Good places to start:
 
-- **Linux port.** The packet engine (`pc_net.py`) is already cross-platform. The Windows-only pieces are the PowerShell queries, `ipconfig` renew, and `netsh` port finder in `porkchopcheck.py`.
 - **More decoders.** Add them to `pc_net.classify()`, with a round-trip check in `tests/test_pc_net.py`.
+- **More Linux distros.** The Linux layer lives at the bottom of `pc_net.py`, and `install-linux.sh` handles dnf and apt.
 - **Bug reports from real switches.** A pcap of the frame that confused it is gold.
 
-Run `python tests/test_pc_net.py` before sending a PR.
+Run both test files before sending a PR.
 
 ## License
 

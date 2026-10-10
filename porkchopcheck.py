@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PorkChopCheck - a big-text, touch-friendly switch-port tester for small Windows boxes.
+PorkChopCheck - a big-text, touch-friendly switch-port tester for Windows and Linux (Nobara/Fedora).
 
 Pages:  PORT    link, speed/duplex, IP, gateway, DHCP, DNS, time-to-IP, internet
         SWITCH  CDP/LLDP neighbor: switch, port, VLAN, voice VLAN, mgmt IP, model, PoE
@@ -11,11 +11,12 @@ Pages:  PORT    link, speed/duplex, IP, gateway, DHCP, DNS, time-to-IP, internet
                 mDNS browser, port finder, port log, re-run checks, settings
         SAVE    log this port (with an optional label) to data/ports.csv
 
-Run:   double-click porkchopcheck.py   (it asks for admin once, then opens fullscreen)
-       python porkchopcheck.py --windowed --size 800x480
+Run:   Windows: double-click porkchopcheck.py (asks for admin once, opens fullscreen)
+       Linux:   ./install-linux.sh once, then launch "PorkChopCheck" from the app menu
+       python porkchopcheck.py --windowed --size 800x480   |   --fullscreen
        python porkchopcheck.py --demo      (fake data, to preview the screens)
 Keys:  1-5 pages  S save  R renew  A next adapter  F11 fullscreen  Esc back  Q quit
-Needs: Python 3.10+, psutil, scapy, Npcap.  pc_net.py must sit next to this file.
+Needs: Python 3.10+, psutil, scapy (+ Npcap on Windows). pc_net.py must sit next to this file.
 """
 
 import collections
@@ -27,20 +28,51 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
-import tkinter.font as tkfont
+
+FROZEN = getattr(sys, "frozen", False)          # running as the PyInstaller .exe
+SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
+
+
+def _fatal(msg):
+    """Show a startup error even without a console (pythonw / .exe), and keep it in crash.log."""
+    try:
+        with open(os.path.join(SCRIPT_DIR, "crash.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n\n")
+    except OSError:
+        pass
+    print(msg, file=sys.stderr)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg[:1500], "PorkChopCheck", 0x10)
+        except Exception:  # noqa: BLE001
+            pass
+    sys.exit(1)
+
+
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+except ImportError as e:
+    _fatal("Tkinter is missing.\nNobara/Fedora: sudo dnf install python3-tkinter\n\n" + repr(e))
 
 try:
     import psutil
 except ImportError:
     psutil = None
 
-import pc_net as N
+try:
+    import pc_net as N
+except Exception as e:  # noqa: BLE001
+    _fatal("PorkChopCheck couldn't load pc_net.py. Keep pc_net.py in the same folder as "
+           "porkchopcheck.py.\n\n" + repr(e))
 
 IS_WIN = N.IS_WIN
+IS_LINUX = N.IS_LINUX
 DEMO = "--demo" in sys.argv
-WINDOWED = "--windowed" in sys.argv or (DEMO and not IS_WIN)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WINDOWED = ("--windowed" in sys.argv or (DEMO and not IS_WIN)
+            or (IS_LINUX and "--fullscreen" not in sys.argv))
+ADMIN_HINT = "run ./install-linux.sh" if IS_LINUX else "needs admin"
 VERSION = "2.0"
 
 
@@ -357,11 +389,13 @@ def sum_v6(s, now):
 
 
 def sum_bcast(s):
-    if not s["link"] or s["bc_pps"] is None:
+    bc, mc = s["bc_pps"], s["mc_pps"]
+    if not s["link"] or (bc is None and mc is None):
         return ("—", FG, "")
-    bc, mc = s["bc_pps"], s["mc_pps"] or 0
+    if bc is None:
+        return (f"{mc:.0f} mcast/s", WARN if mc > 1000 else OK, "bcast n/a on this NIC")
     color = BAD if bc > 500 else WARN if bc > 100 else OK
-    return (f"{bc:.0f} bcast/s", color, f"{mc:.0f} mcast/s")
+    return (f"{bc:.0f} bcast/s", color, f"{mc or 0:.0f} mcast/s")
 
 
 def build_record(s, oui, label=""):
@@ -463,6 +497,8 @@ class Backend:
                 if a and a.get("Name"):
                     lst.append({"name": a["Name"], "desc": a.get("InterfaceDescription") or "",
                                 "mac": N.norm_mac(a.get("MacAddress")), "up": a.get("Status") == "Up"})
+        elif IS_LINUX:
+            lst = N.linux_adapters()
         if not lst and psutil:
             for n, s in psutil.net_if_stats().items():
                 if n.startswith(("Ethernet", "eth", "en")):
@@ -504,6 +540,8 @@ class Backend:
         stats = psutil.net_if_stats().get(name)
         up = bool(stats and stats.isup)
         speed = stats.speed if stats else 0
+        if IS_LINUX:
+            up, speed = N.linux_link(name)
         ip = mask = mac = None
         for a in psutil.net_if_addrs().get(name, []):
             if a.family == socket.AF_INET:
@@ -568,12 +606,15 @@ class Backend:
                 pass
 
     def detail_tick(self):
-        if not IS_WIN:
+        if not (IS_WIN or IS_LINUX):
             return
         name = self.st.sel
         if not name:
             return
-        data = N.ps_json(DETAIL_PS.replace("__NAME__", N.psq(name)))
+        if IS_LINUX:
+            data = N.linux_detail(name)
+        else:
+            data = N.ps_json(DETAIL_PS.replace("__NAME__", N.psq(name)))
         if not isinstance(data, dict):
             return
         now = time.time()
@@ -583,11 +624,12 @@ class Backend:
                 return
             st.d = data
             bc, mc = data.get("RxBcast"), data.get("RxMcast")
-            if isinstance(bc, (int, float)) and isinstance(mc, (int, float)):
+            num = (int, float)
+            if isinstance(mc, num):
                 if st.bc_prev:
                     pbc, pmc, pt = st.bc_prev
                     dt = max(now - pt, 0.5)
-                    st.bc_pps = max(bc - pbc, 0) / dt
+                    st.bc_pps = (max(bc - pbc, 0) / dt) if isinstance(bc, num) and isinstance(pbc, num) else None
                     st.mc_pps = max(mc - pmc, 0) / dt
                 st.bc_prev = (bc, mc, now)
             if "Duplicate" in N.as_list(data.get("V4State")) and not st.dup_mac:
@@ -611,7 +653,8 @@ class Backend:
         sn = self.sniffer
         if sn is not None and not getattr(sn, "running", True):
             with st.lock:
-                st.sniff_msg = "Capture stopped — is Npcap installed?"
+                st.sniff_msg = ("Capture stopped — run ./install-linux.sh" if IS_LINUX
+                                else "Capture stopped — is Npcap installed?")
         if not up or not ip or ip.startswith("169.254."):
             return
         gw_ms = self.echo_ms(gw, ip) if gw else PENDING
@@ -762,7 +805,11 @@ class Backend:
             from scapy.all import AsyncSniffer, conf
             from scapy.layers.l2 import Ether
         except Exception:  # noqa: BLE001
-            self._set_sniff(gen, "Capture off — run: py -m pip install scapy")
+            self._set_sniff(gen, "Capture off — " + ("run ./install-linux.sh" if IS_LINUX
+                                                     else "run: py -m pip install scapy"))
+            return
+        if IS_LINUX and not N.has_net_caps():
+            self._set_sniff(gen, "No capture permission — run ./install-linux.sh")
             return
         if IS_WIN and not getattr(conf, "use_pcap", False):
             self._set_sniff(gen, "Capture off — install Npcap (npcap.com)")
@@ -917,8 +964,12 @@ class Backend:
     def _set_admin(self, name, enabled):
         if IS_WIN:
             N.run(f'netsh interface set interface name="{name}" admin={"enabled" if enabled else "disabled"}', 20)
+        elif IS_LINUX:
+            N.linux_set_link(name, enabled)
 
     def _arp_table(self, name):
+        if IS_LINUX:
+            return [r for r in N.linux_neigh(name) if not 224 <= int(r[0].split(".")[0]) <= 239]
         rows = []
         for r in N.as_list(N.ps_json(NEIGH_PS.replace("__NAME__", N.psq(name)))):
             ip = r.get("IPAddress", "")
@@ -965,17 +1016,23 @@ class Backend:
         if not name:
             return
         self.st.say("Releasing DHCP lease…", 30)
-        N.run(["ipconfig", "/release", name], 30)
+        if not IS_LINUX:
+            N.run(["ipconfig", "/release", name], 30)
         with self.st.lock:
             self.st.ip_wait_from = time.time()
             self.st.time_to_ip = None
             self.st.gw_ms = self.st.dns_ms = self.st.net_ms = PENDING
             self.st.dhcp_done = False
-        self.st.say("Requesting new address…", 45)
-        code, _, _ = N.run(["ipconfig", "/renew", name], 45)
+        self.st.say("Requesting new address…", 60)
+        if IS_LINUX:
+            ok, err = N.linux_renew(name)
+        else:
+            ok, err = N.run(["ipconfig", "/renew", name], 45)[0] == 0, ""
         self.kick.set()
-        if code == 0:
+        if ok:
             self.st.say("DHCP renew done", 3)
+        elif IS_LINUX:
+            self.st.say(f"Renew failed — {err or 'no DHCP reply'}"[:70], 6)
         else:
             self.st.say("Renew failed — " + ("needs admin" if not N.is_admin() else "no DHCP reply"), 5)
 
@@ -987,10 +1044,15 @@ class Backend:
         if not name:
             return
         if not N.is_admin():
-            self.st.say("Bounce needs admin", 5)
+            self.st.say(f"Bounce {ADMIN_HINT}", 5)
             return
         self.st.say("Bouncing link…", 15)
-        N.powershell(f"Restart-NetAdapter -Name {N.psq(name)} -Confirm:$false", 30)
+        if IS_LINUX:
+            N.linux_set_link(name, False)
+            time.sleep(2)
+            N.linux_set_link(name, True)
+        else:
+            N.powershell(f"Restart-NetAdapter -Name {N.psq(name)} -Confirm:$false", 30)
         self.kick.set()
 
     def update_oui(self, quiet=False):
@@ -1262,7 +1324,7 @@ class Backend:
         if not name:
             return
         if not N.is_admin():
-            self.st.say("Port finder needs admin", 4)
+            self.st.say(f"Port finder {ADMIN_HINT}", 4)
             return
         ev = self._new_stop("blink")
         threading.Thread(target=self._blink, args=(ev, name), daemon=True).start()
@@ -1651,9 +1713,9 @@ class UI:
         self.W, self.H = size
         H = self.H
         fams = set(tkfont.families(root))
-        self.fam = next((f for f in ("Segoe UI", "Inter", "DejaVu Sans", "Helvetica") if f in fams),
+        self.fam = next((f for f in ("Segoe UI", "Noto Sans", "Inter", "Cantarell", "DejaVu Sans", "Helvetica") if f in fams),
                         "TkDefaultFont")
-        self.mono_fam = next((f for f in ("Consolas", "Cascadia Mono", "DejaVu Sans Mono", "Courier New")
+        self.mono_fam = next((f for f in ("Consolas", "Cascadia Mono", "Noto Sans Mono", "DejaVu Sans Mono", "Courier New")
                               if f in fams), "TkFixedFont")
         self._fonts = {}
         self.pad = max(6, int(H * 0.016))
@@ -1867,6 +1929,8 @@ class UI:
         try:
             if IS_WIN:
                 os.startfile(DATA_DIR)  # noqa: S606
+            elif IS_LINUX:
+                subprocess.Popen(["xdg-open", DATA_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 self.st.say(DATA_DIR, 4)
         except OSError as e:
@@ -2004,7 +2068,7 @@ class UI:
         elif s["net_ms"] is None:
             color, big, sub = AMBER, "NO INTERNET", f"{ip} · gateway OK"
         else:
-            color, big = GREEN, f"GOOD · {N.fmt_speed(s['speed_mbps'])}"
+            color, big = GREEN, "GOOD · " + (N.fmt_speed(s["speed_mbps"]) if s["speed_mbps"] else "link up")
             vlan = nb.get("vlan")
             sub = f"{ip}" + (f" · VLAN {vlan}" if vlan else "") + (
                 f" · {nb['port']}" if nb.get("port") else "")
@@ -2345,8 +2409,8 @@ def parse_size():
 
 def maybe_elevate():
     """Relaunch elevated (one UAC prompt) so renew / bounce / port finder / capture all work."""
-    if not IS_WIN or DEMO or "--no-elevate" in sys.argv or N.is_admin():
-        return
+    if not IS_WIN or FROZEN or DEMO or "--no-elevate" in sys.argv or N.is_admin():
+        return                       # the .exe elevates through its manifest; Linux uses capabilities
     try:
         import ctypes
         exe = sys.executable
@@ -2370,13 +2434,13 @@ def main():
         except Exception:  # noqa: BLE001
             pass
     if not psutil and not DEMO:
-        print("psutil is missing:  py -m pip install psutil scapy")
-        sys.exit(1)
+        _fatal("psutil is missing.\n" + ("Run ./install-linux.sh" if IS_LINUX
+                                          else "Run:  py -m pip install psutil scapy"))
     root = tk.Tk()
     root.title("PorkChopCheck")
     size = parse_size()
     if WINDOWED:
-        size = size or (800, 480)
+        size = size or ((1024, 640) if IS_LINUX and not DEMO else (800, 480))
         root.geometry(f"{size[0]}x{size[1]}")
     else:
         size = size or (root.winfo_screenwidth(), root.winfo_screenheight())
@@ -2394,4 +2458,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001
+        import traceback
+        _fatal("PorkChopCheck crashed while starting:\n\n" + traceback.format_exc())

@@ -2,5 +2,10 @@ __pycache__/
 *.pyc
 data/
 data_demo/
+.venv/
+crash.log
 iperf3.exe
 *.dll
+build/
+dist/
+*.spec
