@@ -51,6 +51,23 @@ def _fatal(msg):
     sys.exit(1)
 
 
+def _use_private_python():
+    """Linux: if install-linux.sh made .venv next to this file, always run under that Python.
+    It has scapy and the capture permission; the system Python (e.g. double-clicking the
+    file) has neither."""
+    if not sys.platform.startswith("linux") or FROZEN or "--no-venv" in sys.argv:
+        return
+    vpy = os.path.join(SCRIPT_DIR, ".venv", "bin", "python3")
+    if os.path.exists(vpy) and os.path.realpath(sys.executable) != os.path.realpath(vpy):
+        try:
+            os.execv(vpy, [vpy, os.path.abspath(__file__)] + sys.argv[1:])
+        except OSError:
+            pass                      # fall through and run as-is; the L2 page will explain
+
+
+_use_private_python()
+
+
 def log_error(what):
     """Append the current exception to crash.log without stopping the app."""
     import traceback
