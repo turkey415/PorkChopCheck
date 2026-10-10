@@ -113,7 +113,7 @@ Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ## Coming soon
 
-The **multicast browser** (live groups, IGMP querier check, join test), **capture to .pcap**, a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, new-device alerts, printable port reports, and a handful of quick checks.
+The **multicast browser** (live groups, IGMP querier check, join test), **capture to .pcap**, a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, open ports on smart devices, new-device alerts, printable port reports, and a handful of quick checks.
 
 See the full **[roadmap](ROADMAP.md)**. Ideas and pull requests welcome.
 

@@ -19,6 +19,9 @@ On a trunk port, tag onto each VLAN in a list, request DHCP on each one, and rep
 
 ## Planned
 
+### Open ports on smart devices
+Show which common services each device answers on in the SMART tab (web interface, SSH, printing, video streams, casting…), with friendly names, in the device details, and saved to `devices.csv` for documentation.
+
 ### MTU / jumbo frame test
 Find the largest packet that gets through without fragmenting, toward the gateway or any host. Catches jumbo-frame and tunnel MTU mismatches.
 
