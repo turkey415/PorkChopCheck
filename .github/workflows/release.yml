@@ -3,16 +3,25 @@
 #   PorkChopCheck-<tag>-windows-python.zip  the .py files + launcher, for people who have Python
 #   PorkChopCheck-<tag>-linux.tar.gz        .py files + install-linux.sh (Nobara / Fedora / Ubuntu)
 # Tags with a dash (v2.1.0-beta.1) are marked as pre-releases.
-# "Run workflow" on the Actions tab does a test build without publishing anything.
+# "Run workflow" on the Actions tab with the version box empty = test build only.
+# Fill in a version (e.g. v2.1.0) and it creates that tag + release from the chosen branch.
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Publish as this version (e.g. v2.1.0). Leave empty for a test build."
+        required: false
+        default: ""
 
 permissions:
   contents: write
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
   test:
@@ -38,7 +47,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}"
+          $v = "${{ env.VERSION }}"
           New-Item -ItemType Directory -Force out | Out-Null
           Compress-Archive -Path dist/PorkChopCheck.exe, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-exe.zip"
           Compress-Archive -Path porkchopcheck.py, pc_net.py, PorkChopCheck.bat, requirements.txt, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-python.zip"
@@ -54,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Package
         run: |
-          d="PorkChopCheck-${GITHUB_REF_NAME}-linux"
+          d="PorkChopCheck-${VERSION}-linux"
           mkdir -p "out/$d"
           cp porkchopcheck.py pc_net.py install-linux.sh requirements.txt README.md LICENSE "out/$d/"
           chmod +x "out/$d/install-linux.sh"
@@ -66,7 +75,7 @@ jobs:
 
   release:
     needs: [windows, linux]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.version != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -75,6 +84,9 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: PorkChopCheck ${{ env.VERSION }}
           files: dist/*
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.VERSION, '-') }}

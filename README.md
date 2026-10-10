@@ -89,9 +89,13 @@ Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ## Releasing a new version (maintainers)
 
+Either push a tag:
+
 ```bash
 git tag v2.1.0 && git push origin v2.1.0
 ```
+
+or, on GitHub, go to **Actions › Release › Run workflow** and type the version (like `v2.1.0`) in the box. Leave the box empty for a test build that publishes nothing.
 
 GitHub Actions runs the tests, builds the Windows `.exe`, the Windows zip, and the Linux tarball, and publishes them as a release. A tag with a dash, like `v2.1.0-beta.1`, is published as a pre-release.
 
