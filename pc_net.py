@@ -1295,6 +1295,12 @@ def _json_cmd(cmd, timeout=5):
         return []
 
 
+def linux_l3_iface(n):
+    """Bridge / bond members carry no IP: the address lives on their master (br0, bond0...)."""
+    m = os.path.join(SYS_NET, n, "master")
+    return os.path.basename(os.path.realpath(m)) if os.path.exists(m) else n
+
+
 def linux_adapters():
     """Physical wired NICs only: no loopback, Wi-Fi, bridges, veth, docker or VPN interfaces."""
     out = []
@@ -1308,7 +1314,11 @@ def linux_adapters():
             continue
         if os.path.exists(p + "/wireless") or os.path.exists(p + "/phy80211"):
             continue
-        out.append({"name": n, "desc": linux_describe(n), "mac": norm_mac(_read(p + "/address", "")),
+        desc = linux_describe(n)
+        l3 = linux_l3_iface(n)
+        if l3 != n:
+            desc = f"{desc} · IP on {l3}"
+        out.append({"name": n, "desc": desc, "mac": norm_mac(_read(p + "/address", "")),
                     "up": _read(p + "/carrier") == "1"})
     return out
 
@@ -1430,18 +1440,19 @@ def fmt_epoch(ts):
 def linux_detail(name):
     """Same keys the Windows PowerShell query returns, so the UI doesn't care which OS it's on."""
     p = os.path.join(SYS_NET, name)
+    l3 = linux_l3_iface(name)                 # e.g. br0 when the NIC is bridged for VMs
     d = {"FullDuplex": {"full": True, "half": False}.get(_read(p + "/duplex")),
-         "Mac": _read(p + "/address")}
-    d["Gateway"] = parse_ip_gateways(_json_cmd(["ip", "-j", "-4", "route", "show", "default", "dev", name]))
+         "Mac": _read(p + "/address"), "L3Iface": l3}
+    d["Gateway"] = parse_ip_gateways(_json_cmd(["ip", "-j", "-4", "route", "show", "default", "dev", l3]))
     nm = {}
     if shutil.which("nmcli"):
         _, out, _ = run(["nmcli", "-t", "-f", "GENERAL.CONNECTION,IP4.GATEWAY,IP4.DNS,IP4.DOMAIN,DHCP4",
-                         "device", "show", name], 5)
+                         "device", "show", l3], 5)
         nm = parse_nmcli(out)
     dhcp = nm.get("dhcp", {})
     if not d["Gateway"] and nm.get("gateway"):
         d["Gateway"] = [nm["gateway"]]
-    d["Dns"] = nm.get("dns") or linux_dns(name)
+    d["Dns"] = nm.get("dns") or linux_dns(l3)
     d["Domain"] = (nm.get("domain") or [""])[0]
     d["DhcpServer"] = dhcp.get("dhcp_server_identifier")
     if str(dhcp.get("expiry", "")).isdigit():
@@ -1453,7 +1464,7 @@ def linux_detail(name):
         d["DhcpEnabled"] = {"auto": True, "manual": False}.get(m.strip())
     gw = first_v4(d["Gateway"])
     if gw:
-        rows = parse_ip_neigh(_json_cmd(["ip", "-j", "-4", "neigh", "show", gw, "dev", name]))
+        rows = parse_ip_neigh(_json_cmd(["ip", "-j", "-4", "neigh", "show", gw, "dev", l3]))
         if rows:
             d["GwMac"] = rows[0][1]
     try:
@@ -1465,12 +1476,12 @@ def linux_detail(name):
         b = parse_ethtool_bcast(out)
         if b is not None:
             d["RxBcast"] = b
-    d["V6"] = parse_ip6(_json_cmd(["ip", "-j", "-6", "addr", "show", "dev", name]))
+    d["V6"] = parse_ip6(_json_cmd(["ip", "-j", "-6", "addr", "show", "dev", l3]))
     return d
 
 
 def linux_neigh(name):
-    return parse_ip_neigh(_json_cmd(["ip", "-j", "-4", "neigh", "show", "dev", name]))
+    return parse_ip_neigh(_json_cmd(["ip", "-j", "-4", "neigh", "show", "dev", linux_l3_iface(name)]))
 
 
 def linux_set_link(name, up):
@@ -1479,6 +1490,7 @@ def linux_set_link(name, up):
 
 def linux_renew(name):
     """Drop and re-request the DHCP lease. Returns (ok, error_text)."""
+    name = linux_l3_iface(name)
     if shutil.which("nmcli"):
         run(["nmcli", "device", "disconnect", name], 20)
         code, out, err = run(["nmcli", "device", "connect", name], 60)

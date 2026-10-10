@@ -547,11 +547,13 @@ class Backend:
         if IS_LINUX:
             up, speed = N.linux_link(name)
         ip = mask = mac = None
-        for a in psutil.net_if_addrs().get(name, []):
-            if a.family == socket.AF_INET:
-                if ip is None or ip.startswith("169.254."):
-                    ip, mask = a.address, a.netmask
-            elif a.family == psutil.AF_LINK:
+        addrs = psutil.net_if_addrs()
+        l3 = N.linux_l3_iface(name) if IS_LINUX else name      # bridged NIC: IP lives on br0
+        for a in addrs.get(l3, []):
+            if a.family == socket.AF_INET and (ip is None or ip.startswith("169.254.")):
+                ip, mask = a.address, a.netmask
+        for a in addrs.get(name, []):
+            if a.family == psutil.AF_LINK:
                 mac = N.norm_mac(a.address)
         io = psutil.net_io_counters(pernic=True).get(name)
         now = time.time()
@@ -834,7 +836,7 @@ class Backend:
                     break
         except Exception:  # noqa: BLE001
             pass
-        if iface is None:
+        if iface is None or IS_LINUX:
             iface = name
         try:
             sn = AsyncSniffer(iface=iface, filter=N.BPF, store=False,

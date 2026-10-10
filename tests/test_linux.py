@@ -62,4 +62,39 @@ if N.IS_LINUX:
         up, spd = N.linux_link(ads[0]["name"])
         check("linux_link reads carrier", isinstance(up, bool) and spd >= 0, (up, spd))
     check("has_net_caps returns bool", isinstance(N.has_net_caps(), bool))
+
+# --- a bridged NIC, laid out exactly like a Nobara box running VMs (enp14s0 enslaved to br0)
+import tempfile
+root = tempfile.mkdtemp()
+def mk(name, type_="1", device=True, carrier="1", master=None, wireless=False):
+    p = os.path.join(root, name)
+    os.makedirs(p)
+    open(os.path.join(p, "type"), "w").write(type_ + "\n")
+    open(os.path.join(p, "carrier"), "w").write(carrier + "\n")
+    open(os.path.join(p, "speed"), "w").write("1000\n")
+    open(os.path.join(p, "address"), "w").write("fc:9d:05:07:ad:e3\n")
+    if device:
+        os.makedirs(os.path.join(p, "device"))
+    if wireless:
+        os.makedirs(os.path.join(p, "wireless"))
+    if master:
+        os.symlink(os.path.join(root, master), os.path.join(p, "master"))
+mk("lo", type_="772", device=False)
+mk("br0", device=False)
+mk("enp14s0", master="br0")
+mk("wlp15s0", carrier="0", wireless=True)
+mk("tailscale0", type_="65534", device=False)
+mk("virbr0", device=False, carrier="0")
+mk("vnet0", device=False, master="br0")
+real = N.SYS_NET
+N.SYS_NET = root
+try:
+    ads = N.linux_adapters()
+    check("bridged box: only the physical NIC is offered", [a["name"] for a in ads] == ["enp14s0"], ads)
+    check("bridged box: IP interface is br0", N.linux_l3_iface("enp14s0") == "br0")
+    check("bridged box: adapter says where the IP is", ads[0]["desc"].endswith("IP on br0"), ads[0]["desc"])
+    check("bridged box: link read from the port", N.linux_link("enp14s0") == (True, 1000))
+    check("non-bridged NIC maps to itself", N.linux_l3_iface("wlp15s0") == "wlp15s0")
+finally:
+    N.SYS_NET = real
 print(f"\nALL {ok} LINUX CHECKS PASSED")
