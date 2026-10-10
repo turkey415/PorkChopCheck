@@ -43,6 +43,7 @@ Not committed to, but worth thinking about:
 
 ## Already shipped
 
+- **Tick test:** UDP at 64 or 128 packets a second to a reflector (`porkchopcheck --reflector`), reporting loss bursts, jitter, late and out-of-order packets.
 - **Event timeline:** the Ping graph marks link, spanning-tree, gateway, broadcast, duplicate-IP and DHCP events and says what each did to latency.
 - **Multicast browser:** Tools › Multicast lists live groups with names and rates, finds the IGMP querier, and has a join test.
 - **Open services on smart devices:** a Ports button on each device checks 35 common services and names them; saved to `devices.csv`.

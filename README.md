@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -107,6 +107,29 @@ Good to know:
 Each event is listed below the graph with what ping did around it, such as `2 pings lost · peak 212 ms, normally 3 ms` or `no effect on ping`. That is the point of the page: a lag spike sits directly above whatever caused it, or above nothing, which tells you the cause is somewhere this port cannot see.
 
 The third button switches the graph between the last 30 seconds, 5 minutes and 30 minutes. The summary line shows loss, average, jitter, and the time 99% of pings came in under. Events are collected the whole time the app is open, whether or not ping is running.
+
+## Tick test (game-rate UDP)
+
+Counter-Strike and most other games send small UDP packets at a steady rate, 64 or 128 a second. ICMP ping is a different kind of traffic at a much lower rate, and switches and routers often treat it differently. **Tools › Tick test** sends 160-byte UDP packets at the game's rate to a reflector and times every one.
+
+It reports what a player actually feels:
+
+- **Loss**, and the **longest run of lost packets** in a row. Three lost together is a visible hitch even when overall loss is well under 1%.
+- **Jitter**, how much the reply time changes from one packet to the next.
+- **Late replies**: ones that took a whole tick (15.6 ms at 64 a second) longer than usual.
+- Packets that arrived **out of order** or **twice**.
+- Reply times: fastest, typical, the time 95% and 99% came in under, and slowest.
+
+The graph is the same as on the Ping page, with port events marked under it, so a spanning-tree change or a link flap lines up with the hitch it caused. The headline goes amber for any loss or late reply, and red for 1% loss, three lost in a row, or jitter over half a tick.
+
+**It needs something at the far end to send the packets back.** Either:
+
+- on the game server or any spare machine, run `porkchopcheck --reflector` (from source: `python3 porkchopcheck.py --reflector`). It needs only Python, no window and no admin rights; or
+- on a second PorkChopCheck box, open Tools › Tick test and tap **Reflect**.
+
+Then tap **Server**, enter that machine's address, and tap **Start**. The reflector listens on UDP port 27777; add a different port after the address if you started it with one, e.g. `--reflector 27015`. If nothing comes back, open that UDP port in the far machine's firewall (`sudo firewall-cmd --add-port=27777/udp` on Fedora and Nobara).
+
+The reflector answers only this test's packets, one reply for each, so it can't be used to amplify traffic. The test also shows how accurate this box's own send timing is, so you can tell network jitter from a busy tester.
 
 ## Multicast browser
 

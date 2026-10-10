@@ -159,6 +159,65 @@ slow = [(t / 4, 40.0 + (t % 3)) for t in range(400)]
 check("impact: a steady slow link is not a spike", N.event_impact(slow, 50.0)["hit"] is False)
 one = [(t / 4, 3.0) for t in range(400)]; one[200] = (50.0, None)
 check("impact text: one lost ping, singular", N.impact_text(N.event_impact(one, 50.0)) == "1 ping lost")
+# tick-rate test: packets, the buffer, the figures, the verdict, and a real run over loopback
+pk = N.tick_packet(0xDEADBEEF, 41)
+check("tick packet: marker, session, sequence, padded to size", len(pk) == N.TICK_SIZE and N.parse_tick(pk) == (0xDEADBEEF, 41))
+check("tick packet: anything else is not ours", N.parse_tick(b"PCC1") is None and N.parse_tick(b"XXXX" + bytes(20)) is None and N.parse_tick(b"") is None)
+check("tick server: address forms", [N.parse_tick_server(t) for t in ("10.1.2.3", " 10.1.2.3:27015 ", "10.1.2.3 27015", "cs-server.lan")] ==
+      [("10.1.2.3", N.TICK_PORT), ("10.1.2.3", 27015), ("10.1.2.3", 27015), ("cs-server.lan", N.TICK_PORT)])
+for bad in ("", None, "10.1.2.3:0", "10.1.2.3:99999", "host; rm -rf /", "-oProxyCommand=x", "a b c"):
+    check(f"tick server refused: {bad!r}", N.parse_tick_server(bad) is None)
+tb = N.TickBuffer()
+seqs = [tb.add_sent(100.0 + i / 64) for i in range(10)]
+for q in (0, 1, 2, 4, 3, 6, 6, 9):               # 5, 7 and 8 never answered; 3 late and out of order; 6 twice
+    tb.add_reply(q, 1.5)
+tb.add_reply(999, 1.0)
+check("tick buffer: counters", tb.counters() == {"sent": 10, "recv": 7, "reorder": 1, "dup": 1}, tb.counters())
+check("tick buffer: unanswered packets wait out their timeout before counting as lost",
+      len(tb.samples(100.2)) == 7 and len(tb.samples(102.0)) == 10)
+sm = N.tick_summary(tb.samples(102.0), 64)
+check("tick summary: loss and the longest run of lost packets", (sm["n"], sm["lost"], sm["burst"]) == (10, 3, 2) and abs(sm["loss_pct"] - 30) < 1e-9, sm)
+tb2 = N.TickBuffer(); tb2.MAX = 4
+for i in range(10):
+    tb2.add_sent(200.0 + i)
+check("tick buffer: old packets fall off the front and sequence numbers carry on", (tb2.base, len(tb2.rows), tb2.add_sent(300.0)) == (6, 4, 10), (tb2.base, len(tb2.rows)))
+tb2.add_reply(10, 2.0); tb2.add_reply(3, 2.0)
+check("tick buffer: a reply for a packet no longer held is ignored", tb2.rows[-1][1] == 2.0 and tb2.counters()["recv"] == 1)
+steady = [(i / 64, 1.2 + (0.05 if i % 2 else 0)) for i in range(640)]
+ss = N.tick_summary(steady, 64)
+check("tick summary: a clean run", (ss["lost"], ss["burst"], ss["late"]) == (0, 0, 0) and abs(ss["jitter"] - 0.05) < 1e-9 and ss["p50"] == 1.2 and ss["max"] == 1.25, ss)
+check("tick verdict: clean is ok", N.tick_verdict(ss, 64) == ("0.00% loss · 1.2 ms · jitter 0.05 ms", "ok"))
+late = list(steady); late[100] = (late[100][0], 1.2 + 16.0)
+check("tick summary: a reply over one tick slow is late", N.tick_summary(late, 64)["late"] == 1 and N.tick_summary(late, 128)["late"] == 1)
+check("tick verdict: one late reply is a warning", N.tick_verdict(N.tick_summary(late, 64), 64)[1] == "warn")
+gap = list(steady)
+for i in (200, 201, 202):
+    gap[i] = (gap[i][0], None)
+check("tick verdict: three lost in a row is bad even under 1% loss", N.tick_summary(gap, 64)["burst"] == 3 and N.tick_summary(gap, 64)["loss_pct"] < 1 and N.tick_verdict(N.tick_summary(gap, 64), 64)[1] == "bad")
+jittery = [(i / 64, 1.0 + (10.0 if i % 2 else 0)) for i in range(640)]
+check("tick verdict: jitter over half a tick is bad", N.tick_verdict(N.tick_summary(jittery, 64), 64)[1] == "bad")
+check("tick verdict: nothing back at all", N.tick_verdict(N.tick_summary([(i / 64, None) for i in range(64)], 64), 64) == ("No replies", "bad"))
+check("tick verdict: nothing sent yet", N.tick_verdict(N.tick_summary([], 64), 64)[1] == "wait")
+import time as _t
+rf = N.Reflector(0, "127.0.0.1"); rport = rf.sock.getsockname()[1]; rf.start()
+tt = N.TickTest("127.0.0.1", "127.0.0.1", rport, 128); tt.start(); _t.sleep(1.3); tt.stop(); _t.sleep(0.3)
+cn = tt.buf.counters()
+check("live run on loopback: about 128 a second, every packet back", 140 <= cn["sent"] <= 190 and cn["recv"] >= cn["sent"] - 2 and cn["dup"] == 0, cn)
+check("live run: reply times are sane and the reflector counted them", 0 < N.tick_summary(tt.buf.samples(_t.time() + 2), 128)["p50"] < 50 and rf.count >= cn["recv"] and "127.0.0.1" in rf.peers)
+junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); junk.settimeout(0.4); junk.sendto(b"not a test packet", ("127.0.0.1", rport))
+try:
+    junk.recvfrom(100); echoed = True
+except socket.timeout:
+    echoed = False
+check("reflector ignores anything without the test marker", echoed is False)
+junk.close(); rf.stop()
+try:
+    N.TickTest("127.0.0.1", "no-such-host.invalid", 1, 64); opened = True
+except OSError:
+    opened = False
+check("tick test: an unknown host fails cleanly", opened is False)
+check("impact text names what was running", N.impact_text(N.event_impact(smp, 50.0), "the test", "packet") == "2 packets lost · peak 180 ms, normally 3 ms"
+      and N.impact_text(None, "the test", "packet") == "the test wasn't running")
 # multicast browser: names, frames, IGMP, the tracker and the querier verdict
 MAC = "00:11:22:33:44:55"
 check("mcast names: exact, range, unknown", (N.mcast_name("224.0.0.251"), N.mcast_name("239.69.4.4"), N.mcast_name("239.1.2.3")) == ("mDNS", "Dante / AES67 audio", ""))

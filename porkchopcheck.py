@@ -99,6 +99,11 @@ def _drop_ambient_caps():
 _use_private_python()
 _drop_ambient_caps()
 
+if "--reflector" in sys.argv:
+    # The far end of the tick test, with no window: needs nothing but Python itself.
+    import pc_net
+    sys.exit(pc_net.reflector_main(sys.argv))
+
 
 def log_error(what):
     """Append the current exception to crash.log without stopping the app."""
@@ -239,6 +244,9 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.tick = {"running": False, "rate": 64, "span": 30, "msg": "", "target": "", "sum": None,
+                     "cols": [], "t_end": 0.0, "normal": 0.0, "counters": {}, "pace": 0.0,
+                     "impacts": {}, "reflecting": False, "reflected": 0, "peers": []}
         self.events = collections.deque(maxlen=300)       # the timeline: link, STP, gateway, storms…
         self.bc_storm = False
         self.mcast = {"running": False, "msg": "", "snap": None, "join": None, "probed": None,
@@ -1540,6 +1548,118 @@ class Backend:
                         d["ports"], d["services_checked"] = ports, True
         self.st.say(err or f"{ip}: {len(ports)} of {len(S.ALL_PORTS)} common services answer", 4)
 
+    # ---------------------------------------------------------- tick-rate test
+    TICK_SPANS = (30, 300)
+    TICK_COLS = 240
+
+    def tick_toggle(self):
+        with self.st.lock:
+            running, rate, src = self.st.tick["running"], self.st.tick["rate"], self.st.ipv4
+        if running:
+            self.stops["tick"].set()
+            return
+        target = N.parse_tick_server(self.settings.get("tick_server"))
+        if not target:
+            self.st.say("Set the reflector's address first (the Server button)", 5)
+            return
+        if not src:
+            self.st.say("Need an IP address", 3)
+            return
+        ev = self._new_stop("tick")
+        with self.st.lock:
+            self.st.tick.update(running=True, msg="", sum=None, cols=[], counters={},
+                                target=f"{target[0]}:{target[1]}", impacts={})
+        threading.Thread(target=self._tick_run, args=(ev, src, target, rate), daemon=True).start()
+
+    def tick_next_rate(self):
+        with self.st.lock:
+            t, opts = self.st.tick, N.TICK_RATES
+            if not t["running"]:
+                t["rate"] = opts[(opts.index(t["rate"]) + 1) % len(opts)] if t["rate"] in opts else opts[0]
+
+    def tick_next_span(self):
+        with self.st.lock:
+            t, opts = self.st.tick, self.TICK_SPANS
+            t["span"] = opts[(opts.index(t["span"]) + 1) % len(opts)] if t["span"] in opts else opts[0]
+
+    def tick_set_server(self, text):
+        text = (text or "").strip()
+        if text and not N.parse_tick_server(text):
+            self.st.say("Enter an address like 10.1.2.3, optionally followed by a port", 5)
+            return
+        self.settings.set("tick_server", text)
+
+    def _tick_open(self, src, target, rate):
+        t = N.TickTest(src, target[0], target[1], rate)
+        t.start()
+        return t.buf, t
+
+    def _tick_run(self, ev, src, target, rate):
+        st = self.st
+        try:
+            buf, test = self._tick_open(src, target, rate)
+        except OSError as e:
+            with st.lock:
+                st.tick.update(running=False, msg=f"Couldn't start: {e}"[:80])
+            return
+        t0 = time.time()
+        while not ev.wait(0.5):
+            self._tick_publish(buf, rate, getattr(test, "pace_err", 0.0), t0)
+        if test is not None:
+            test.stop()
+        self._tick_publish(buf, rate, getattr(test, "pace_err", 0.0), t0)
+        with st.lock:
+            st.tick["running"] = False
+
+    def _tick_publish(self, buf, rate, pace, t0):
+        """Twice a second: boil the run down to what the screen needs. The packets themselves
+        stay here; copying tens of thousands of them into the UI each refresh would be slow."""
+        st = self.st
+        now = time.time()
+        with st.lock:
+            span, events = st.tick["span"], list(st.events)
+        samples = buf.samples(now)
+        recent = [x for x in samples if x[0] >= now - span]
+        summ = N.tick_summary(recent, rate)
+        c = buf.counters()
+        msg = ""
+        if c["sent"] > rate * 2 and c["recv"] == 0 and now - t0 > 2:
+            msg = "No replies. Is the reflector running there, and is its firewall open?"
+        impacts = {e["ts"]: N.impact_text(N.event_impact(samples, e["ts"], before=10, after=3),
+                                          "the test", "packet")
+                   for e in events[-25:]}
+        with st.lock:
+            st.tick.update(sum=summ, counters=c, pace=pace, t_end=now, msg=msg, impacts=impacts,
+                           cols=N.bucket_samples(samples, now, span, self.TICK_COLS),
+                           normal=summ["p50"] or 0.0)
+
+    def tick_reflect_toggle(self):
+        r = getattr(self, "reflector", None)
+        if r is not None:
+            r.stop()
+            self.reflector = None
+            with self.st.lock:
+                self.st.tick.update(reflecting=False)
+            self.st.say("Reflector stopped", 3)
+            return
+        try:
+            r = N.Reflector(N.TICK_PORT)
+        except OSError as e:
+            self.st.say(f"Can't listen on UDP {N.TICK_PORT}: {e}"[:70], 5)
+            return
+        r.start()
+        self.reflector = r
+        with self.st.lock:
+            self.st.tick.update(reflecting=True, reflected=0, peers=[])
+        self.st.say(f"Reflecting on UDP port {N.TICK_PORT}", 4)
+
+        def watch():
+            while self.reflector is r:
+                with self.st.lock:
+                    self.st.tick.update(reflected=r.count, peers=sorted(r.peers))
+                time.sleep(1)
+        threading.Thread(target=watch, daemon=True).start()
+
     # ---------------------------------------------------------- multicast browser
     MCAST_PROBE_GROUP = "239.192.137.251"       # joined for a moment to make a querier speak up
 
@@ -1943,6 +2063,39 @@ class DemoBackend(Backend):
 
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
+
+    def _tick_open(self, src, target, rate):
+        """A made-up path: steady 1.2 ms, with the demo network's spanning-tree glitch in it."""
+        buf = N.TickBuffer()
+        stop = self.stops["tick"]
+
+        def feed():
+            due = time.time()
+            while not stop.is_set():
+                now = time.time()
+                while due <= now:
+                    seq = buf.add_sent(due)
+                    phase = due % 23
+                    if phase < 1.2:
+                        self.event("stp", "Spanning-tree topology change (VLAN 30)", "warn", quiet=10)
+                        if random.random() < 0.5:
+                            buf.add_reply(seq, random.uniform(20, 90))
+                    elif random.random() > 0.0008:
+                        buf.add_reply(seq, max(0.3, random.gauss(1.2, 0.12)))
+                    due += 1.0 / rate
+                time.sleep(0.05)
+        threading.Thread(target=feed, daemon=True).start()
+        return buf, None
+
+    def tick_toggle(self):
+        if not self.settings.get("tick_server"):
+            self.settings.data["tick_server"] = "10.20.30.200"
+        super().tick_toggle()
+
+    def tick_reflect_toggle(self):
+        with self.st.lock:
+            on = not self.st.tick["reflecting"]
+            self.st.tick.update(reflecting=on, reflected=18240 if on else 0, peers=["10.20.30.61"] if on else [])
 
     def mcast_start(self):
         with self.st.lock:
@@ -2635,6 +2788,11 @@ class UI:
             "ping": ToolView(self.body, self, "Ping", [("Start", self.be.ping_toggle),
                                                      ("Target ›", self.be.ping_next_target),
                                                      ("30 s", self.be.ping_next_span)], chart=0.24),
+            "tick": ToolView(self.body, self, "Tick test", [("Start", self.be.tick_toggle),
+                                                           ("64/s", self.be.tick_next_rate),
+                                                           ("30 s", self.be.tick_next_span),
+                                                           ("Server", self.tick_server_dialog),
+                                                           ("Reflect", self.be.tick_reflect_toggle)], chart=0.24),
             "trace": ToolView(self.body, self, "Traceroute", [("Run", self.be.trace_toggle),
                                                              ("Target ›", self.be.trace_next_target)]),
             "speed": ToolView(self.body, self, "Speed test", [("iperf3", self.be.speed_iperf),
@@ -2788,6 +2946,7 @@ class UI:
         page = tk.Frame(self.body, bg=BG)
         self.views["TOOLS"] = page
         items = [("Ping", lambda: self.show("ping")), ("Traceroute", lambda: self.show("trace")),
+                 ("Tick test", lambda: self.show("tick")),
                  ("Speed test", lambda: self.show("speed")), ("ARP table", self.open_arp),
                  ("ARP scan", lambda: self.show("arpscan")), ("mDNS browser", self.open_mdns),
                  ("Port finder", lambda: self.show("blink")), ("Capture", self.open_capture),
@@ -2857,6 +3016,12 @@ class UI:
         self.show("mdns")
         if not self.be.mdns.snapshot()["last_scan"]:
             self.be.mdns_scan()
+
+    def tick_server_dialog(self):
+        Keyboard(self, "Reflector address for the tick test", self.be.settings.get("tick_server"),
+                 self.be.tick_set_server,
+                 f"The machine running 'porkchopcheck --reflector', or another PorkChopCheck with "
+                 f"Reflect on. Port {N.TICK_PORT} unless you add another after a space.")
 
     def open_mcast(self):
         self.show("mcast")
@@ -3215,7 +3380,9 @@ class UI:
         v.set_summary(summ, color, sub)
         t_end = now if p["running"] or not samples else samples[-1][0]
         events = list(s["events"])
-        self.draw_timeline(v.chart, samples, events, t_end, span)
+        ncol = 120 if span <= 30 else max(60, v.chart.winfo_width() // 3)
+        normal = N.percentile([r for _, r in samples if r is not None], 50) or 0
+        self.draw_timeline(v.chart, N.bucket_samples(samples, t_end, span, ncol), normal, events, t_end, span)
         rows = [("Port events, newest first", HDR, "hdr")]
         for e in reversed(events[-25:]):
             stamp = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
@@ -3231,21 +3398,80 @@ class UI:
         rows += [(t, c, "mono") for t, c in list(p["log"])[:8]]
         v.list.set_rows(rows, "")
 
-    def draw_timeline(self, c, samples, events, t_end, span):
-        """Latency bars with lost pings in red, and under them a lane marking each port event."""
+    def render_tick(self, s, v, now):
+        t = s["tick"]
+        run, rate, span, summ = t["running"], t["rate"], t["span"], t["sum"]
+        v.set_action(0, "Stop" if run else "Start", RED if run else BLUE)
+        v.set_action(1, f"{rate}/s", GREY if run else BLUE)
+        v.set_action(2, {30: "30 s", 300: "5 min"}.get(span, f"{span} s"))
+        v.set_action(4, "Reflecting" if t["reflecting"] else "Reflect", GREEN if t["reflecting"] else BLUE)
+        server = self.be.settings.get("tick_server")
+        tick_ms = 1000.0 / rate
+        if summ and summ["n"]:
+            head, level = N.tick_verdict(summ, rate)
+            color = {"ok": OK, "warn": WARN, "bad": BAD}.get(level, FG)
+            c = t["counters"]
+            sub = t["msg"] or (f"{t['target']} · {rate} a second · sent {c.get('sent', 0):,}"
+                               f" · longest gap {summ['burst']} · late {summ['late']}"
+                               f" · out of order {c.get('reorder', 0)}")
+            v.set_summary(head, color, sub, BAD if t["msg"] else DIM)
+        elif run:
+            v.set_summary("Waiting for replies…", FG, t["msg"] or t["target"], BAD if t["msg"] else DIM)
+        else:
+            v.set_summary("Game-rate UDP test", FG, t["msg"] or (
+                f"Reflector: {server}. Tap Start." if server else
+                "Tap Server to set where the reflector is, then Start."), BAD if t["msg"] else DIM)
+        events = list(s["events"])
+        # A reply that takes one tick longer than usual arrives a tick late: that is the amber line.
+        self.draw_timeline(v.chart, t["cols"], t["normal"], events, t["t_end"] or now, span,
+                           slow=t["normal"] + tick_ms, cap=max(t["normal"] + 3 * tick_ms, 3 * t["normal"] + 5))
+        rows = []
+        if summ and summ["n"] and summ["min"] is not None:
+            rows += [("Reply times over the " + ("last 30 s" if span == 30 else "last 5 min"), HDR, "hdr"),
+                     (f"fastest {summ['min']:.1f} · typical {summ['p50']:.1f} · 95% under {summ['p95']:.1f} · "
+                      f"99% under {summ['p99']:.1f} · slowest {summ['max']:.1f} ms", FG, "row"),
+                     (f"{summ['lost']} of {summ['n']:,} lost · longest run of lost packets {summ['burst']} · "
+                      f"{summ['late']} replies over a tick ({tick_ms:.1f} ms) late · "
+                      f"{t['counters'].get('dup', 0)} duplicated · this box's own send timing is within "
+                      f"{t['pace']:.2f} ms", DIM, "dim")]
+        if t["reflecting"]:
+            rows += [("Reflector", HDR, "hdr"),
+                     (f"Answering on UDP port {N.TICK_PORT}: {t['reflected']:,} packets returned"
+                      + (f" to {', '.join(t['peers'][:3])}" if t["peers"] else ""), OK, "row")]
+        rows.append(("Port events, newest first", HDR, "hdr"))
+        for e in reversed(events[-25:]):
+            stamp = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+            rows.append((f"{stamp}  {e['text']}", self.SEV_COLOR.get(e["sev"], FG), "row"))
+            imp = t["impacts"].get(e["ts"])
+            if imp:
+                rows.append(("              " + imp, DIM, "dim"))
+        if not events:
+            rows.append(("None yet.", DIM, "dim"))
+        rows.append(("How to use it", HDR, "hdr"))
+        rows.append((f"Run 'porkchopcheck --reflector' on the game server or any machine at the far end, or tap "
+                     f"Reflect on a second PorkChopCheck. Then set its address with Server and tap Start. "
+                     f"This sends {N.TICK_SIZE}-byte UDP packets at the game's rate and times each one.", FG, "row"))
+        v.list.set_rows(rows, "")
+
+    def draw_timeline(self, c, cols, normal, events, t_end, span, slow=None, cap=None):
+        """Latency bars with lost packets in red, and under them a lane marking each port event.
+        `cols` is N.bucket_samples output; `normal` the usual reply time, for colouring. With
+        `cap`, the scale stops there so one huge spike doesn't flatten everything else; bars
+        that go past it are drawn full height and the scale label gets a plus."""
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 20:
+        if w < 20 or not cols:
             return
         lane = max(10, int(h * 0.2))
         ph = h - lane
-        ncol = 120 if span <= 30 else max(60, w // 3)
-        cols = N.bucket_samples(samples, t_end, span, ncol)
+        ncol = len(cols)
         bw = w / ncol
         vals = [r for r, _, _ in cols if r is not None]
-        normal = N.percentile([r for _, r in samples if r is not None], 50) or 0
-        slow = max(20, 3 * normal)
+        slow = slow if slow is not None else max(20, 3 * normal)
         top = max(max(vals) if vals else 1, 2) * 1.15
+        clipped = cap is not None and top > cap
+        if clipped:
+            top = cap
         for i, (r, lost, n) in enumerate(cols):
             x = i * bw
             if not n:
@@ -3253,8 +3479,8 @@ class UI:
             if r is None:
                 c.create_rectangle(x, 0, x + bw - 1, ph, fill=BAD, width=0)
                 continue
-            bh = max(2, ph * r / top)
-            c.create_rectangle(x, ph - bh, x + bw - 1, ph, fill=OK if r < slow else WARN, width=0)
+            bh = min(ph, max(2, ph * r / top))
+            c.create_rectangle(x, ph - bh, x + max(1, bw - 1), ph, fill=OK if r < slow else WARN, width=0)
             if lost:
                 c.create_rectangle(x, 0, x + bw - 1, max(3, ph * 0.12), fill=BAD, width=0)
         c.create_line(0, ph, w, ph, fill=GREY)
@@ -3268,7 +3494,11 @@ class UI:
             c.create_polygon(x, ph + 2, x - lane * 0.45, h - 1, x + lane * 0.45, h - 1, fill=col, outline="")
         font = self.font(self.sz["rowsm"])
         label = {30: "last 30 s", 300: "last 5 min", 1800: "last 30 min"}.get(span, "")
-        c.create_text(6, 4, anchor="nw", text=f"{top:.0f} ms  ·  {label}", fill=DIM, font=font)
+        tag = c.create_text(6, 4, anchor="nw", fill=FG, font=font,
+                            text=f"{top:.0f}{'+' if clipped else ''} ms  ·  {label}")
+        box = c.bbox(tag)
+        if box:
+            c.tag_lower(c.create_rectangle(box[0] - 4, box[1] - 2, box[2] + 4, box[3] + 2, fill=BG, width=0), tag)
 
     def render_trace(self, s, v, now):
         t = s["trace"]

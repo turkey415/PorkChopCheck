@@ -6,6 +6,7 @@ ICMP ping + traceroute, iperf3 / HTTP speed tests, MAC vendor lookup, port log, 
 No GUI code in here, so it can be tested on any OS.
 """
 
+import collections
 import csv
 import ctypes
 import http.client
@@ -19,6 +20,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -1186,7 +1188,7 @@ class Oui:
 # ====================================================================== settings + port log
 class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
-                "iperf_port": 5201, "smart_services": False}
+                "iperf_port": 5201, "smart_services": False, "tick_server": ""}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")
@@ -1276,17 +1278,281 @@ def event_impact(samples, ts, before=10.0, after=5.0):
     return {"lost": lost, "peak": peak, "normal": normal, "hit": bool(lost or spike)}
 
 
-def impact_text(imp):
+def impact_text(imp, name="ping", unit="ping"):
+    """`name` is what was running ("ping", "the test"); `unit` is one of what it sends."""
     if imp is None:
-        return "ping wasn't running"
+        return f"{name} wasn't running"
     if not imp["hit"]:
-        return "no effect on ping"
+        return f"no effect on {name}"
     bits = []
     if imp["lost"]:
-        bits.append(f"{imp['lost']} ping{'s' if imp['lost'] != 1 else ''} lost")
+        bits.append(f"{imp['lost']} {unit}{'s' if imp['lost'] != 1 else ''} lost")
     if imp["peak"] is not None and imp["normal"] is not None and imp["peak"] > max(2 * imp["normal"], imp["normal"] + 10):
         bits.append(f"peak {imp['peak']:.0f} ms, normally {imp['normal']:.0f} ms")
     return " · ".join(bits)
+
+
+# ====================================================================== tick-rate test
+# A game sends small UDP packets at a steady rate, 64 or 128 a second for Counter-Strike. This
+# test does the same to a reflector and times every packet, which shows what ICMP ping hides:
+# short bursts of loss, packets arriving out of order, and replies that miss their tick.
+TICK_MAGIC = b"PCC1"
+TICK_PORT = 27777
+TICK_RATES = (64, 128)
+TICK_SIZE = 160                    # bytes of UDP payload, about a game client's packet
+
+
+def tick_packet(session, seq, size=TICK_SIZE):
+    return (TICK_MAGIC + struct.pack("!II", session, seq)).ljust(size, b"\x00")
+
+
+def parse_tick(data):
+    """(session, seq) from a test packet, or None."""
+    if len(data) < 12 or data[:4] != TICK_MAGIC:
+        return None
+    return struct.unpack("!II", data[4:12])
+
+
+def parse_tick_server(text, default_port=TICK_PORT):
+    """"10.1.2.3", "10.1.2.3:27015", "10.1.2.3 27015" or "server.lan" -> (host, port) or None."""
+    m = re.fullmatch(r"\s*([A-Za-z0-9][A-Za-z0-9.\-]*)(?:\s*[:/ ]\s*(\d{1,5}))?\s*", text or "")
+    if not m:
+        return None
+    port = int(m.group(2)) if m.group(2) else default_port
+    return (m.group(1), port) if 0 < port < 65536 else None
+
+
+class TickBuffer:
+    """Every packet of a run: when it left and how long its reply took."""
+
+    MAX = 40000                    # about 10 minutes at 64 a second, 5 at 128
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rows = collections.deque()        # [send time, rtt in ms or None]
+        self.base = 0                          # sequence number of rows[0]
+        self.top = -1                          # highest sequence number answered so far
+        self.sent = self.recv = self.reorder = self.dup = 0
+
+    def add_sent(self, ts):
+        with self.lock:
+            self.rows.append([ts, None])
+            self.sent += 1
+            if len(self.rows) > self.MAX:
+                self.rows.popleft()
+                self.base += 1
+            return self.base + len(self.rows) - 1
+
+    def add_reply(self, seq, rtt_ms):
+        with self.lock:
+            i = seq - self.base
+            if not 0 <= i < len(self.rows):
+                return
+            if self.rows[i][1] is not None:
+                self.dup += 1
+                return
+            self.rows[i][1] = rtt_ms
+            self.recv += 1
+            if seq < self.top:
+                self.reorder += 1
+            else:
+                self.top = seq
+
+    def samples(self, now, timeout=1.0):
+        """[(send time, rtt or None)], leaving out packets still inside their timeout."""
+        with self.lock:
+            return [(ts, rtt) for ts, rtt in self.rows if rtt is not None or now - ts >= timeout]
+
+    def counters(self):
+        with self.lock:
+            return {"sent": self.sent, "recv": self.recv, "reorder": self.reorder, "dup": self.dup}
+
+
+def tick_summary(samples, rate):
+    """Figures for a stretch of tick-test samples: loss, the longest run of lost packets, reply
+    times, jitter, and how many replies were late enough to miss a tick."""
+    rtts = [r for _, r in samples if r is not None]
+    n = len(samples)
+    lost = n - len(rtts)
+    burst = run = 0
+    for _, r in samples:
+        run = run + 1 if r is None else 0
+        burst = max(burst, run)
+    out = {"n": n, "lost": lost, "loss_pct": 100 * lost / n if n else 0.0, "burst": burst,
+           "min": min(rtts) if rtts else None, "max": max(rtts) if rtts else None,
+           "avg": sum(rtts) / len(rtts) if rtts else None,
+           "p50": percentile(rtts, 50), "p95": percentile(rtts, 95), "p99": percentile(rtts, 99),
+           "jitter": None, "late": 0}
+    if len(rtts) > 1:
+        out["jitter"] = sum(abs(b - a) for a, b in zip(rtts, rtts[1:])) / (len(rtts) - 1)
+    if rtts:
+        tick = 1000.0 / rate
+        out["late"] = sum(1 for r in rtts if r > out["p50"] + tick)
+    return out
+
+
+def tick_verdict(s, rate):
+    """(headline, level) for a summary: ok | warn | bad, judged the way a player would feel it."""
+    if not s["n"]:
+        return ("Waiting for replies…", "wait")
+    if s["lost"] == s["n"]:
+        return ("No replies", "bad")
+    tick = 1000.0 / rate
+    if s["loss_pct"] >= 1 or s["burst"] >= 3 or (s["jitter"] or 0) > tick / 2:
+        level = "bad"
+    elif s["lost"] or s["late"] or (s["jitter"] or 0) > tick / 8:
+        level = "warn"
+    else:
+        level = "ok"
+    return (f"{s['loss_pct']:.2f}% loss · {s['p50']:.1f} ms · jitter {s['jitter'] or 0:.2f} ms", level)
+
+
+class TickTest:
+    """Sends the packets, at a steady rate, and times the replies."""
+
+    def __init__(self, src, host, port, rate, size=TICK_SIZE):
+        self.host, self.port, self.rate, self.size = host, port, rate, size
+        self.buf = TickBuffer()
+        self.session = random.getrandbits(32)
+        self.stop_ev = threading.Event()
+        self.pace_err = 0.0            # how far off its schedule this box's own sending is, in ms
+        self.error = None
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if src:
+                self.sock.bind((src, 0))
+            self.sock.connect((host, port))
+            self.sock.settimeout(0.2)
+        except OSError:
+            self.sock.close()
+            raise
+        self.sent_at = {}              # seq -> perf_counter when it left
+
+    def start(self):
+        for fn in (self._send_loop, self._recv_loop):
+            threading.Thread(target=fn, daemon=True).start()
+
+    def stop(self):
+        self.stop_ev.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _send_loop(self):
+        gap = 1.0 / self.rate
+        due = time.perf_counter()
+        while not self.stop_ev.is_set():
+            now = time.perf_counter()
+            if now - due > 0.5:        # the machine slept or stalled; don't fire a burst to catch up
+                due = now
+            self.pace_err += (abs(now - due) * 1000 - self.pace_err) * 0.05
+            seq = self.buf.add_sent(time.time())
+            self.sent_at[seq] = now
+            if len(self.sent_at) > 4 * self.rate:
+                self.sent_at.pop(next(iter(self.sent_at)), None)
+            try:
+                self.sock.send(tick_packet(self.session, seq, self.size))
+            except OSError as e:
+                self.error = str(e)    # e.g. ICMP port unreachable coming back; keep going
+            due += gap
+            wait = due - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+
+    def _recv_loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                data = self.sock.recv(2048)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if self.stop_ev.is_set():
+                    return
+                self.error = str(e)
+                time.sleep(0.05)
+                continue
+            now = time.perf_counter()
+            p = parse_tick(data)
+            if not p or p[0] != self.session:
+                continue
+            t = self.sent_at.get(p[1])
+            if t is not None:
+                self.buf.add_reply(p[1], (now - t) * 1000)
+
+
+class Reflector:
+    """The far end of the tick test: sends every test packet straight back where it came from.
+    It answers only packets that start with the test's marker, one reply per packet, so it
+    cannot be used to amplify traffic."""
+
+    def __init__(self, port=TICK_PORT, bind=""):
+        self.port, self.count, self.peers = port, 0, {}
+        self.stop_ev = threading.Event()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind((bind, port))
+            self.sock.settimeout(0.3)
+        except OSError:
+            self.sock.close()
+            raise
+
+    def serve(self):
+        while not self.stop_ev.is_set():
+            try:
+                data, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop_ev.is_set():
+                    return
+                continue
+            if data[:4] != TICK_MAGIC:
+                continue
+            try:
+                self.sock.sendto(data, addr)
+            except OSError:
+                continue
+            self.count += 1
+            self.peers[addr[0]] = time.time()
+
+    def start(self):
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def stop(self):
+        self.stop_ev.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def reflector_main(argv):
+    """`porkchopcheck --reflector [port]`: run only the reflector, with no window. For the game
+    server or any spare machine at the far end of the path you want to test."""
+    port = TICK_PORT
+    for a in argv[argv.index("--reflector") + 1:][:1]:
+        if a.isdigit() and 0 < int(a) < 65536:
+            port = int(a)
+    try:
+        r = Reflector(port)
+    except OSError as e:
+        print(f"Can't listen on UDP port {port}: {e}", file=sys.stderr)
+        return 1
+    print(f"PorkChopCheck reflector listening on UDP port {port}. Press Ctrl+C to stop.")
+    print("If nothing reaches it, open that port in this machine's firewall.")
+    r.start()
+    try:
+        last = 0
+        while True:
+            time.sleep(5)
+            if r.count != last:
+                last = r.count
+                print(f"  {r.count:,} packets returned, to {', '.join(sorted(r.peers))}")
+    except KeyboardInterrupt:
+        r.stop()
+        print(f"\nStopped after {r.count:,} packets.")
+        return 0
 
 
 # ====================================================================== multicast
