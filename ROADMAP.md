@@ -42,7 +42,7 @@ Small tools that come up all the time:
 - **TCP port test:** can this port reach `host:port`? (e.g. a printer on 9100)
 - **Wake-on-LAN:** wake a machine by MAC
 - **NTP check:** time offset against an NTP server
-- **Public IP & ISP:** what the internet sees this port as
+- **ISP name:** who the public IP belongs to (the public IP itself now shows on the PORT page)
 - **Subnet calculator**
 
 ## Ideas parking lot

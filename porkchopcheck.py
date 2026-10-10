@@ -258,6 +258,7 @@ class State:
         self.ip_wait_from = None
         self.time_to_ip = None
         self.gw_ms = self.dns_ms = self.net_ms = PENDING
+        self.public_ip = None
         self.nb = {}
         self.sniff_msg = "Starting…"
         self.reset_l2(now)
@@ -514,6 +515,8 @@ class Backend:
         self.last_sig = None
         self.last_log = 0.0
         self.oui_tried = False
+        self.pubip_at = 0.0             # last time the public IP was asked for
+        self.pubip_for = None           # (adapter, local IP) it was asked from
         self.devstore = S.DeviceStore(DATA_DIR)
 
     # ---------------------------------------------------------- lifecycle
@@ -627,6 +630,7 @@ class Backend:
                     st.drops += 1
                 st.nb = {}
                 st.gw_ms = st.dns_ms = st.net_ms = PENDING
+                st.public_ip = None
                 st.reset_l2(now)
             st.link = up
             st.speed_mbps = speed if up else 0
@@ -725,8 +729,21 @@ class Backend:
         if net_ms is None:
             net_ms = N.tcp_probe("8.8.8.8", 443, ip)
         with st.lock:
+            have_pub = st.public_ip
             if st.sel == name and st.link:
                 st.gw_ms, st.dns_ms, st.net_ms = gw_ms, dns_ms, net_ms
+                if net_ms is None:
+                    st.public_ip = have_pub = None
+        # Ask for the public IP as soon as the internet answers on a new port or address, then
+        # every five minutes; while there is none yet, try again every 20 s.
+        now = time.time()
+        if net_ms is not None and ((name, ip) != self.pubip_for
+                                   or now - self.pubip_at > (300 if have_pub else 20)):
+            self.pubip_at, self.pubip_for = now, (name, ip)
+            pub = N.public_ip(ip)
+            with st.lock:
+                if st.sel == name and st.link and st.ipv4 == ip:
+                    st.public_ip = pub or st.public_ip
         if net_ms is not None and not self.oui.available() and not self.oui_tried:
             self.oui_tried = True
             threading.Thread(target=self.update_oui, args=(True,), daemon=True).start()
@@ -1088,6 +1105,7 @@ class Backend:
             self.st.ip_wait_from = time.time()
             self.st.time_to_ip = None
             self.st.gw_ms = self.st.dns_ms = self.st.net_ms = PENDING
+            self.st.public_ip = None
             self.st.dhcp_done = False
         self.st.say("Requesting new address…", 60)
         if IS_LINUX:
@@ -1522,6 +1540,7 @@ class DemoBackend(Backend):
                             "V6": [{"IPAddress": "fe80::1c4a:9e2f:6d01:7a3b", "Origin": "WellKnown"},
                                    {"IPAddress": "2001:db8:30::1c4a:9e2f", "Origin": "RouterAdvertisement"}]}
                     st.gw_ms, st.dns_ms, st.net_ms = 0.9, 4.2, 18.6
+                    st.public_ip = "203.0.113.47"
                     st.stp = {"proto": "Rapid-PVST", "vlan": 30, "root_prio": 24576,
                               "root_mac": "70:db:98:1a:00:01", "cost": 4}
                     st.dhcp_scan = {"xid": 1, "status": "done", "ts": time.time(), "offers": {
@@ -2609,6 +2628,8 @@ class UI:
             T("Internet").set("Testing…", DIM)
         elif nm is None:
             T("Internet").set("No route out", WARN)
+        elif s["public_ip"]:
+            T("Internet").set(s["public_ip"], OK, "online · " + fmt_ms(nm))
         else:
             T("Internet").set("Reachable", OK, fmt_ms(nm))
 

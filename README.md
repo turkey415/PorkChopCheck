@@ -51,7 +51,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 
 | Page | What it shows |
 |---|---|
-| **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time-to-IP (flags portfast off), internet |
+| **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time-to-IP (flags portfast off), internet with your public IP |
 | **SWITCH** | CDP/LLDP: switch, port, data and voice VLAN, mgmt IP, model, PoE, negotiation |
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
@@ -98,6 +98,7 @@ By default, PorkChopCheck sends LLDP and CDP every 30 s, so `show cdp neighbors`
 
 ## Notes
 
+- The **Internet** tile shows the public IP this port goes out as. It asks Cloudflare (`https://1.1.1.1/cdn-cgi/trace`) when the internet first answers and every five minutes after that.
 - CDP is sent every 60 s, LLDP every 30 s, and DTP every 30 s. Some L2 tiles say "Listening…" for up to a minute after you plug in.
 - Many Windows NIC drivers strip VLAN tags. "Trunk / DTP" catches trunks via DTP even when tags are hidden.
 - The DHCP server check sends one DHCP Discover from this box's MAC and counts the offers. It never accepts an offer.

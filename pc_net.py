@@ -1008,6 +1008,36 @@ def tcp_probe(host, port, src, timeout=2.0):
         s.close()
 
 
+def parse_trace_ip(text):
+    """The ip= line of a Cloudflare /cdn-cgi/trace reply, checked to be an address."""
+    m = re.search(r"^ip=(\S+)$", text, re.M)
+    try:
+        return str(ipaddress.ip_address(m.group(1))) if m else None
+    except ValueError:
+        return None
+
+
+def public_ip(src=None, timeout=4.0):
+    """The address the internet sees this port as, or None. Asks Cloudflare by IP address, so it
+    still answers when DNS on this port is broken, and goes out through `src` like every other
+    probe."""
+    for host in ("1.1.1.1", "1.0.0.1"):
+        try:
+            c = http.client.HTTPSConnection(host, 443, timeout=timeout,
+                                            source_address=(src, 0) if src else None)
+            try:
+                c.request("GET", "/cdn-cgi/trace", headers={"User-Agent": "PorkChopCheck"})
+                r = c.getresponse()
+                ip = parse_trace_ip(r.read(4096).decode("ascii", "replace")) if r.status == 200 else None
+                if ip:
+                    return ip
+            finally:
+                c.close()
+        except (OSError, http.client.HTTPException, ValueError):
+            continue
+    return None
+
+
 def scan_hosts(ip, mask, cap=1024):
     """Hosts to ARP-scan. Subnets bigger than `cap` are limited to the /24 around us."""
     net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)

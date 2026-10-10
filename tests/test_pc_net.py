@@ -105,6 +105,12 @@ for name in ("ports.csv", "history.csv"):
     check(f"{name}: the text is kept, quoted", "'=HYPERLINK(\"http://x\",\"SW\")" in cells and "'@SUM(1+1)" in cells)
 check("csv_safe leaves ordinary values alone", N.csv_safe({"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"}) == {"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"})
 check("ports.json keeps the raw value", N.PortLog(tmp).label_for(evil) == "@SUM(1+1)")
+# public IP: Cloudflare trace reply
+TRACE = "fl=29f85\nh=1.1.1.1\nip=203.0.113.47\nts=1791612003.1\nvisit_scheme=https\nuag=PorkChopCheck\ncolo=DFW\nloc=US\ntls=TLSv1.3\n"
+check("trace: public IPv4", N.parse_trace_ip(TRACE) == "203.0.113.47")
+check("trace: public IPv6 is normalised", N.parse_trace_ip("h=x\nip=2001:DB8:0:0::1\n") == "2001:db8::1")
+for bad in ("", "h=1.1.1.1\ncolo=DFW\n", "ip=<script>alert(1)</script>\n", "ip=999.1.1.1\n", "xip=1.2.3.4\n", "ip=1.2.3.4 extra\n"):
+    check(f"trace: not an address -> None: {bad[:24]!r}", N.parse_trace_ip(bad) is None)
 # Oui parsing
 p = os.path.join(tmp, "manuf"); open(p, "w").write("# c\n00:00:0C\tCisco\tCisco Systems, Inc\n00:1B:C5:00:00:00/36\tX\n")
 o = N.Oui(p); check("oui lookup", o.lookup("00:00:0c:07:ac:01") == "Cisco · HSRPv1 group 1", o.lookup("00:00:0c:07:ac:01"))
