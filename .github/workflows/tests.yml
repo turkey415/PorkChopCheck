@@ -1,0 +1,24 @@
+# Runs the checks on every push and pull request. The release workflow runs them again.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tests/test_pc_net.py
+      - run: python tests/test_linux.py
+      - run: python tests/test_smart.py
+      - run: python tests/test_launcher.py
+      - run: bash -n install-linux.sh
