@@ -25,6 +25,7 @@ import copy
 import os
 import random
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -237,6 +238,10 @@ class State:
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
                          "total": 0, "limited": False}
         self.blink = {"running": False, "cycles": 0}
+        self.mcast = {"running": False, "msg": "", "snap": None, "join": None, "probed": None,
+                      "last_join": "239."}
+        self.capture = {"running": False, "secs": 30, "left": 0, "frames": 0, "bytes": 0,
+                        "file": "", "msg": "", "ok": True, "files": []}
         self.smart = {"running": False, "stage": "", "devices": [], "ts": None, "counts": {}}
         self.reset_adapter()
 
@@ -258,6 +263,7 @@ class State:
         self.ip_wait_from = None
         self.time_to_ip = None
         self.gw_ms = self.dns_ms = self.net_ms = PENDING
+        self.public_ip = None
         self.nb = {}
         self.sniff_msg = "Starting…"
         self.reset_l2(now)
@@ -508,12 +514,15 @@ class Backend:
         self.kick = threading.Event()
         self.sniffer = None
         self.sniff_gen = 0
+        self.sniff_iface = None         # what the sniffer is listening on; captures reuse it
         self.l2sock = None
         self.send_lock = threading.Lock()
         self.stops = {}
         self.last_sig = None
         self.last_log = 0.0
         self.oui_tried = False
+        self.pubip_at = 0.0             # last time the public IP was asked for
+        self.pubip_for = None           # (adapter, local IP) it was asked from
         self.devstore = S.DeviceStore(DATA_DIR)
 
     # ---------------------------------------------------------- lifecycle
@@ -627,6 +636,7 @@ class Backend:
                     st.drops += 1
                 st.nb = {}
                 st.gw_ms = st.dns_ms = st.net_ms = PENDING
+                st.public_ip = None
                 st.reset_l2(now)
             st.link = up
             st.speed_mbps = speed if up else 0
@@ -725,8 +735,21 @@ class Backend:
         if net_ms is None:
             net_ms = N.tcp_probe("8.8.8.8", 443, ip)
         with st.lock:
+            have_pub = st.public_ip
             if st.sel == name and st.link:
                 st.gw_ms, st.dns_ms, st.net_ms = gw_ms, dns_ms, net_ms
+                if net_ms is None:
+                    st.public_ip = have_pub = None
+        # Ask for the public IP as soon as the internet answers on a new port or address, then
+        # every five minutes; while there is none yet, try again every 20 s.
+        now = time.time()
+        if net_ms is not None and ((name, ip) != self.pubip_for
+                                   or now - self.pubip_at > (300 if have_pub else 20)):
+            self.pubip_at, self.pubip_for = now, (name, ip)
+            pub = N.public_ip(ip)
+            with st.lock:
+                if st.sel == name and st.link and st.ipv4 == ip:
+                    st.public_ip = pub or st.public_ip
         if net_ms is not None and not self.oui.available() and not self.oui_tried:
             self.oui_tried = True
             threading.Thread(target=self.update_oui, args=(True,), daemon=True).start()
@@ -847,7 +870,7 @@ class Backend:
     def restart_sniffer(self):
         self.sniff_gen += 1
         old, oldsock = self.sniffer, self.l2sock
-        self.sniffer = self.l2sock = None
+        self.sniffer = self.l2sock = self.sniff_iface = None
         threading.Thread(target=self._sniff_start, args=(self.sniff_gen, old, oldsock),
                          daemon=True).start()
 
@@ -918,7 +941,7 @@ class Backend:
                 except Exception:  # noqa: BLE001
                     pass
             return
-        self.sniffer, self.l2sock = sn, sock
+        self.sniffer, self.l2sock, self.sniff_iface = sn, sock, iface
         self._set_sniff(gen, "listening")
 
     def send(self, frame):
@@ -1088,6 +1111,7 @@ class Backend:
             self.st.ip_wait_from = time.time()
             self.st.time_to_ip = None
             self.st.gw_ms = self.st.dns_ms = self.st.net_ms = PENDING
+            self.st.public_ip = None
             self.st.dhcp_done = False
         self.st.say("Requesting new address…", 60)
         if IS_LINUX:
@@ -1406,7 +1430,7 @@ class Backend:
                 self._mdns_scan(ip)
                 return self.mdns.snapshot()
             scan = S.SmartScan(ip, mask, mac, self.oui, lambda: self._arp_table(name), mdns_fn,
-                               self._smart_progress)
+                               self._smart_progress, services=bool(self.settings.get("smart_services")))
             devs = scan.run(ev)
             self._smart_store(devs, scan.counts)
         except Exception as e:  # noqa: BLE001
@@ -1421,6 +1445,7 @@ class Backend:
         _, err = self.devstore.merge(devs)
         for d in devs:
             d["label"] = self.devstore.label(d["key"])
+            d["ports"] = self.devstore.ports(d["key"])      # includes what an earlier full check found
         with self.st.lock:
             self.st.smart.update(devices=devs, ts=time.time(), counts=dict(counts))
         n = sum(1 for d in devs if d.get("smart"))
@@ -1433,6 +1458,247 @@ class Backend:
                 if d.get("key") == key:
                     d["label"] = label
         self.st.say(err or (f"Labelled: {label}" if label else "Label cleared"), 3)
+
+    def device_ports_scan(self, key):
+        """Check every common service port on one device (the Ports button on its detail card)."""
+        with self.st.lock:
+            d = next((x for x in self.st.smart["devices"] if x.get("key") == key), None)
+            src = self.st.ipv4
+            if not d or d.get("port_scan") == "running":
+                return
+            d["port_scan"] = "running"
+            ip = d["ip"]
+        threading.Thread(target=self._device_ports_scan, args=(key, ip, src), daemon=True).start()
+
+    def _probe_device(self, ip, src):
+        return S.probe_ports(ip, S.ALL_PORTS, src)
+
+    def _device_ports_scan(self, key, ip, src):
+        try:
+            ports = self._probe_device(ip, src)
+        except Exception:  # noqa: BLE001
+            log_error("Port check failed")
+            ports = None
+        err = self.devstore.set_ports(key, ports) if ports is not None else "Port check failed"
+        with self.st.lock:
+            for d in self.st.smart["devices"]:
+                if d.get("key") == key:
+                    d["port_scan"] = "done" if ports is not None else ""
+                    if ports is not None:
+                        d["ports"], d["services_checked"] = ports, True
+        self.st.say(err or f"{ip}: {len(ports)} of {len(S.ALL_PORTS)} common services answer", 4)
+
+    # ---------------------------------------------------------- multicast browser
+    MCAST_PROBE_GROUP = "239.192.137.251"       # joined for a moment to make a querier speak up
+
+    def mcast_toggle(self):
+        with self.st.lock:
+            running = self.st.mcast["running"]
+        if running:
+            self.mcast_stop()
+        else:
+            self.mcast_start()
+
+    def mcast_start(self):
+        with self.st.lock:
+            if self.st.mcast["running"]:
+                return
+            name = self.st.sel
+        iface = self.sniff_iface
+        if not name or self.sniffer is None or iface is None:
+            with self.st.lock:
+                self.st.mcast["msg"] = "Capture isn't running on this adapter — see the L2 page"
+            return
+        ev = self._new_stop("mcast")
+        with self.st.lock:
+            self.st.mcast.update(running=True, msg="", snap=None, probed=None)
+        threading.Thread(target=self._mcast_run, args=(ev, iface), daemon=True).start()
+
+    def mcast_stop(self):
+        ev = self.stops.get("mcast")
+        if ev:
+            ev.set()
+        self.mcast_leave(quiet=True)
+
+    def _mcast_run(self, ev, iface):
+        tr = N.McastTracker()
+        sn = None
+        try:
+            from scapy.all import AsyncSniffer
+            sn = AsyncSniffer(iface=iface, filter=N.MCAST_BPF, store=False,
+                              prn=lambda pkt: tr.feed(bytes(pkt), float(pkt.time)))
+            sn.start()
+        except Exception as e:  # noqa: BLE001
+            log_error("Multicast browser failed to start")
+            with self.st.lock:
+                self.st.mcast.update(running=False, msg=f"Couldn't start: {e}"[:80])
+            return
+        self._mcast_publish(ev, tr)
+        try:
+            sn.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mcast_publish(self, ev, tr):
+        """Once a second: work out the rates and hand the UI a fresh picture."""
+        while True:
+            now = time.time()
+            tr.tick(now)
+            snap = tr.snapshot(now)
+            with self.st.lock:
+                self.st.mcast["snap"] = snap
+            if ev.wait(1.0):
+                break
+        with self.st.lock:
+            self.st.mcast["running"] = False
+
+    def mcast_join(self, text):
+        target = N.parse_mcast_target(text)
+        with self.st.lock:
+            src = self.st.ipv4
+            self.st.mcast["last_join"] = (text or "").strip() or "239."
+        if not target:
+            self.st.say("Not a multicast group — try something like 239.1.2.3", 5)
+            return
+        if not src:
+            self.st.say("Need an IP address to join a group", 4)
+            return
+        self.mcast_leave(quiet=True)
+        group, port = target
+        try:
+            sock = N.mcast_join_socket(group, src)
+        except OSError as e:
+            self.st.say(f"Couldn't join {group}: {e}"[:70], 5)
+            return
+        self.mcast_sock = sock
+        with self.st.lock:
+            self.st.mcast["join"] = {"group": group, "port": port, "since": time.time()}
+        self.mcast_start()
+        self.st.say(f"Joined {group}", 3)
+
+    def mcast_leave(self, quiet=False):
+        sock, self.mcast_sock = getattr(self, "mcast_sock", None), None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        with self.st.lock:
+            j, self.st.mcast["join"] = self.st.mcast["join"], None
+        if j and not quiet:
+            self.st.say(f"Left {j['group']}", 3)
+
+    def mcast_probe(self):
+        """Join a scratch group for a moment and leave it. A querier answers a leave with a
+        group-specific query within about a second, which saves waiting two minutes for its
+        next general one."""
+        with self.st.lock:
+            src, running = self.st.ipv4, self.st.mcast["running"]
+        if not src or not running:
+            self.st.say("Start the browser first" if src else "Need an IP address", 3)
+            return
+
+        def work():
+            try:
+                s = N.mcast_join_socket(self.MCAST_PROBE_GROUP, src)
+                time.sleep(1.5)
+                s.close()
+            except OSError as e:
+                self.st.say(f"Couldn't send the probe: {e}"[:70], 5)
+                return
+            with self.st.lock:
+                self.st.mcast["probed"] = time.time()
+        self.st.say("Asking for a querier…", 3)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------------------------------------------------- capture to file
+    CAPTURE_SECS = (30, 60, 300)
+    CAPTURE_MAX = 200 * 1024 * 1024         # stop early instead of filling the disk on a busy port
+
+    @staticmethod
+    def capture_dir():
+        return os.path.join(DATA_DIR, "captures")
+
+    def capture_refresh(self):
+        files = N.list_captures(self.capture_dir())
+        with self.st.lock:
+            self.st.capture["files"] = files
+
+    def capture_next_secs(self):
+        with self.st.lock:
+            c = self.st.capture
+            if not c["running"]:
+                opts = self.CAPTURE_SECS
+                c["secs"] = opts[(opts.index(c["secs"]) + 1) % len(opts)] if c["secs"] in opts else opts[0]
+
+    def capture_toggle(self):
+        with self.st.lock:
+            c = self.st.capture
+            running, secs, name = c["running"], c["secs"], self.st.sel
+            nb = N.merge_neighbors(self.st.nb)
+        if running:
+            self.stops["capture"].set()
+            return
+        iface = self.sniff_iface
+        if not name or self.sniffer is None or iface is None:
+            self.st.say("Capture isn't running on this adapter — see the L2 page", 5)
+            return
+        tag = "-".join(str(x) for x in (nb.get("name") or nb.get("chassis"), nb.get("port")) if x)
+        ev = self._new_stop("capture")
+        with self.st.lock:
+            self.st.capture.update(running=True, left=secs, frames=0, bytes=0, file="", msg="", ok=True)
+        threading.Thread(target=self._capture, args=(ev, iface, secs, tag), daemon=True).start()
+
+    def _capture(self, ev, iface, secs, tag):
+        """Record everything this adapter sees, unfiltered, for `secs` seconds."""
+        st = self.st
+
+        def finish(msg, ok):
+            with st.lock:
+                st.capture.update(running=False, left=0, msg=msg, ok=ok)
+            self.capture_refresh()
+
+        w = sn = None
+        try:
+            from scapy.all import AsyncSniffer
+            os.makedirs(self.capture_dir(), exist_ok=True)
+            path = os.path.join(self.capture_dir(), N.capture_name(time.time(), tag))
+            w = N.PcapWriter(path)
+            sn = AsyncSniffer(iface=iface, store=False,
+                              prn=lambda pkt: w.add(bytes(pkt), float(pkt.time)))
+            sn.start()
+        except Exception as e:  # noqa: BLE001
+            log_error("Capture to file failed to start")
+            if w is not None:
+                w.close()
+            finish(f"Couldn't start: {e}"[:80], False)
+            return
+        with st.lock:
+            st.capture["file"] = os.path.basename(path)
+        t0, why = time.time(), ""
+        while True:
+            left = secs - (time.time() - t0)
+            with st.lock:
+                st.capture.update(left=max(0.0, left), frames=w.frames, bytes=w.bytes)
+            if left <= 0:
+                break
+            if w.bytes >= self.CAPTURE_MAX:
+                why = " · stopped at the 200 MB limit"
+                break
+            if time.time() - t0 > 1 and not getattr(sn, "running", True):
+                why = " · the capture stopped early"
+                break
+            if ev.wait(0.25):
+                why = " · stopped"
+                break
+        try:
+            sn.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        w.close()
+        with st.lock:
+            st.capture.update(frames=w.frames, bytes=w.bytes)
+        finish(f"Saved {w.frames:,} frames · {N.fmt_bytes(w.bytes)}{why}", True)
 
     # ---------------------------------------------------------- port finder
     def blink_toggle(self):
@@ -1522,6 +1788,7 @@ class DemoBackend(Backend):
                             "V6": [{"IPAddress": "fe80::1c4a:9e2f:6d01:7a3b", "Origin": "WellKnown"},
                                    {"IPAddress": "2001:db8:30::1c4a:9e2f", "Origin": "RouterAdvertisement"}]}
                     st.gw_ms, st.dns_ms, st.net_ms = 0.9, 4.2, 18.6
+                    st.public_ip = "203.0.113.47"
                     st.stp = {"proto": "Rapid-PVST", "vlan": 30, "root_prio": 24576,
                               "root_mac": "70:db:98:1a:00:01", "cost": 4}
                     st.dhcp_scan = {"xid": 1, "status": "done", "ts": time.time(), "offers": {
@@ -1615,6 +1882,98 @@ class DemoBackend(Backend):
 
     def update_oui(self, quiet=False):
         self.st.say("Vendor list updated (demo)", 2)
+
+    def mcast_start(self):
+        with self.st.lock:
+            if self.st.mcast["running"]:
+                return
+            self.st.mcast.update(running=True, msg="", snap=None, probed=None)
+        ev = self._new_stop("mcast")
+        threading.Thread(target=self._mcast_run, args=(ev, None), daemon=True).start()
+
+    def _mcast_run(self, ev, iface):
+        tr = N.McastTracker()
+        mac, t0 = "70:db:98:1a:00:01", time.time()
+        F = N.mcast_frame
+        for ago in (250, 125, 0):
+            tr.feed(F(mac, "10.20.30.1", "224.0.0.1", 2, N.igmp_payload("query")), t0 - ago)
+        tr.feed(F(mac, "10.20.30.21", "224.0.0.22", 2, N.igmp_payload("report3", "239.1.1.10")), t0)
+        tr.feed(F(mac, "10.20.30.44", "224.0.0.22", 2, N.igmp_payload("report3", "239.69.12.7")), t0)
+
+        def feed():
+            udp = lambda port, n: struct.pack("!HHHH", 40000, port, 8 + n, 0) + bytes(n)  # noqa: E731
+            while not ev.wait(0.1):
+                now = time.time()
+                with self.st.lock:
+                    j = self.st.mcast["join"]
+                for _ in range(40):
+                    tr.feed(F(mac, "10.1.1.5", "239.1.1.10", 17, udp(5004, 1316), ttl=16), now)
+                for _ in range(10):
+                    tr.feed(F(mac, "10.20.30.44", "239.69.12.7", 17, udp(5004, 288), ttl=8), now)
+                if random.random() < 0.3:
+                    tr.feed(F(mac, f"10.20.30.{random.choice((15, 21, 70))}", "239.255.255.250", 17, udp(1900, 300)), now)
+                if random.random() < 0.5:
+                    tr.feed(F(mac, f"10.20.30.{random.choice((21, 34, 147))}", "224.0.0.251", 17, udp(5353, 120)), now)
+                if random.random() < 0.1:
+                    tr.feed(F(mac, "10.20.30.2", "224.0.0.18", 112, bytes(20)), now)
+                if j and now - j["since"] > 1.5:
+                    for _ in range(25):
+                        tr.feed(F(mac, "10.1.1.9", j["group"], 17, udp(j["port"] or 5004, 1316), ttl=16), now)
+        threading.Thread(target=feed, daemon=True).start()
+        self._mcast_publish(ev, tr)
+
+    def mcast_join(self, text):
+        target = N.parse_mcast_target(text)
+        if not target:
+            self.st.say("Not a multicast group — try something like 239.1.2.3", 5)
+            return
+        with self.st.lock:
+            self.st.mcast["join"] = {"group": target[0], "port": target[1], "since": time.time()}
+            self.st.mcast["last_join"] = text.strip()
+        self.mcast_start()
+
+    def mcast_probe(self):
+        with self.st.lock:
+            self.st.mcast["probed"] = time.time()
+        self.st.say("Asking for a querier…", 3)
+
+    def _probe_device(self, ip, src):
+        time.sleep(1.2)
+        with self.st.lock:
+            d = next((x for x in self.st.smart["devices"] if x.get("ip") == ip), {})
+        extra = {"camera": [80, 443, 554, 8554], "tv": [7000, 8008, 8009, 8060], "printer": [80, 443, 515, 631, 9100],
+                 "speaker": [1400, 7000], "hub": [80, 443, 8080]}.get(d.get("category"), [80])
+        return sorted(set(d.get("ports", [])) | set(extra))
+
+    def capture_refresh(self):
+        with self.st.lock:
+            self.st.capture["files"] = [("capture-20261010-101502-SW-IDF2-03-Gi1_0_14.pcap", 4_812_330, 0),
+                                        ("capture-20261009-164455-SW-IDF2-03-Gi1_0_14.pcap", 918_204, 0)]
+
+    def capture_toggle(self):
+        with self.st.lock:
+            c = self.st.capture
+            if c["running"]:
+                self.stops["capture"].set()
+                return
+            secs = c["secs"]
+            c.update(running=True, left=secs, frames=0, bytes=24, msg="", ok=True,
+                     file="capture-demo.pcap")
+        ev = self._new_stop("capture")
+
+        def work():
+            t0 = time.time()
+            while not ev.wait(0.25) and time.time() - t0 < secs:
+                with self.st.lock:
+                    c = self.st.capture
+                    c["left"] = secs - (time.time() - t0)
+                    c["frames"] += random.randint(8, 40)
+                    c["bytes"] += random.randint(2_000, 30_000)
+            with self.st.lock:
+                c = self.st.capture
+                c.update(running=False, left=0, ok=True,
+                         msg=f"Saved {c['frames']:,} frames · {N.fmt_bytes(c['bytes'])} (demo: nothing written)")
+        threading.Thread(target=work, daemon=True).start()
 
     def smart_scan_toggle(self):
         def work():
@@ -1849,6 +2208,8 @@ class DeviceDetail(tk.Frame):
         ui.button(hdr, "Close", self.close, ui.sz["small"], bg=GREY, padx=pad * 2).pack(side="right")
         ui.button(hdr, "Label", self.relabel, ui.sz["small"], bg=BLUE, padx=pad * 2).pack(
             side="right", padx=(0, pad // 2))
+        self.ports_btn = ui.button(hdr, "Ports", self.scan_ports, ui.sz["small"], bg=BLUE, padx=pad * 2)
+        self.ports_btn.pack(side="right", padx=(0, pad // 2))
         titles = tk.Frame(hdr, bg=BG)
         titles.pack(side="left", fill="x", expand=True, padx=pad)
         tk.Label(titles, text=device_title(d), bg=BG, fg=FG, anchor="w",
@@ -1856,6 +2217,40 @@ class DeviceDetail(tk.Frame):
         tk.Label(titles, text=f"{d.get('brand', '')}  ·  {S.CATEGORIES.get(d.get('category', ''), '')}",
                  bg=BG, fg=CAT_COLORS.get(d.get("category"), DIM), anchor="w",
                  font=ui.font(ui.sz["small"], "bold")).pack(fill="x")
+        self.lst = ListView(self, ui)
+        self.lst.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+        self.fill()
+        ui.overlay = self
+        self.after(500, self.poll)
+
+    def poll(self):
+        """Pick up the result of a port check, or a label change, while the card is open."""
+        if self.ui.overlay is not self:
+            return
+        with self.ui.st.lock:
+            cur = next((copy.deepcopy(x) for x in self.ui.st.smart["devices"]
+                        if x.get("key") == self.d.get("key")), None)
+        if cur is not None and cur != self.d:
+            self.d = cur
+            self.fill()
+        self.after(500, self.poll)
+
+    def scan_ports(self):
+        self.ui.be.device_ports_scan(self.d.get("key"))
+
+    def fill(self):
+        d, ui = self.d, self.ui
+        busy = d.get("port_scan") == "running"
+        self.ports_btn.config(text="Checking…" if busy else "Ports", bg=GREY if busy else BLUE)
+        ports = d.get("ports", [])
+        if busy:
+            svc = "Checking every common service…"
+        elif ports:
+            svc = "\n".join(S.describe_ports(ports))
+        else:
+            svc = "none answered"
+        if not busy and not d.get("services_checked"):
+            svc += "\n(quick check only: tap Ports to check all " + str(len(S.ALL_PORTS)) + " common services)"
         serial = d.get("serial") or ""
         rows = [
             ("Label", d.get("label") or "(tap Label to add one)"),
@@ -1864,20 +2259,17 @@ class DeviceDetail(tk.Frame):
             ("IP address", d.get("ip", "")), ("MAC address", d.get("mac") or "not seen"),
             ("MAC vendor", d.get("vendor", "")), ("Hostname", d.get("hostname", "")),
             ("Firmware", d.get("fw", "")),
-            ("Open ports", " ".join(map(str, d.get("ports", [])))),
-            ("Services", ", ".join(t.replace(".local", "") for t in d.get("mdns_types", []))),
+            ("Open services", svc),
+            ("Advertises (mDNS)", ", ".join(t.replace(".local", "") for t in d.get("mdns_types", []))),
             ("Found via", ", ".join(d.get("sources", []))),
             ("Smart home", "yes" if d.get("smart") else "no"),
         ]
-        lst = ListView(self, ui)
-        lst.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
         out = []
         for k, v in rows:
             if v:
                 out.append((k.upper(), DIM, "dim"))
                 out.append((str(v), FG, "row"))
-        lst.set_rows(out)
-        ui.overlay = self
+        self.lst.set_rows(out)
 
     def relabel(self):
         key, d = self.d.get("key"), self.d
@@ -2189,6 +2581,12 @@ class UI:
             "mdns": ToolView(self.body, self, "mDNS browser", [("Scan", self.be.mdns_scan),
                                                               ("Clear", self.be.mdns.reset)]),
             "blink": ToolView(self.body, self, "Port finder", [("Start", self.be.blink_toggle)]),
+            "mcast": ToolView(self.body, self, "Multicast", [("Stop", self.be.mcast_toggle),
+                                                           ("Join…", self.mcast_join_dialog),
+                                                           ("Querier", self.be.mcast_probe)]),
+            "capture": ToolView(self.body, self, "Capture", [("Start", self.be.capture_toggle),
+                                                           ("30 s", self.be.capture_next_secs),
+                                                           ("Folder", self.open_captures)]),
             "log": ToolView(self.body, self, "Port log", [("Open folder", self.open_data)]),
         }
         self.views.update(self.tools)
@@ -2329,11 +2727,12 @@ class UI:
         items = [("Ping", lambda: self.show("ping")), ("Traceroute", lambda: self.show("trace")),
                  ("Speed test", lambda: self.show("speed")), ("ARP table", self.open_arp),
                  ("ARP scan", lambda: self.show("arpscan")), ("mDNS browser", self.open_mdns),
-                 ("Port finder", lambda: self.show("blink")), ("Port log", lambda: self.show("log")),
-                 ("Re-run checks", self.be.rerun_checks), ("Settings", lambda: self.show("settings"))]
+                 ("Port finder", lambda: self.show("blink")), ("Capture", self.open_capture),
+                 ("Multicast", self.open_mcast), ("Port log", lambda: self.show("log")), ("Re-run checks", self.be.rerun_checks),
+                 ("Settings", lambda: self.show("settings"))]
         for c in range(2):
             page.columnconfigure(c, weight=1, uniform="c")
-        for r in range(5):
+        for r in range((len(items) + 1) // 2):
             page.rowconfigure(r, weight=1, uniform="r")
         for i, (label, cmd) in enumerate(items):
             self.button(page, label, cmd, self.sz["toolbtn"]).grid(
@@ -2348,10 +2747,13 @@ class UI:
         self.button(hdr, "‹ Back", self.show_tools, self.sz["small"], bg=GREY, padx=self.pad * 2).pack(side="left")
         tk.Label(hdr, text="Settings", bg=BG, fg=FG, font=self.font(self.sz["sub"], "bold")).pack(
             side="left", padx=self.pad)
+        tk.Label(hdr, text=f"v{VERSION}  ·  github.com/turkey415/porkchopcheck", bg=BG, fg=DIM,
+                 font=self.font(self.sz["rowsm"])).pack(side="right", padx=self.pad)
         lst = tk.Frame(page, bg=BG)
         lst.pack(fill="both", expand=True, pady=(self.pad // 2, 0))
         self.set_btns = {}
         rows = [("announce", self.toggle("announce")), ("autolog", self.toggle("autolog")),
+                ("smartsvc", self.toggle("smart_services")),
                 ("hostname", self.edit_hostname), ("iperf", self.edit_iperf),
                 ("oui", lambda: threading.Thread(target=self.be.update_oui, daemon=True).start()),
                 ("folder", self.open_data), ("exit", self.quit)]
@@ -2362,13 +2764,13 @@ class UI:
             b.grid(row=r, column=0, sticky="nsew", pady=self.pad // 4)
             self.set_btns[key] = b
         lst.columnconfigure(0, weight=1)
-        tk.Label(page, text=f"PorkChopCheck v{VERSION}  ·  github.com/turkey415/porkchopcheck",
-                 bg=BG, fg=DIM, font=self.font(self.sz["rowsm"])).pack(fill="x", pady=(self.pad // 2, 0))
 
     # ---------------------------------------------------------- navigation
     def show(self, name):
         if self.cur == name:
             return
+        if self.cur == "mcast":
+            self.be.mcast_stop()          # stop listening, and leave any group, when the view closes
         if self.cur:
             self.views[self.cur].pack_forget()
         self.views[name].pack(fill="both", expand=True)
@@ -2393,14 +2795,36 @@ class UI:
         if not self.be.mdns.snapshot()["last_scan"]:
             self.be.mdns_scan()
 
-    def open_data(self):
+    def open_mcast(self):
+        self.show("mcast")
+        self.be.mcast_start()
+
+    def mcast_join_dialog(self):
+        with self.st.lock:
+            joined, last = self.st.mcast["join"], self.st.mcast["last_join"]
+        if joined:
+            self.be.mcast_leave()
+            return
+        Keyboard(self, "Multicast group to join", last, self.be.mcast_join,
+                 "e.g. 239.1.2.3. This box joins the group like a receiver would, then shows "
+                 "whether the stream arrives.")
+
+    def open_capture(self):
+        self.show("capture")
+        self.be.capture_refresh()
+
+    def open_captures(self):
+        os.makedirs(self.be.capture_dir(), exist_ok=True)
+        self.open_data(self.be.capture_dir())
+
+    def open_data(self, folder=DATA_DIR):
         try:
             if IS_WIN:
-                os.startfile(DATA_DIR)  # noqa: S606
+                os.startfile(folder)  # noqa: S606
             elif IS_LINUX:
-                subprocess.Popen(["xdg-open", DATA_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                self.st.say(DATA_DIR, 4)
+                self.st.say(folder, 4)
         except OSError as e:
             self.st.say(str(e)[:60], 4)
 
@@ -2609,6 +3033,8 @@ class UI:
             T("Internet").set("Testing…", DIM)
         elif nm is None:
             T("Internet").set("No route out", WARN)
+        elif s["public_ip"]:
+            T("Internet").set(s["public_ip"], OK, "online · " + fmt_ms(nm))
         else:
             T("Internet").set("Reachable", OK, fmt_ms(nm))
 
@@ -2678,6 +3104,7 @@ class UI:
         texts = {
             "announce": f"Announce to switch (LLDP + CDP):  {'ON' if g('announce') else 'OFF'}",
             "autolog": f"Auto-log every port to ports.csv:  {'ON' if g('autolog') else 'OFF'}",
+            "smartsvc": f"Smart scan checks common services on every device:  {'ON' if g('smart_services') else 'OFF'}",
             "hostname": f"Name sent to switch:  {self.be.hostname()}",
             "iperf": "iperf3 server:  " + ((g('iperf_server') + (f":{g('iperf_port')}" if g('iperf_port') != 5201 else ""))
                                            if g("iperf_server") else "(tap to set)"),
@@ -2829,6 +3256,87 @@ class UI:
                           f"Multicast announcements seen: {mc} · replies: {m['unicast_replies']}")
         rows = [(t, HDR if k == "hdr" else FG, k) for t, k in N.mdns_rows(m)]
         v.list.set_rows(rows, "Tap Scan to browse Bonjour / mDNS services")
+
+    def render_mcast(self, s, v, now):
+        m = s["mcast"]
+        snap, run, j = m["snap"], m["running"], m["join"]
+        v.set_action(0, "Stop" if run else "Start", RED if run else BLUE)
+        v.set_action(1, "Leave" if j else "Join…", RED if j else BLUE)
+        if not snap:
+            v.set_summary("Multicast browser", FG, m["msg"] or ("Listening…" if run else "Tap Start to listen"),
+                          WARN if m["msg"] else DIM)
+            v.list.set_rows([], "Nothing heard yet." if run else "")
+            return
+        groups = snap["groups"]
+        live = [g for g in groups if g["pkts"]]
+        qtext, level, qnote = N.querier_verdict(snap, probed=bool(m["probed"]) and now - m["probed"] > 3)
+        qcolor = {"ok": OK, "wait": DIM, "warn": WARN}[level]
+        v.set_summary(f"{len(live)} groups · {N.fmt_rate(snap['bps'])}" + ("" if run else "  (stopped)"),
+                      FG, qtext, qcolor)
+        rows = [("IGMP querier", HDR, "hdr"), (qtext, qcolor if level != "wait" else FG, "row"), (qnote, DIM, "dim")]
+        if j:
+            g = next((x for x in groups if x["group"] == j["group"]), None)
+            waited = now - j["since"]
+            rows.append(("Join test", HDR, "hdr"))
+            if g and g["pkts"] and g["pps"] > 0:
+                rows.append((f"{j['group']}: arriving at {N.fmt_rate(g['bps'])}, {g['pps']:.0f} packets/s"
+                             + (f" from {g['sources'][0]}" if g["sources"] else ""), OK, "row"))
+            elif g and g["pkts"]:
+                rows.append((f"{j['group']}: {g['pkts']:,} packets so far, none in the last second", WARN, "row"))
+            else:
+                rows.append((f"{j['group']}: joined {waited:.0f} s ago, nothing arriving",
+                             WARN if waited > 5 else FG, "row"))
+                if waited > 5:
+                    rows.append(("Is anything sending to this group, and is it routed to this VLAN?", DIM, "dim"))
+        rows.append(("Groups, busiest first", HDR, "hdr"))
+        for g in groups[:40]:
+            rows.append((f"{g['group']:<17}{g['name']}", FG if g["pkts"] else DIM, "mono"))
+            bits = []
+            if g["pkts"]:
+                bits.append(f"{g['pps']:.0f} packets/s · {N.fmt_rate(g['bps'])}")
+                if g["sources"]:
+                    more = len(g["sources"]) - 1
+                    bits.append(f"from {g['sources'][0]}" + (f" +{more}" if more else ""))
+                if g["port"]:
+                    bits.append(f"UDP {g['port']}")
+            else:
+                bits.append("no traffic seen")
+            if g["members"]:
+                bits.append(f"joined by {g['members'][0]}" + (f" +{len(g['members']) - 1}" if len(g["members"]) > 1 else ""))
+            if N.mcast_is_link_local(g["group"]):
+                bits.append("link-local")
+            rows.append(("   " + " · ".join(bits), DIM, "dim"))
+        if not groups:
+            rows.append(("Nothing heard yet.", DIM, "dim"))
+        rows.append(("With IGMP snooping on, a port only receives groups something on it has joined, plus "
+                     "224.0.0.x link-local traffic. Join a group to pull it to this port.", DIM, "dim"))
+        v.list.set_rows(rows)
+
+    def render_capture(self, s, v, now):
+        c = s["capture"]
+        run = c["running"]
+        v.set_action(0, "Stop" if run else "Start", RED if run else BLUE)
+        v.set_action(1, "5 min" if c["secs"] >= 300 else f"{c['secs']} s", GREY if run else BLUE)
+        counts = f"{c['frames']:,} frames · {N.fmt_bytes(c['bytes'])}"
+        if run:
+            v.set_summary(f"Recording… {c['left']:.0f} s left", WARN, f"{counts}  →  {c['file'] or '…'}")
+        elif c["msg"]:
+            v.set_summary(c["msg"], OK if c["ok"] else BAD, c["file"])
+        else:
+            v.set_summary("Record this port to a .pcap", FG,
+                          "Tap Start. The button beside it sets how long. Open the file in Wireshark.")
+        rows = [("Saved captures", HDR, "hdr")]
+        rows += [(f"{name}   {N.fmt_bytes(size)}", FG, "mono") for name, size, _ in c["files"][:8]]
+        if not c["files"]:
+            rows.append(("None yet", DIM, "dim"))
+        rows += [
+            ("What you'll see", HDR, "hdr"),
+            ("On a normal switch port: this box's own traffic, plus the broadcast and multicast "
+             "the switch sends everyone. On a mirror (SPAN) port: everything the switch copies to it.",
+             FG, "row"),
+            (f"Saved in {self.be.capture_dir()}. A capture stops by itself at 200 MB.", DIM, "dim"),
+        ]
+        v.list.set_rows(rows)
 
     def render_blink(self, s, v, now):
         b = s["blink"]

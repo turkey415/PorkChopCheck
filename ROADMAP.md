@@ -4,23 +4,10 @@ What's cooking next. Nothing here is built yet. Ideas, priorities and pull reque
 
 ## Up next
 
-### Multicast browser
-See what multicast is actually flowing on the port, and why it might not be.
-- **Live group list:** every multicast group seen on the wire, with friendly names (224.0.0.251 mDNS, 239.255.255.250 SSDP, 224.0.0.18 VRRP, 224.0.0.102 HSRP, OSPF, PIM…), who's sending, packets/sec, bandwidth, and last seen.
-- **IGMP querier check:** is there an IGMP querier on this VLAN, what's its address, and which IGMP version. A missing querier is behind a lot of "mDNS / AirPlay / video works for 5 minutes, then dies" problems on switches with IGMP snooping.
-- **Join test:** type a group (a video stream, a Dante audio flow…) and the box joins it, then shows whether traffic actually arrives and at what rate. Tests the multicast path end to end.
-- With IGMP snooping on, a port only receives groups someone on it has joined, plus 224.0.0.x link-local traffic. The browser will make that distinction clear.
-
-### Capture to file
-One tap records 30–60 seconds of traffic to a `.pcap` in the data folder, ready to open in Wireshark or attach to a ticket.
-
 ### VLAN tester (Linux first)
 On a trunk port, tag onto each VLAN in a list, request DHCP on each one, and report which VLANs hand out addresses (and from which server). Answers "is VLAN 40 actually allowed on this trunk?" in seconds.
 
 ## Planned
-
-### Open ports on smart devices
-Show which common services each device answers on in the SMART tab (web interface, SSH, printing, video streams, casting…), with friendly names, in the device details, and saved to `devices.csv` for documentation.
 
 ### MTU / jumbo frame test
 Find the largest packet that gets through without fragmenting, toward the gateway or any host. Catches jumbo-frame and tunnel MTU mismatches.
@@ -42,12 +29,13 @@ Small tools that come up all the time:
 - **TCP port test:** can this port reach `host:port`? (e.g. a printer on 9100)
 - **Wake-on-LAN:** wake a machine by MAC
 - **NTP check:** time offset against an NTP server
-- **Public IP & ISP:** what the internet sees this port as
+- **ISP name:** who the public IP belongs to (the public IP itself now shows on the PORT page)
 - **Subnet calculator**
 
 ## Ideas parking lot
 
 Not committed to, but worth thinking about:
+- IPv6 multicast (MLD) in the multicast browser
 - Read port configuration from the switch over SNMP (description, VLANs, errors)
 - Per-device throughput in a "mirror port" mode, when plugged into a SPAN port
 - Linux Wi-Fi fallback for the SMART scan when no cable is plugged in
@@ -55,4 +43,8 @@ Not committed to, but worth thinking about:
 
 ## Already shipped
 
+- **Multicast browser:** Tools › Multicast lists live groups with names and rates, finds the IGMP querier, and has a join test.
+- **Open services on smart devices:** a Ports button on each device checks 35 common services and names them; saved to `devices.csv`.
+- **Capture to file:** Tools › Capture records 30 s, 60 s or 5 min to a `.pcap` in the data folder.
+- **Public IP** on the PORT page's Internet tile.
 - **v2.0 betas:** port, switch (CDP/LLDP), L2 checks (802.1X, STP, trunk/DTP, rogue DHCP, phone options, IPv6, broadcast), stats, ping, traceroute, speed tests, ARP table and scan, mDNS browser, port finder, port log, the SMART home device tab, Windows `.exe`, and native Linux (Nobara) support including bridged NICs.

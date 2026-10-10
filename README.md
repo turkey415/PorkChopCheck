@@ -51,12 +51,12 @@ Swipe left/right or tap the bottom bar to move between pages.
 
 | Page | What it shows |
 |---|---|
-| **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time-to-IP (flags portfast off), internet |
+| **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time-to-IP (flags portfast off), internet with your public IP |
 | **SWITCH** | CDP/LLDP: switch, port, data and voice VLAN, mgmt IP, model, PoE, negotiation |
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, chart), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -80,11 +80,35 @@ How it finds them, all locally with no cloud logins:
 | LIFX, Govee, WiZ, Yeelight, Tuya / Smart Life | model and device ID |
 | HTTP device info | Roku serial, Hue bridge ID, Shelly ID, Cast model |
 
+### Open services
+
+Tap a device, then **Ports**, and PorkChopCheck checks 35 common service ports on it and lists what answers in plain words: `80 Web interface`, `554 Video stream (RTSP)`, `9100 Printing (raw)`, `22 SSH`. The result is saved to `devices.csv` in the `open_ports` and `services` columns.
+
+A normal scan only tries nine ports, the ones that help identify a device. To run the full check on every device during a scan, turn on **Settings › Smart scan checks common services on every device**. It is off by default: it makes one connection attempt per port to every host, which takes longer on a big subnet and can look like a port scan to an intrusion detection system. Each check is a plain connect that is closed straight away; nothing is sent to the service.
+
 Good to know:
 - **Govee:** turn on *LAN Control* per device in the Govee app. **WiZ:** turn on *Allow local communication* in the WiZ app.
 - Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
 - Icons are generic device-type drawings, not brand logos.
 - Per-device throughput isn't shown. A normal switch port can't see other devices' traffic.
+
+## Multicast browser
+
+**Tools › Multicast** shows what multicast is crossing the port, and helps explain why a stream is missing.
+
+- **Groups, busiest first.** Every IPv4 multicast group seen, with a friendly name where there is one (mDNS, SSDP, VRRP, HSRP, OSPF, PIM, PTP, Dante, sACN…), packets per second, bandwidth, who is sending, the UDP port, and which hosts have joined it.
+- **IGMP querier.** Shows the querier's address, its IGMP version and how often it asks. Queriers normally ask every 125 seconds, so tap **Querier** to prompt one straight away: the box joins a scratch group for a moment and leaves it, and a querier answers a leave within about a second. If none answers and none is heard for two minutes, the page says so. A missing querier is behind a lot of "AirPlay, mDNS or video works for five minutes, then dies" problems on switches with IGMP snooping.
+- **Join test.** Tap **Join…** and type a group such as `239.1.2.3`. The box joins it the way a receiver would, through the operating system, then shows whether the stream arrives and how fast. **Leave** ends the test.
+
+With IGMP snooping on, a port only receives the groups something on it has joined, plus `224.0.0.x` link-local traffic, so an empty list on a quiet port is normal. Leaving the page stops listening and leaves any joined group. IPv6 multicast (MLD) is not covered yet.
+
+## Capture to file
+
+**Tools › Capture** records everything the adapter sees to a `.pcap` you can open in Wireshark or attach to a ticket. Tap the time button to pick 30 seconds, 60 seconds or 5 minutes, then **Start**. **Stop** ends it early and keeps what was recorded.
+
+Files go in the `captures` folder inside the data folder, named with the time and, when CDP/LLDP has named them, the switch and port: `capture-20261010-101502-SW-IDF2-03-Gi1_0_14.pcap`. A capture stops by itself at 200 MB.
+
+On a normal switch port you get this box's own traffic plus the broadcast and multicast the switch sends everyone. Plug into a mirror (SPAN) port to record other devices' traffic. A capture holds whatever crossed the port, so treat the files like any other packet trace.
 
 ## Announcing itself
 
@@ -98,6 +122,7 @@ By default, PorkChopCheck sends LLDP and CDP every 30 s, so `show cdp neighbors`
 
 ## Notes
 
+- The **Internet** tile shows the public IP this port goes out as. It asks Cloudflare (`https://1.1.1.1/cdn-cgi/trace`) when the internet first answers and every five minutes after that.
 - CDP is sent every 60 s, LLDP every 30 s, and DTP every 30 s. Some L2 tiles say "Listening…" for up to a minute after you plug in.
 - Many Windows NIC drivers strip VLAN tags. "Trunk / DTP" catches trunks via DTP even when tags are hidden.
 - The DHCP server check sends one DHCP Discover from this box's MAC and counts the offers. It never accepts an offer.
@@ -117,7 +142,7 @@ Demo-mode renders. Fonts on a real machine are larger and smoother.
 
 ## Coming soon
 
-The **multicast browser** (live groups, IGMP querier check, join test), **capture to .pcap**, a **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, open ports on smart devices, new-device alerts, printable port reports, and a handful of quick checks.
+A **VLAN tester** for trunk ports, an MTU test, a Wi-Fi survey, a soak test for flaky ports, new-device alerts, printable port reports, and a handful of quick checks.
 
 See the full **[roadmap](ROADMAP.md)**. Ideas and pull requests welcome.
 

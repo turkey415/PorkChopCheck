@@ -1,4 +1,4 @@
-import os, sys, struct, socket, tempfile
+import os, re, sys, struct, socket, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import pc_net as N
 ok = 0
@@ -105,6 +105,112 @@ for name in ("ports.csv", "history.csv"):
     check(f"{name}: the text is kept, quoted", "'=HYPERLINK(\"http://x\",\"SW\")" in cells and "'@SUM(1+1)" in cells)
 check("csv_safe leaves ordinary values alone", N.csv_safe({"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"}) == {"a": "SW01", "b": 12, "c": "", "d": "10.0.0.1"})
 check("ports.json keeps the raw value", N.PortLog(tmp).label_for(evil) == "@SUM(1+1)")
+# capture to file: the .pcap writer
+cap_dir = os.path.join(tmp, "captures"); os.makedirs(cap_dir)
+cap = os.path.join(cap_dir, N.capture_name(1791612003.25, "SW-IDF2-03-Gi1/0/14"))
+check("capture name: stamped, tag made filename-safe", re.fullmatch(r"capture-\d{8}-\d{6}-SW_IDF2_03_Gi1_0_14\.pcap", os.path.basename(cap)), os.path.basename(cap))
+check("capture name: no tag", re.fullmatch(r"capture-\d{8}-\d{6}\.pcap", N.capture_name(1791612003)))
+check("capture name: a hostile tag can't leave the folder", "/" not in N.capture_name(1, "../../etc/passwd") and ".." not in N.capture_name(1, "../../etc/passwd"))
+w = N.PcapWriter(cap)
+f1 = bytes.fromhex("ffffffffffff0011223344550806") + b"\x00" * 46
+f2 = bytes.fromhex("01005e0000fb0011223344550800") + b"\x45" + b"\x00" * 99
+w.add(f1, 1791612003.250001); w.add(f2, 1791612004.5)
+check("pcap writer counts frames and bytes", w.frames == 2 and w.bytes == 24 + 16 + len(f1) + 16 + len(f2), (w.frames, w.bytes))
+w.close(); w.add(f1, 1791612005.0)
+check("pcap file size matches, nothing written after close", os.path.getsize(cap) == w.bytes and w.frames == 2)
+raw = open(cap, "rb").read()
+check("pcap global header: magic, v2.4, Ethernet", raw[:8] == bytes.fromhex("d4c3b2a102000400") and raw[20:24] == b"\x01\x00\x00\x00")
+back = N.read_pcap(cap)
+check("pcap reads back frame for frame", [b for _, b in back] == [f1, f2])
+check("pcap timestamps keep microseconds", abs(back[0][0] - 1791612003.250001) < 2e-6 and abs(back[1][0] - 1791612004.5) < 2e-6, back[0][0])
+open(os.path.join(cap_dir, "notes.txt"), "w").write("x")
+rows = N.list_captures(cap_dir)
+check("capture list: only .pcap files, with sizes", [r[0] for r in rows] == [os.path.basename(cap)] and rows[0][1] == w.bytes)
+check("capture list: a missing folder is just empty", N.list_captures(os.path.join(tmp, "nope")) == [])
+check("fmt_bytes", [N.fmt_bytes(n) for n in (0, 999, 1024, 1536, 5 << 20, 3 << 30)] == ["0 B", "999 B", "1.0 kB", "1.5 kB", "5.0 MB", "3.0 GB"])
+# multicast browser: names, frames, IGMP, the tracker and the querier verdict
+MAC = "00:11:22:33:44:55"
+check("mcast names: exact, range, unknown", (N.mcast_name("224.0.0.251"), N.mcast_name("239.69.4.4"), N.mcast_name("239.1.2.3")) == ("mDNS", "Dante / AES67 audio", ""))
+check("mcast: SSDP is not mistaken for sACN", N.mcast_name("239.255.255.250") == "SSDP / UPnP" and N.mcast_name("239.255.0.1") == "sACN lighting")
+check("mcast: link-local scope", N.mcast_is_link_local("224.0.0.18") and not N.mcast_is_link_local("224.0.1.129"))
+check("mcast mac", N.mcast_mac("239.129.2.3").hex() == "01005e010203" and N.mcast_mac("224.0.0.251").hex() == "01005e0000fb")
+check("join target: group", N.parse_mcast_target(" 239.1.2.3 ") == ("239.1.2.3", None))
+check("join target: group and port, any separator", [N.parse_mcast_target(t) for t in ("239.1.2.3:5004", "239.1.2.3 5004", "239.1.2.3/5004")] == [("239.1.2.3", 5004)] * 3)
+for bad in ("10.1.2.3", "239.1.2", "239.1.2.300", "239.1.2.3:0", "239.1.2.3:70000", "stream.local", "", None, "239.1.2.3; rm -rf /"):
+    check(f"join target refused: {bad!r}", N.parse_mcast_target(bad) is None)
+udp = lambda port, n: struct.pack("!HHHH", 40000, port, 8 + n, 0) + bytes(n)
+fr = N.mcast_frame(MAC, "10.1.1.5", "239.1.1.10", 17, udp(5004, 1316), ttl=16)
+pm = N.parse_mcast(fr)
+check("parse: a UDP stream frame", (pm["src"], pm["group"], pm["proto"], pm["port"], pm["len"], pm["vlan"]) == ("10.1.1.5", "239.1.1.10", 17, 5004, len(fr), None), pm)
+check("built frame has a valid IP checksum and the right MACs", N.checksum(fr[14:34]) == 0 and fr[:6].hex() == "01005e01010a" and fr[6:12].hex() == "001122334455")
+pv = N.parse_mcast(N.mcast_frame(MAC, "10.1.1.5", "239.1.1.10", 17, udp(5004, 100), vlan=30))
+check("parse: a VLAN-tagged frame", pv["vlan"] == 30 and pv["group"] == "239.1.1.10" and pv["port"] == 5004)
+check("parse: unicast, ARP and runts are ignored", N.parse_mcast(N.mcast_frame(MAC, "10.1.1.5", "239.1.1.10", 17, udp(1, 8), dst_ip="10.1.1.9")) is None
+      and N.parse_mcast(bytes.fromhex("ffffffffffff0011223344550806") + bytes(46)) is None and N.parse_mcast(b"\x01\x00") is None)
+q = lambda **kw: N.parse_mcast(N.mcast_frame(MAC, "10.20.30.1", "224.0.0.1", 2, N.igmp_payload("query", **kw)))["igmp"][0]
+check("igmp: v2 general query", q() == ("query", "0.0.0.0", {"max_resp": 10.0, "version": 2, "general": True}), q())
+check("igmp: v3 general query carries its interval", q(version=3)[2]["version"] == 3 and q(version=3)[2]["qqic"] == 125)
+check("igmp: v1 query", q(version=1)[2]["version"] == 1)
+check("igmp: group-specific query", q(group="239.1.1.10")[1:] == ("239.1.1.10", {"max_resp": 10.0, "version": 2, "general": False}))
+check("igmp: query message checksums to zero", N.checksum(N.igmp_payload("query", version=3)) == 0)
+ig = lambda kind, g, **kw: N.parse_igmp(N.igmp_payload(kind, g, **kw))
+check("igmp: v2 report and leave", ig("report", "239.1.1.10") == [("join", "239.1.1.10", {"version": 2})] and ig("leave", "239.1.1.10") == [("leave", "239.1.1.10", {"version": 2})])
+check("igmp: v3 join and leave records", ig("report3", "239.1.1.10") == [("join", "239.1.1.10", {"version": 3})] and ig("leave3", "239.1.1.10") == [("leave", "239.1.1.10", {"version": 3})])
+check("igmp: v3 exponent-coded times", [N.igmp_code(v) for v in (0, 125, 127, 128, 0x8F, 0xFF)] == [0, 125, 127, 128, 248, 31744])
+check("igmp: a truncated v3 report doesn't raise", N.parse_igmp(N.igmp_payload("report3", "239.1.1.10")[:12]) == [])
+tr = N.McastTracker(now=1000.0)
+snap0 = tr.snapshot(1010.0)
+check("querier: still waiting early on", N.querier_verdict(snap0)[1] == "wait")
+check("querier: none after a probe got no answer", N.querier_verdict(snap0, probed=True)[1] == "warn")
+check("querier: none after two minutes of silence", N.querier_verdict(tr.snapshot(1131.0))[:2] == ("No IGMP querier found", "warn"))
+for ts in (1001.0, 1126.0):
+    tr.feed(N.mcast_frame(MAC, "10.20.30.1", "224.0.0.1", 2, N.igmp_payload("query")), ts)
+tr.feed(N.mcast_frame(MAC, "10.20.30.60", "224.0.0.22", 2, N.igmp_payload("report3", "239.1.1.10")), 1002.0)
+tr.feed(N.mcast_frame(MAC, "10.20.30.61", "239.9.9.9", 2, N.igmp_payload("report", "239.9.9.9")), 1002.0)
+for i in range(50):
+    tr.feed(fr, 1002.0 + i / 50)
+tr.feed(N.mcast_frame(MAC, "10.20.30.21", "239.255.255.250", 17, udp(1900, 300)), 1002.5)
+tr.feed(bytes.fromhex("ffffffffffff0011223344550806") + bytes(46), 1002.6)
+tr.tick(1003.0)
+sn = tr.snapshot(1130.0)
+by = {g["group"]: g for g in sn["groups"]}
+check("tracker: the busiest group is first", sn["groups"][0]["group"] == "239.1.1.10")
+g = by["239.1.1.10"]
+check("tracker: packets, bytes, source, port, members", (g["pkts"], g["bytes"], g["sources"], g["port"], g["members"]) == (50, 50 * len(fr), ["10.1.1.5"], 5004, ["10.20.30.60"]), g)
+check("tracker: rate since the group was first seen, one second before the tick", abs(g["pps"] - 50) < 0.01 and abs(g["bps"] - 50 * len(fr) * 8) < 1, (g["pps"], g["bps"]))
+check("tracker: a joined group with no traffic is still listed", by["239.9.9.9"]["pkts"] == 0 and by["239.9.9.9"]["members"] == ["10.20.30.61"])
+check("tracker: IGMP itself is not counted as group traffic", "224.0.0.22" not in by and "224.0.0.1" not in by and sn["frames"] == 55)
+check("tracker: names attached", by["239.255.255.250"]["name"] == "SSDP / UPnP")
+check("querier: found, with version and measured interval", N.querier_verdict(sn) == ("Querier: 10.20.30.1", "ok", "IGMPv2 · asks every 125 s"), N.querier_verdict(sn))
+tr.feed(N.mcast_frame(MAC, "10.20.30.60", "224.0.0.22", 2, N.igmp_payload("leave3", "239.1.1.10")), 1128.0)
+tr.feed(N.mcast_frame(MAC, "10.20.30.0", "224.0.0.1", 2, N.igmp_payload("query", version=3)), 1129.0)
+sn2 = tr.snapshot(1130.0)
+check("tracker: a leave removes the member", {g["group"]: g for g in sn2["groups"]}["239.1.1.10"]["members"] == [])
+check("querier: two seen, the lowest address is the one named", N.querier_verdict(sn2)[0] == "Querier: 10.20.30.0" and "2 queriers" in N.querier_verdict(sn2)[2])
+tr2 = N.McastTracker(now=0.0)
+tr2.feed(N.mcast_frame(MAC, "10.20.30.1", "239.192.137.251", 2, N.igmp_payload("query", group="239.192.137.251")), 3.0)
+check("querier: a reply to our leave is enough to name it", N.querier_verdict(tr2.snapshot(4.0), probed=True)[:2] == ("Querier: 10.20.30.1", "ok"))
+tr3 = N.McastTracker(now=0.0); tr3.MAX_GROUPS = 3
+for i in range(10):
+    tr3.feed(N.mcast_frame(MAC, "10.1.1.5", f"239.1.1.{i + 1}", 17, udp(5004, 10)), 1.0)
+check("tracker: the group table is capped", len(tr3.snapshot(2.0)["groups"]) == 3)
+# a real membership through the OS, on loopback
+try:
+    js = N.mcast_join_socket("239.192.137.251", "127.0.0.1"); js.close(); joined = True
+except OSError as e:
+    joined = str(e)
+check("mcast_join_socket joins and leaves through the OS", joined is True, joined)
+try:
+    N.mcast_join_socket("10.1.2.3", "127.0.0.1"); refused = False
+except OSError:
+    refused = True
+check("mcast_join_socket refuses a non-multicast address", refused)
+# public IP: Cloudflare trace reply
+TRACE = "fl=29f85\nh=1.1.1.1\nip=203.0.113.47\nts=1791612003.1\nvisit_scheme=https\nuag=PorkChopCheck\ncolo=DFW\nloc=US\ntls=TLSv1.3\n"
+check("trace: public IPv4", N.parse_trace_ip(TRACE) == "203.0.113.47")
+check("trace: public IPv6 is normalised", N.parse_trace_ip("h=x\nip=2001:DB8:0:0::1\n") == "2001:db8::1")
+for bad in ("", "h=1.1.1.1\ncolo=DFW\n", "ip=<script>alert(1)</script>\n", "ip=999.1.1.1\n", "xip=1.2.3.4\n", "ip=1.2.3.4 extra\n"):
+    check(f"trace: not an address -> None: {bad[:24]!r}", N.parse_trace_ip(bad) is None)
 # Oui parsing
 p = os.path.join(tmp, "manuf"); open(p, "w").write("# c\n00:00:0C\tCisco\tCisco Systems, Inc\n00:1B:C5:00:00:00/36\tX\n")
 o = N.Oui(p); check("oui lookup", o.lookup("00:00:0c:07:ac:01") == "Cisco · HSRPv1 group 1", o.lookup("00:00:0c:07:ac:01"))

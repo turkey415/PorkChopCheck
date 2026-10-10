@@ -166,6 +166,35 @@ import csv as _csv
 cells = [c for row in _csv.reader(open(os.path.join(tmp, "devices.csv"), encoding="utf-8-sig")) for c in row]
 check("devices.csv: a device name can't start a formula", not any(c and c[0] in "=+-@" for c in cells) and "'" not in cells and "'=cmd|' /C calc'!A0" in cells)
 
+# --- common services: names, the per-device check, and what the inventory keeps
+check("service names for known ports", S.describe_ports([554, 80, 80, 12345]) == ["80  Web interface", "554  Video stream (RTSP)", "12345"])
+check("service summary has no repeats", S.service_names([8009, 8008, 80, 31337]) == "Web interface, Chromecast")
+check("the full list covers the quick fingerprint ports", set(S.PROBE_PORTS) <= set(S.ALL_PORTS) and S.ALL_PORTS == sorted(S.ALL_PORTS))
+import socket as _so
+srv = _so.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(8); open_port = srv.getsockname()[1]
+shut = _so.socket(); shut.bind(("127.0.0.1", 0)); closed_port = shut.getsockname()[1]; shut.close()
+check("port_open: a listening port", S.port_open("127.0.0.1", open_port, "127.0.0.1") is True)
+check("port_open: a closed port", S.port_open("127.0.0.1", closed_port, "127.0.0.1") is False)
+check("port_open: a bad source address is just False", S.port_open("127.0.0.1", open_port, "203.0.113.9") is False)
+check("probe_ports finds exactly the open one", S.probe_ports("127.0.0.1", [closed_port, open_port], "127.0.0.1") == [open_port])
+srv.close()
+check("a quick scan keeps ports only a full check tests", S.kept_ports("22 80 443 554", [80], False) == [22, 80, 443])
+check("a quick scan drops a fingerprint port that closed", 554 not in S.kept_ports("80 554", [80], False))
+check("a full check replaces the list", S.kept_ports("22 80 443", [80, 8080], True) == [80, 8080])
+check("kept_ports copes with an empty or odd cell", S.kept_ports("", [80], False) == [80] and S.kept_ports("abc 22", [], False) == [22])
+st2 = S.DeviceStore(tempfile.mkdtemp())
+cam = {"ip": "10.20.30.90", "mac": "48:a6:b8:00:00:09", "sources": ["ARP", "Ports"], "ports": [80, 554]}
+st2.merge([S.classify(dict(cam, services_checked=True, ports=[22, 80, 443, 554]))])
+key = S.DeviceStore.key(cam)
+check("inventory records a full check with names", st2.items[key]["open_ports"] == "22 80 443 554" and st2.items[key]["services"] == "SSH, Web interface, Web interface (HTTPS), Video stream (RTSP)", st2.items[key]["services"])
+st2.merge([S.classify(dict(cam, services_checked=False, ports=[80]))])
+check("a later quick scan keeps SSH and HTTPS, drops the closed stream port", st2.ports(key) == [22, 80, 443], st2.ports(key))
+st2.set_ports(key, [80, 8080])
+check("set_ports records one device's check", st2.ports(key) == [80, 8080] and S.DeviceStore(os.path.dirname(st2.json_path)).items[key]["services"] == "Web interface, Web interface (alt)")
+check("set_ports on an unknown device is a no-op", st2.set_ports("ip:10.9.9.9", [80]) is None and st2.ports("ip:10.9.9.9") == [])
+hdr = open(st2.csv_path, encoding="utf-8-sig").readline().strip().split(",")
+check("devices.csv has a services column next to open_ports", hdr[hdr.index("open_ports") + 1] == "services", hdr)
+
 # --- SSDP: a device may only point us at its own address
 check("ssdp location on the sender is fetched", S.url_is_on("http://10.20.30.70:1400/xml/device_description.xml", "10.20.30.70"))
 for bad in ("http://127.0.0.1:8080/admin", "http://10.20.30.71/desc.xml", "http://localhost/x", "https://10.20.30.70/x",

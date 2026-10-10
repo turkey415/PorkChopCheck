@@ -1008,6 +1008,36 @@ def tcp_probe(host, port, src, timeout=2.0):
         s.close()
 
 
+def parse_trace_ip(text):
+    """The ip= line of a Cloudflare /cdn-cgi/trace reply, checked to be an address."""
+    m = re.search(r"^ip=(\S+)$", text, re.M)
+    try:
+        return str(ipaddress.ip_address(m.group(1))) if m else None
+    except ValueError:
+        return None
+
+
+def public_ip(src=None, timeout=4.0):
+    """The address the internet sees this port as, or None. Asks Cloudflare by IP address, so it
+    still answers when DNS on this port is broken, and goes out through `src` like every other
+    probe."""
+    for host in ("1.1.1.1", "1.0.0.1"):
+        try:
+            c = http.client.HTTPSConnection(host, 443, timeout=timeout,
+                                            source_address=(src, 0) if src else None)
+            try:
+                c.request("GET", "/cdn-cgi/trace", headers={"User-Agent": "PorkChopCheck"})
+                r = c.getresponse()
+                ip = parse_trace_ip(r.read(4096).decode("ascii", "replace")) if r.status == 200 else None
+                if ip:
+                    return ip
+            finally:
+                c.close()
+        except (OSError, http.client.HTTPException, ValueError):
+            continue
+    return None
+
+
 def scan_hosts(ip, mask, cap=1024):
     """Hosts to ARP-scan. Subnets bigger than `cap` are limited to the /24 around us."""
     net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
@@ -1156,7 +1186,7 @@ class Oui:
 # ====================================================================== settings + port log
 class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
-                "iperf_port": 5201}
+                "iperf_port": 5201, "smart_services": False}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")
@@ -1185,6 +1215,360 @@ LOG_FIELDS = ["last_seen", "label", "switch", "port", "vlan", "voice_vlan", "mgm
               "tagged_vlans", "ipv6", "pc_mac", "adapter", "first_seen", "saves"]
 HIST_FIELDS = ["time", "source"] + [f for f in LOG_FIELDS
                                     if f not in ("last_seen", "first_seen", "saves")]
+
+
+# ====================================================================== multicast
+# Well-known groups, by address or by range, with the name a network person would use.
+MCAST_NAMES = {
+    "224.0.0.1": "All hosts", "224.0.0.2": "All routers", "224.0.0.5": "OSPF", "224.0.0.6": "OSPF DR",
+    "224.0.0.9": "RIPv2", "224.0.0.10": "EIGRP", "224.0.0.13": "PIM", "224.0.0.18": "VRRP",
+    "224.0.0.22": "IGMPv3 reports", "224.0.0.102": "HSRPv2", "224.0.0.251": "mDNS",
+    "224.0.0.252": "LLMNR", "224.0.1.1": "NTP", "224.0.1.39": "Cisco RP announce",
+    "224.0.1.40": "Cisco RP discovery", "224.0.1.129": "PTP", "224.0.1.130": "PTP",
+    "224.0.1.131": "PTP", "224.0.1.132": "PTP", "224.0.0.107": "PTP peer delay",
+    "224.0.23.12": "KNX", "239.255.255.250": "SSDP / UPnP", "239.255.255.253": "SLP",
+    "224.2.127.254": "SAP announcements",
+}
+MCAST_RANGES = [("224.0.0.230", "224.0.0.233", "Dante control"), ("239.69.0.0", "239.69.255.255", "Dante / AES67 audio"),
+                ("239.255.0.0", "239.255.249.255", "sACN lighting"), ("232.0.0.0", "232.255.255.255", "Source-specific (SSM)")]
+MCAST_BPF = "ip multicast or (vlan and ip multicast)"
+
+
+def mcast_name(group):
+    if group in MCAST_NAMES:
+        return MCAST_NAMES[group]
+    try:
+        g = int(ipaddress.IPv4Address(group))
+    except ValueError:
+        return ""
+    for lo, hi, name in MCAST_RANGES:
+        if int(ipaddress.IPv4Address(lo)) <= g <= int(ipaddress.IPv4Address(hi)):
+            return name
+    return ""
+
+
+def mcast_is_link_local(group):
+    """224.0.0.x never leaves the subnet and switches flood it even with IGMP snooping on."""
+    return group.startswith("224.0.0.")
+
+
+def parse_mcast_target(text):
+    """"239.1.2.3", "239.1.2.3:5004" or "239.1.2.3 5004" -> (group, port or None); None if it is
+    not a multicast group. A space or slash works for the port because the on-screen keyboard
+    has no colon."""
+    m = re.fullmatch(r"\s*(\d+\.\d+\.\d+\.\d+)(?:\s*[:/ ]\s*(\d{1,5}))?\s*", text or "")
+    if not m:
+        return None
+    try:
+        addr = ipaddress.IPv4Address(m.group(1))
+    except ValueError:
+        return None
+    port = int(m.group(2)) if m.group(2) else None
+    if not addr.is_multicast or (port is not None and not 0 < port < 65536):
+        return None
+    return str(addr), port
+
+
+def mcast_mac(group):
+    """The Ethernet address a multicast group is sent to: 01:00:5e plus its low 23 bits."""
+    b = socket.inet_aton(group)
+    return bytes([0x01, 0x00, 0x5E, b[1] & 0x7F, b[2], b[3]])
+
+
+def mcast_frame(src_mac, src_ip, group, proto, payload, ttl=1, dst_ip=None, vlan=None):
+    """An Ethernet + IPv4 frame to a multicast group. Used by the tests and the demo."""
+    dst_ip = dst_ip or group
+    ra = b"\x94\x04\x00\x00" if proto == 2 else b""          # IGMP carries Router Alert
+    ihl = 5 + len(ra) // 4
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x40 | ihl, 0xC0 if proto == 2 else 0, 20 + len(ra) + len(payload),
+                      0, 0, ttl, proto, 0, socket.inet_aton(src_ip), socket.inet_aton(dst_ip)) + ra
+    hdr = hdr[:10] + struct.pack("!H", checksum(hdr)) + hdr[12:]
+    tag = struct.pack("!HH", 0x8100, vlan) if vlan is not None else b""
+    return mcast_mac(dst_ip) + bytes.fromhex(norm_mac(src_mac).replace(":", "")) + tag + b"\x08\x00" + hdr + payload
+
+
+def igmp_payload(kind, group="0.0.0.0", max_resp=100, version=2, qqic=125):
+    """kind: query | report | leave | report3 | leave3."""
+    g = socket.inet_aton(group)
+    if kind == "query":
+        body = struct.pack("!BBH4s", 0x11, 0 if version == 1 else max_resp, 0, g)
+        if version == 3:
+            body += struct.pack("!BBH", 2, qqic, 0)
+    elif kind == "report":
+        body = struct.pack("!BBH4s", 0x12 if version == 1 else 0x16, 0, 0, g)
+    elif kind == "leave":
+        body = struct.pack("!BBH4s", 0x17, 0, 0, g)
+    else:                                   # v3 report with one record: join = TO_EX {}, leave = TO_IN {}
+        body = struct.pack("!BBHHHBBH4s", 0x22, 0, 0, 0, 1, 4 if kind == "report3" else 3, 0, 0, g)
+    return body[:2] + struct.pack("!H", checksum(body)) + body[4:]
+
+
+def parse_mcast(raw):
+    """One frame -> {"src", "group", "proto", "len", "vlan", "port", "igmp"} or None if it is not
+    IPv4 multicast. "igmp" is a list of (what, group, detail) with what in query/join/leave."""
+    if len(raw) < 34:
+        return None
+    off, vlan, et = 14, None, u16(raw, 12)
+    if et == 0x8100 and len(raw) >= 38:
+        vlan, et, off = u16(raw, 14) & 0x0FFF, u16(raw, 16), 18
+    if et != 0x0800 or raw[off] >> 4 != 4:
+        return None
+    ihl = (raw[off] & 0x0F) * 4
+    if ihl < 20 or len(raw) < off + ihl or raw[off + 16] & 0xF0 != 0xE0:
+        return None
+    proto = raw[off + 9]
+    out = {"src": socket.inet_ntoa(raw[off + 12:off + 16]), "group": socket.inet_ntoa(raw[off + 16:off + 20]),
+           "proto": proto, "len": len(raw), "vlan": vlan, "port": None, "igmp": []}
+    body = raw[off + ihl:off + max(ihl, u16(raw, off + 2))]
+    if proto == 17 and len(body) >= 4:
+        out["port"] = u16(body, 2)
+    elif proto == 2 and len(body) >= 8:
+        out["igmp"] = parse_igmp(body)
+    return out
+
+
+def igmp_code(v):
+    """IGMPv3 packs times of 128 and up as a small float: 1eeemmmm -> (mmmm | 0x10) << (eee + 3)."""
+    return v if v < 128 else ((v & 0x0F) | 0x10) << (((v >> 4) & 0x07) + 3)
+
+
+def mcast_join_socket(group, src):
+    """Join a group the ordinary way, through the operating system, on the interface that owns
+    `src`. The OS sends the IGMP reports and answers queries for as long as the socket is open;
+    closing it leaves the group."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((src, 0))                 # Windows refuses a membership on an unbound socket
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                     socket.inet_aton(group) + socket.inet_aton(src))
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
+def parse_igmp(b):
+    """IGMP message -> [(what, group, detail)]."""
+    t, grp = b[0], socket.inet_ntoa(b[4:8])
+    if t == 0x11:
+        if len(b) >= 12:
+            ver, detail = 3, {"qqic": igmp_code(b[9]), "max_resp": igmp_code(b[1]) / 10}
+        elif b[1] == 0:
+            ver, detail = 1, {"max_resp": 10.0}
+        else:
+            ver, detail = 2, {"max_resp": b[1] / 10}
+        return [("query", grp, dict(detail, version=ver, general=grp == "0.0.0.0"))]
+    if t in (0x12, 0x16):
+        return [("join", grp, {"version": 1 if t == 0x12 else 2})]
+    if t == 0x17:
+        return [("leave", grp, {"version": 2})]
+    if t == 0x22:
+        out, off = [], 8
+        for _ in range(min(u16(b, 6), 64)):
+            if len(b) < off + 8:
+                break
+            rtype, aux, nsrc = b[off], b[off + 1], u16(b, off + 2)
+            g = socket.inet_ntoa(b[off + 4:off + 8])
+            if rtype in (2, 4) or (rtype in (1, 5) and nsrc):
+                out.append(("join", g, {"version": 3}))
+            elif rtype == 6 or (rtype == 3 and not nsrc):
+                out.append(("leave", g, {"version": 3}))
+            elif rtype == 3:
+                out.append(("join", g, {"version": 3}))
+            off += 8 + 4 * nsrc + 4 * aux
+        return out
+    return []
+
+
+class McastTracker:
+    """Counts what multicast crosses the port and remembers who is asking about it."""
+
+    MAX_GROUPS, MAX_SOURCES, MAX_MEMBERS = 2000, 16, 32
+
+    def __init__(self, now=None):
+        self.lock = threading.Lock()
+        self.reset(now)
+
+    def reset(self, now=None):
+        with self.lock:
+            self.started = time.time() if now is None else now
+            self.groups = {}             # group -> counters
+            self.queriers = {}           # ip -> what its queries said
+            self.frames = 0
+
+    def feed(self, raw, ts):
+        p = parse_mcast(raw)
+        if not p:
+            return
+        with self.lock:
+            self.frames += 1
+            for what, grp, det in p["igmp"]:
+                if what == "query":
+                    q = self.queriers.setdefault(p["src"], {"ip": p["src"], "general": 0, "specific": 0,
+                                                            "first": ts, "times": []})
+                    q.update(version=det["version"], max_resp=det["max_resp"], last=ts)
+                    if det.get("qqic") is not None:
+                        q["qqic"] = det["qqic"]
+                    if det["general"]:
+                        q["general"] += 1
+                        q["times"] = (q["times"] + [ts])[-4:]
+                    else:
+                        q["specific"] += 1
+                else:
+                    g = self._group(grp, ts)
+                    if g is not None:
+                        if what == "join":
+                            if len(g["members"]) < self.MAX_MEMBERS or p["src"] in g["members"]:
+                                g["members"][p["src"]] = ts
+                        else:
+                            g["members"].pop(p["src"], None)
+                            g["left"] = ts
+            if p["proto"] == 2:
+                return                   # IGMP is bookkeeping, not traffic for the group it is sent to
+            g = self._group(p["group"], ts)
+            if g is None:
+                return
+            g["pkts"] += 1
+            g["bytes"] += p["len"]
+            g["last"] = ts
+            if p["port"]:
+                g["port"] = p["port"]
+            if p["vlan"] is not None:
+                g["vlan"] = p["vlan"]
+            if p["src"] in g["sources"] or len(g["sources"]) < self.MAX_SOURCES:
+                g["sources"][p["src"]] = g["sources"].get(p["src"], 0) + 1
+
+    def _group(self, grp, ts):
+        g = self.groups.get(grp)
+        if g is None:
+            if len(self.groups) >= self.MAX_GROUPS:
+                return None
+            g = self.groups[grp] = {"group": grp, "pkts": 0, "bytes": 0, "first": ts, "last": None,
+                                    "sources": {}, "members": {}, "port": None, "vlan": None, "left": None,
+                                    "pps": 0.0, "bps": 0.0, "_at": ts, "_pkts": 0, "_bytes": 0}
+        return g
+
+    def tick(self, now):
+        """Work out each group's rate since the last tick. Call about once a second."""
+        with self.lock:
+            for g in self.groups.values():
+                dt = now - g["_at"]
+                if dt >= 0.5:
+                    g["pps"] = (g["pkts"] - g["_pkts"]) / dt
+                    g["bps"] = (g["bytes"] - g["_bytes"]) * 8 / dt
+                    g["_at"], g["_pkts"], g["_bytes"] = now, g["pkts"], g["bytes"]
+
+    def snapshot(self, now):
+        with self.lock:
+            groups = []
+            for g in self.groups.values():
+                row = {k: v for k, v in g.items() if not k.startswith("_")}
+                row["sources"] = [ip for ip, _ in sorted(g["sources"].items(), key=lambda kv: -kv[1])]
+                row["members"] = sorted(g["members"])
+                row["name"] = mcast_name(g["group"])
+                groups.append(row)
+            groups.sort(key=lambda r: (-r["bps"], -r["pkts"], socket.inet_aton(r["group"])))
+            queriers = []
+            for q in self.queriers.values():
+                t = q["times"]
+                gaps = [b - a for a, b in zip(t, t[1:])]
+                queriers.append(dict({k: v for k, v in q.items() if k != "times"},
+                                     interval=sum(gaps) / len(gaps) if gaps else None))
+            # The lowest address wins the querier election.
+            queriers.sort(key=lambda q: socket.inet_aton(q["ip"]))
+            return {"groups": groups, "queriers": queriers, "elapsed": now - self.started,
+                    "frames": self.frames, "bps": sum(g["bps"] for g in groups)}
+
+
+def querier_verdict(snap, probed=False):
+    """(text, level, note) for the IGMP querier line. level: ok | wait | warn."""
+    qs = [q for q in snap["queriers"] if q["general"] or q["specific"]]
+    el = snap["elapsed"]
+    if qs:
+        q = qs[0]
+        every = q.get("interval") or q.get("qqic")
+        note = f"IGMPv{q['version']}" + (f" · asks every {every:.0f} s" if every else "")
+        if len(qs) > 1:
+            note += f" · {len(qs)} queriers seen, lowest address wins"
+        return (f"Querier: {q['ip']}", "ok", note)
+    if el < 130 and not (probed and el > 5):
+        return ("No querier heard yet", "wait",
+                f"listening {el:.0f} s — a querier normally asks every 125 s. Tap Querier to prompt one.")
+    return ("No IGMP querier found", "warn",
+            "With IGMP snooping on and no querier, streams, AirPlay and mDNS work for a few minutes and then stop.")
+
+
+class PcapWriter:
+    """A classic .pcap file (libpcap 2.4, Ethernet, microsecond stamps) that Wireshark opens.
+    Written here and not with scapy so it works the same on every platform."""
+
+    SNAPLEN = 262144
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.frames = 0
+        self.bytes = 24
+        self.f = open(path, "wb")
+        self.f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, self.SNAPLEN, 1))
+
+    def add(self, raw, ts):
+        sec = int(ts)
+        cap = raw[:self.SNAPLEN]
+        with self.lock:
+            if self.f is None:
+                return
+            self.f.write(struct.pack("<IIII", sec & 0xFFFFFFFF, int((ts - sec) * 1_000_000),
+                                     len(cap), len(raw)) + cap)
+            self.frames += 1
+            self.bytes += 16 + len(cap)
+
+    def close(self):
+        with self.lock:
+            if self.f is not None:
+                self.f.close()
+                self.f = None
+
+
+def read_pcap(path):
+    """[(timestamp, frame bytes)] from a file PcapWriter made."""
+    out = []
+    with open(path, "rb") as f:
+        magic, _maj, _min, _tz, _sig, _snap, link = struct.unpack("<IHHiIII", f.read(24))
+        if magic != 0xA1B2C3D4 or link != 1:
+            raise ValueError("not an Ethernet .pcap file")
+        while True:
+            hdr = f.read(16)
+            if len(hdr) < 16:
+                return out
+            sec, usec, caplen, _orig = struct.unpack("<IIII", hdr)
+            out.append((sec + usec / 1_000_000, f.read(caplen)))
+
+
+def capture_name(now, tag=""):
+    """capture-20261010-015500-SW01-Gi1_0_14.pcap; the tag is cut down to safe characters."""
+    tag = re.sub(r"[^A-Za-z0-9.]+", "_", tag or "").strip("_.")[:40]
+    return time.strftime("capture-%Y%m%d-%H%M%S", time.localtime(now)) + (f"-{tag}" if tag else "") + ".pcap"
+
+
+def list_captures(folder, limit=20):
+    """[(name, size, mtime)] newest first."""
+    rows = []
+    try:
+        for n in os.listdir(folder):
+            if n.endswith(".pcap"):
+                st = os.stat(os.path.join(folder, n))
+                rows.append((n, st.st_size, st.st_mtime))
+    except OSError:
+        pass
+    return sorted(rows, key=lambda r: r[2], reverse=True)[:limit]
+
+
+def fmt_bytes(n):
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n} B"
 
 
 def csv_safe(row):
