@@ -1187,8 +1187,16 @@ HIST_FIELDS = ["time", "source"] + [f for f in LOG_FIELDS
                                     if f not in ("last_seen", "first_seen", "saves")]
 
 
+def csv_safe(row):
+    """A copy of a row that is safe to open in Excel or LibreOffice. Names, labels and models
+    come from whatever is on the network, and a cell that starts with = + - or @ is run as a
+    formula. A leading apostrophe makes the spreadsheet treat it as plain text."""
+    return {k: ("'" + v if isinstance(v, str) and v and v[0] in "=+-@\t\r" else v) for k, v in row.items()}
+
+
 class PortLog:
-    """ports.csv = one row per switch+port (latest result). history.csv = every save."""
+    """ports.csv = one row per switch+port (latest result). history.csv = every save.
+    ports.json is what gets read back; the CSV files are only ever written."""
 
     def __init__(self, folder):
         self.folder = folder
@@ -1254,7 +1262,7 @@ class PortLog:
             with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
                 w.writeheader()
-                w.writerows(rows)
+                w.writerows(csv_safe(r) for r in rows)
             os.replace(tmp, self.csv_path)
         except PermissionError:
             return "ports.csv is open (Excel?) — will update next time"
@@ -1269,7 +1277,7 @@ class PortLog:
                 w = csv.DictWriter(f, fieldnames=HIST_FIELDS, extrasaction="ignore")
                 if new_file:
                     w.writeheader()
-                w.writerow(dict(rec, time=rec.get("last_seen"), source=source))
+                w.writerow(csv_safe(dict(rec, time=rec.get("last_seen"), source=source)))
         except PermissionError:
             return "history.csv is open (Excel?)"
         except OSError as e:
@@ -1485,7 +1493,34 @@ def linux_neigh(name):
 
 
 def linux_set_link(name, up):
-    return run(["ip", "link", "set", "dev", name, "up" if up else "down"], 15)[0] == 0
+    """Bring an interface up or down from this process. It has to be done here and not by
+    running `ip link set`: the link capability belongs to this process and is deliberately not
+    passed on to the programs it starts."""
+    import fcntl
+    ifname = name.encode()[:15]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            flags = linux_link_flags(name, s)
+            flags = flags | IFF_UP if up else flags & ~IFF_UP
+            fcntl.ioctl(s, SIOCSIFFLAGS, struct.pack("16sH14s", ifname, flags, b""))
+        return True
+    except OSError:
+        return False
+
+
+SIOCGIFFLAGS, SIOCSIFFLAGS, IFF_UP = 0x8913, 0x8914, 0x1
+
+
+def linux_link_flags(name, sock=None):
+    """The interface's IFF_* flags. Raises OSError if there is no such interface."""
+    import fcntl
+    s = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ifr = fcntl.ioctl(s, SIOCGIFFLAGS, struct.pack("16sH14s", name.encode()[:15], 0, b""))
+        return struct.unpack("16sH14s", ifr)[1]
+    finally:
+        if not sock:
+            s.close()
 
 
 def linux_renew(name):

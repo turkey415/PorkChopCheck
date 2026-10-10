@@ -21,6 +21,7 @@ import concurrent.futures as cf
 import csv
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -204,6 +205,17 @@ def _json(b):
         return json.loads(b) if b[:1] in "{[" else None
     except ValueError:
         return None
+
+
+def url_is_on(url, ip):
+    """True if a plain-http URL points at this exact IP address. A device's SSDP reply names the
+    URL of its description; without this check any device could have us fetch a page from
+    another host, including this machine."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        return u.scheme == "http" and ipaddress.ip_address(u.hostname or "") == ipaddress.ip_address(ip)
+    except ValueError:
+        return False
 
 
 def http_get(url, src=None, timeout=2.0, limit=131072):
@@ -735,7 +747,7 @@ class SmartScan:
                 f["desc"] = server[:80]
             self.add(ip, f, "SSDP", PRIO["upnp"] - 1)
             loc = hd.get("location", "")
-            if loc.startswith("http://"):
+            if url_is_on(loc, ip):
                 locs.setdefault(ip, set()).add(loc)
         _collect(s, 3.0, h, stop)
         s.close()
@@ -1006,7 +1018,7 @@ class DeviceStore:
             with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.DictWriter(f, fieldnames=INV_FIELDS, extrasaction="ignore")
                 w.writeheader()
-                w.writerows(rows)
+                w.writerows(N.csv_safe(r) for r in rows)
             os.replace(tmp, self.csv_path)
         except PermissionError:
             return "devices.csv is open (Excel?) — will update next scan"

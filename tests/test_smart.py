@@ -161,5 +161,15 @@ check("inventory rescan keeps label", new == 0 and st.label("48:a6:b8:c1:d2:e3")
 rows = open(os.path.join(tmp, "devices.csv"), encoding="utf-8-sig").read().splitlines()
 check("devices.csv: smart first, labelled", rows[1].startswith("Front lobby speaker,Sonos") and len(rows) == 3, rows[1])
 check("inventory reloads", len(S.DeviceStore(tmp).items) == 2)
+st.merge([S.classify({"ip": "10.20.30.80", "mac": "48:a6:b8:00:00:01", "name": "=cmd|' /C calc'!A0", "sources": ["UPnP"]})])
+import csv as _csv
+cells = [c for row in _csv.reader(open(os.path.join(tmp, "devices.csv"), encoding="utf-8-sig")) for c in row]
+check("devices.csv: a device name can't start a formula", not any(c and c[0] in "=+-@" for c in cells) and "'" not in cells and "'=cmd|' /C calc'!A0" in cells)
+
+# --- SSDP: a device may only point us at its own address
+check("ssdp location on the sender is fetched", S.url_is_on("http://10.20.30.70:1400/xml/device_description.xml", "10.20.30.70"))
+for bad in ("http://127.0.0.1:8080/admin", "http://10.20.30.71/desc.xml", "http://localhost/x", "https://10.20.30.70/x",
+            "http://10.20.30.70.evil.example/x", "http://[::1]/x", "file:///etc/passwd", "http:///x", ""):
+    check(f"ssdp location elsewhere is refused: {bad or '(empty)'}", not S.url_is_on(bad, "10.20.30.70"))
 
 print(f"\nALL {ok} SMART CHECKS PASSED")
