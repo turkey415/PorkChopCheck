@@ -1,0 +1,2394 @@
+#!/usr/bin/env python3
+"""
+PortCheck - a big-text, touch-friendly switch-port tester for small Windows boxes.
+
+Pages:  PORT    link, speed/duplex, IP, gateway, DHCP, DNS, time-to-IP, internet
+        SWITCH  CDP/LLDP neighbor: switch, port, VLAN, voice VLAN, mgmt IP, model, PoE
+        L2      802.1X, spanning tree, trunk/DTP, DHCP servers, phone options, gateway MAC,
+                IPv6, broadcast rate
+        STATS   MAC, adapter, errors, discards, throughput, link drops
+        TOOLS   ping, traceroute, speed test (iperf3 / internet), ARP table, ARP scan,
+                mDNS browser, port finder, port log, re-run checks, settings
+        SAVE    log this port (with an optional label) to data/ports.csv
+
+Run:   double-click portcheck.py   (it asks for admin once, then opens fullscreen)
+       python portcheck.py --windowed --size 800x480
+       python portcheck.py --demo      (fake data, to preview the screens)
+Keys:  1-5 pages  S save  R renew  A next adapter  F11 fullscreen  Esc back  Q quit
+Needs: Python 3.10+, psutil, scapy, Npcap.  pc_net.py must sit next to this file.
+"""
+
+import collections
+import copy
+import os
+import random
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+import pc_net as N
+
+IS_WIN = N.IS_WIN
+DEMO = "--demo" in sys.argv
+WINDOWED = "--windowed" in sys.argv or (DEMO and not IS_WIN)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def pick_data_dir():
+    sub = "data_demo" if DEMO else "data"
+    for d in (os.path.join(SCRIPT_DIR, sub),
+              os.path.join(os.path.expanduser("~"), "Documents", "PortCheck", sub)):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_test")
+            with open(probe, "w") as f:
+                f.write("x")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return SCRIPT_DIR
+
+
+DATA_DIR = pick_data_dir()
+
+# ---------------------------------------------------------------- colors
+BG = "#0b0f14"
+PANEL = "#161b22"
+FG = "#e6edf3"
+DIM = "#8b949e"
+GREEN = "#238636"
+AMBER = "#9e6a03"
+RED = "#b62324"
+BLUE = "#1f6feb"
+GREY = "#30363d"
+OK = "#3fb950"
+WARN = "#e3b341"
+BAD = "#f85149"
+HDR = "#79c0ff"
+
+PENDING = "pending"
+
+PING_TARGETS = [("gateway", "Gateway"), ("dns", "DNS server"), ("switch", "Switch mgmt"),
+                ("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google DNS")]
+TRACE_TARGETS = [("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google DNS"), ("gateway", "Gateway"),
+                 ("dns", "DNS server")]
+
+# ---------------------------------------------------------------- PowerShell
+ADAPTERS_PS = r"""$ErrorActionPreference='SilentlyContinue'
+ConvertTo-Json -Compress -InputObject @(Get-NetAdapter -Physical |
+  Where-Object { $_.PhysicalMediaType -eq '802.3' -or $_.MediaType -eq '802.3' } |
+  Select-Object Name, InterfaceDescription, @{n='Status';e={[string]$_.Status}}, MacAddress)"""
+
+DETAIL_PS = r"""$ErrorActionPreference='SilentlyContinue'
+$a = Get-NetAdapter -Name __NAME__
+$c = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter ("InterfaceIndex=" + $a.ifIndex)
+$exp = $null; if ($c.DHCPLeaseExpires) { $exp = $c.DHCPLeaseExpires.ToString('MMM d h:mm tt') }
+$gw = @($c.DefaultIPGateway) | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
+$gwmac = $null; if ($gw) { $gwmac = (Get-NetNeighbor -InterfaceIndex $a.ifIndex -IPAddress $gw).LinkLayerAddress }
+$s = Get-NetAdapterStatistics -Name __NAME__
+$v6 = @(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv6 |
+        Select-Object IPAddress, @{n='Origin';e={[string]$_.PrefixOrigin}})
+$v4s = @(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 | ForEach-Object { [string]$_.AddressState })
+[pscustomobject]@{
+  Status = [string]$a.Status
+  FullDuplex = $a.FullDuplex
+  Mac = $a.MacAddress
+  Desc = $a.InterfaceDescription
+  DhcpEnabled = $c.DHCPEnabled
+  DhcpServer = $c.DHCPServer
+  LeaseExpires = $exp
+  Gateway = @($c.DefaultIPGateway)
+  Dns = @($c.DNSServerSearchOrder)
+  Domain = $c.DNSDomain
+  GwMac = $gwmac
+  RxBcast = $s.ReceivedBroadcastPackets
+  RxMcast = $s.ReceivedMulticastPackets
+  V6 = $v6
+  V4State = $v4s
+} | ConvertTo-Json -Compress -Depth 4"""
+
+NEIGH_PS = r"""$ErrorActionPreference='SilentlyContinue'
+ConvertTo-Json -Compress -InputObject @(Get-NetNeighbor -InterfaceAlias __NAME__ -AddressFamily IPv4 |
+  Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -notmatch '^(00-00-00-00-00-00|FF-FF-FF-FF-FF-FF)$' -and [string]$_.State -ne 'Unreachable' } |
+  Select-Object IPAddress, LinkLayerAddress, @{n='State';e={[string]$_.State}})"""
+
+
+# ================================================================ shared state
+def new_ping():
+    return {"running": False, "kind": "gateway", "label": "Gateway", "target": None,
+            "rtts": collections.deque(maxlen=120), "log": collections.deque(maxlen=40),
+            "sent": 0, "recv": 0, "min": None, "max": None, "sum": 0.0, "jit": 0.0, "jn": 0,
+            "last": None}
+
+
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.adapters = []
+        self.sel = None
+        self.toast = None
+        self.toast_until = 0.0
+        self.ping = new_ping()
+        self.trace = {"running": False, "kind": "1.1.1.1", "label": "Cloudflare", "target": None,
+                      "hops": []}
+        self.speed = {"running": False, "mode": "", "down": None, "up": None, "lines": []}
+        self.arp_table = {"running": False, "rows": [], "ts": None}
+        self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
+                         "total": 0, "limited": False}
+        self.blink = {"running": False, "cycles": 0}
+        self.reset_adapter()
+
+    def reset_adapter(self):
+        now = time.time()
+        self.link = None
+        self.speed_mbps = 0
+        self.ipv4 = None
+        self.mask = None
+        self.mac = ""
+        self.d = {}
+        self.io = None
+        self.io_base = None
+        self.io_prev = None
+        self.rx_bps = 0.0
+        self.tx_bps = 0.0
+        self.drops = 0
+        self.link_up_at = None
+        self.ip_wait_from = None
+        self.time_to_ip = None
+        self.gw_ms = self.dns_ms = self.net_ms = PENDING
+        self.nb = {}
+        self.sniff_msg = "Starting…"
+        self.reset_l2(now)
+
+    def reset_l2(self, now):
+        self.l2_since = now
+        self.dot1x = None
+        self.stp = None
+        self.stp_tc_at = None
+        self.dtp = None
+        self.tagged = set()
+        self.dhcp_scan = None
+        self.dhcp_seen = {}
+        self.dhcp_ack = None
+        self.dup_mac = None
+        self.gw_mac = None
+        self.ra = None
+        self.bc_pps = None
+        self.mc_pps = None
+        self.bc_prev = None
+        self.eapol_sent = False
+        self.dhcp_done = False
+        self.dup_done = False
+        self.gw_arp_sent = False
+        self.last_announce = 0.0
+
+    def snapshot(self):
+        with self.lock:
+            return copy.deepcopy({k: v for k, v in self.__dict__.items() if k != "lock"})
+
+    def say(self, msg, secs=4):
+        with self.lock:
+            self.toast = msg
+            self.toast_until = time.time() + secs
+
+
+# ================================================================ summaries (UI + log)
+def good_ip(s):
+    ip = s["ipv4"]
+    return bool(ip) and not ip.startswith("169.254.")
+
+
+def sniff_ok(s):
+    return s["sniff_msg"] == "listening"
+
+
+def fmt_ms(v):
+    if v == PENDING or v is None:
+        return ""
+    return "<1 ms" if v < 1 else f"{v:.0f} ms"
+
+
+def sum_dot1x(s, now):
+    if not s["link"]:
+        return ("—", FG, "")
+    if not sniff_ok(s):
+        return ("Needs Npcap", WARN, "")
+    x = s["dot1x"]
+    el = now - s["l2_since"]
+    if x:
+        code, et = x.get("code"), x.get("eap_type", "")
+        if code == "Success":
+            return ("Authorized", OK, "EAP success")
+        if code == "Failure":
+            return ("AUTH FAILED", BAD, "EAP failure")
+        return ("ENABLED", WARN, f"EAP {code}" + (f" / {et}" if et else ""))
+    if el > 35:
+        return ("Not detected", OK, f"no EAP in {el:.0f}s")
+    return ("Listening…", DIM, f"{el:.0f}s")
+
+
+def sum_stp(s, now):
+    if not s["link"]:
+        return ("—", FG, "")
+    if not sniff_ok(s):
+        return ("Needs Npcap", WARN, "")
+    x = s["stp"]
+    el = now - s["l2_since"]
+    if x:
+        val = x.get("proto", "STP") + (f" · VLAN {x['vlan']}" if x.get("vlan") else "")
+        if s["stp_tc_at"] and now - s["stp_tc_at"] < 60:
+            return (val, WARN, "TOPOLOGY CHANGE")
+        if "root_mac" in x:
+            if x.get("cost") == 0:
+                return (val, FG, "this switch is root")
+            return (val, FG, f"root {x['root_prio']}·{x['root_mac'][-8:]}")
+        return (val, FG, "")
+    if el > 10:
+        return ("No BPDUs", DIM, "filtered?")
+    return ("Listening…", DIM, "")
+
+
+def sum_trunk(s, now):
+    if not s["link"]:
+        return ("—", FG, "")
+    if not sniff_ok(s):
+        return ("Needs Npcap", WARN, "")
+    tags = sorted(s["tagged"])
+    dtp = s["dtp"]
+    el = now - s["l2_since"]
+    if tags:
+        more = "…" if len(tags) > 6 else ""
+        return ("Tagged " + ",".join(map(str, tags[:6])) + more, BAD, "TRUNK PORT?")
+    if dtp:
+        if dtp.get("oper") == "trunk":
+            return ("TRUNK (DTP)", BAD, f"mode {dtp.get('admin')}")
+        return (f"DTP {dtp.get('admin')}", WARN, "nonegotiate off")
+    if el > 65:
+        return ("Access", OK, "no tags / DTP")
+    return ("Listening…", DIM, f"{el:.0f}s")
+
+
+def dhcp_servers(s):
+    servers = set()
+    sc = s["dhcp_scan"]
+    if sc:
+        servers |= set(sc["offers"])
+    servers |= {k for k, v in s["dhcp_seen"].items() if v.get("msg") in ("OFFER", "ACK")}
+    return sorted(servers)
+
+
+def sum_dhcp(s, now):
+    if not s["link"]:
+        return ("—", FG, "")
+    sc = s["dhcp_scan"]
+    servers = dhcp_servers(s)
+    if len(servers) > 1:
+        return (f"{len(servers)} SERVERS!", BAD, ", ".join(servers[:3]))
+    if not good_ip(s) and not sc:
+        return ("—", FG, "")
+    if not sc:
+        return ("Needs Npcap", WARN, "") if not sniff_ok(s) else ("Pending…", DIM, "")
+    if sc["status"] == "running":
+        return ("Testing…", DIM, "")
+    if len(servers) == 1:
+        return ("1 server", OK, servers[0])
+    return ("No offers", WARN, "server silent?")
+
+
+def phone_opts(s):
+    sc = s["dhcp_scan"]
+    if sc and sc["offers"]:
+        return next(iter(sc["offers"].values()))
+    return s["dhcp_ack"]
+
+
+def sum_phone(s):
+    o = phone_opts(s)
+    if not s["link"] or not o:
+        return ("—", FG, "")
+    if o.get("tftp_ips"):
+        return ("TFTP " + ", ".join(o["tftp_ips"][:2]), OK, "option 150")
+    if o.get("tftp_name"):
+        return ("TFTP " + o["tftp_name"], OK, "option 66")
+    if o.get("opt43"):
+        return ("Option 43 set", FG, o["opt43"][:16])
+    return ("None", DIM, "no 66 / 150 / 43")
+
+
+def gw_mac_of(s):
+    return N.norm_mac(s["gw_mac"] or s["d"].get("GwMac") or "")
+
+
+def sum_gw(s, oui):
+    mac = gw_mac_of(s)
+    if not s["link"] or not mac:
+        return ("—", FG, "")
+    return (mac, FG, oui.lookup(mac) if oui else "")
+
+
+def sum_v6(s, now):
+    if not s["link"]:
+        return ("—", FG, "")
+    v6 = [a for a in N.as_list(s["d"].get("V6")) if isinstance(a, dict) and a.get("IPAddress")]
+    glob = [a for a in v6 if not str(a["IPAddress"]).lower().startswith("fe80")]
+    ra = s["ra"]
+    if ra:
+        flags = "".join(f for f, on in (("M", ra.get("m")), ("O", ra.get("o"))) if on)
+        note = "RA" + (f" {flags}" if flags else "") + (f" {ra['prefixes'][0]}" if ra.get("prefixes") else "")
+    else:
+        note = "no RA" if now - s["l2_since"] > 30 else ""
+    if glob:
+        origin = {"RouterAdvertisement": "SLAAC", "Dhcp": "DHCPv6"}.get(glob[0].get("Origin"), "")
+        return (glob[0]["IPAddress"], OK, note or origin)
+    if v6:
+        return ("Link-local only", DIM, note)
+    return ("—", FG, note)
+
+
+def sum_bcast(s):
+    if not s["link"] or s["bc_pps"] is None:
+        return ("—", FG, "")
+    bc, mc = s["bc_pps"], s["mc_pps"] or 0
+    color = BAD if bc > 500 else WARN if bc > 100 else OK
+    return (f"{bc:.0f} bcast/s", color, f"{mc:.0f} mcast/s")
+
+
+def build_record(s, oui, label=""):
+    now = time.time()
+    nb = N.merge_neighbors(s["nb"])
+    d = s["d"]
+    pl = N.prefix_len(s["mask"]) if s["mask"] else None
+    srv = d.get("DhcpServer")
+    srv = srv if N.is_ipv4(srv) and srv != "255.255.255.255" else ""
+    net = s["net_ms"]
+    adapter = next((a for a in s["adapters"] if a["name"] == s["sel"]), {})
+    sc = s["dhcp_scan"]
+    return {
+        "label": label,
+        "switch": nb.get("name") or nb.get("chassis") or "",
+        "port": nb.get("port", ""),
+        "vlan": nb.get("vlan", ""),
+        "voice_vlan": nb.get("voice_vlan", ""),
+        "mgmt_ip": nb.get("mgmt_ip", ""),
+        "model": nb.get("platform", ""),
+        "poe": nb.get("poe", ""),
+        "speed": N.fmt_speed(s["speed_mbps"]) if s["link"] else "no link",
+        "duplex": {True: "full", False: "half"}.get(d.get("FullDuplex"), ""),
+        "ip": (f"{s['ipv4']}/{pl}" if pl else s["ipv4"]) if s["ipv4"] else "",
+        "gateway": N.first_v4(d.get("Gateway")) or "",
+        "gw_ms": fmt_ms(s["gw_ms"]),
+        "gw_mac": gw_mac_of(s),
+        "dhcp_server": srv,
+        "dhcp_servers": len(dhcp_servers(s)) if sc and sc["status"] == "done" else "",
+        "dns": ", ".join(x for x in N.as_list(d.get("Dns")) if N.is_ipv4(x)),
+        "internet": "" if net == PENDING else ("ok" if net is not None else "fail"),
+        "time_to_ip": f"{s['time_to_ip']:.1f}" if s["time_to_ip"] is not None else "",
+        "dot1x": sum_dot1x(s, now)[0],
+        "stp": " ".join(x for x in sum_stp(s, now)[::2] if x),
+        "dtp": sum_trunk(s, now)[0],
+        "tagged_vlans": ",".join(map(str, sorted(s["tagged"]))),
+        "ipv6": sum_v6(s, now)[0],
+        "pc_mac": s["mac"],
+        "adapter": adapter.get("desc") or s["sel"] or "",
+    }
+
+
+SIG_FIELDS = ("switch", "port", "vlan", "voice_vlan", "speed", "duplex", "ip", "dhcp_server",
+              "internet", "dot1x", "dtp", "dhcp_servers", "poe")
+
+
+# ================================================================ backend
+class Backend:
+    def __init__(self, st, settings, portlog, oui, mdns):
+        self.st, self.settings, self.portlog, self.oui, self.mdns = st, settings, portlog, oui, mdns
+        self.kick = threading.Event()
+        self.sniffer = None
+        self.sniff_gen = 0
+        self.l2sock = None
+        self.send_lock = threading.Lock()
+        self.stops = {}
+        self.last_sig = None
+        self.last_log = 0.0
+        self.oui_tried = False
+
+    # ---------------------------------------------------------- lifecycle
+    def start(self):
+        self.recover_blink()
+        self.load_adapters()
+        for fn in (self.fast_loop, self.detail_loop, self.health_loop, self.probe_loop):
+            threading.Thread(target=fn, daemon=True).start()
+        self.restart_sniffer()
+
+    def shutdown(self):
+        ev = self.stops.get("blink")
+        if ev and not ev.is_set():
+            ev.set()
+            with self.st.lock:
+                name = self.st.sel
+            if name:
+                self._set_admin(name, True)
+        try:
+            if self.sniffer:
+                self.sniffer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def recover_blink(self):
+        lock = os.path.join(DATA_DIR, "blink.lock")
+        if os.path.exists(lock):
+            try:
+                with open(lock, encoding="utf-8") as f:
+                    name = f.read().strip()
+                if name:
+                    self._set_admin(name, True)
+                os.remove(lock)
+            except OSError:
+                pass
+
+    def load_adapters(self):
+        lst = []
+        if IS_WIN:
+            for a in N.as_list(N.ps_json(ADAPTERS_PS)):
+                if a and a.get("Name"):
+                    lst.append({"name": a["Name"], "desc": a.get("InterfaceDescription") or "",
+                                "mac": N.norm_mac(a.get("MacAddress")), "up": a.get("Status") == "Up"})
+        if not lst and psutil:
+            for n, s in psutil.net_if_stats().items():
+                if n.startswith(("Ethernet", "eth", "en")):
+                    lst.append({"name": n, "desc": "", "mac": "", "up": s.isup})
+        lst.sort(key=lambda a: (not a["up"], a["name"]))
+        st = self.st
+        with st.lock:
+            st.adapters = lst
+            names = [a["name"] for a in lst]
+            changed = st.sel not in names
+            if changed:
+                st.sel = names[0] if names else None
+                st.reset_adapter()
+        if changed:
+            self.restart_sniffer()
+
+    def my_mac(self):
+        """Call with st.lock held."""
+        st = self.st
+        for a in st.adapters:
+            if a["name"] == st.sel and a["mac"]:
+                return a["mac"]
+        return st.mac
+
+    # ---------------------------------------------------------- fast loop (psutil, 1 s)
+    def fast_loop(self):
+        while True:
+            try:
+                self.fast_tick()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1)
+
+    def fast_tick(self):
+        st = self.st
+        name = st.sel
+        if not name or not psutil:
+            return
+        stats = psutil.net_if_stats().get(name)
+        up = bool(stats and stats.isup)
+        speed = stats.speed if stats else 0
+        ip = mask = mac = None
+        for a in psutil.net_if_addrs().get(name, []):
+            if a.family == socket.AF_INET:
+                if ip is None or ip.startswith("169.254."):
+                    ip, mask = a.address, a.netmask
+            elif a.family == psutil.AF_LINK:
+                mac = N.norm_mac(a.address)
+        io = psutil.net_io_counters(pernic=True).get(name)
+        now = time.time()
+        came_up = changed = False
+        with st.lock:
+            if name != st.sel:
+                return
+            if st.link is not None and up != st.link:
+                changed = True
+                if up:
+                    came_up = True
+                    st.link_up_at = st.ip_wait_from = now
+                    st.time_to_ip = None
+                elif not st.blink["running"]:
+                    st.drops += 1
+                st.nb = {}
+                st.gw_ms = st.dns_ms = st.net_ms = PENDING
+                st.reset_l2(now)
+            st.link = up
+            st.speed_mbps = speed if up else 0
+            st.ipv4 = ip if up else None
+            st.mask = mask if up else None
+            if mac:
+                st.mac = mac
+            if (up and ip and not ip.startswith("169.254.")
+                    and st.ip_wait_from and st.time_to_ip is None):
+                st.time_to_ip = now - st.ip_wait_from
+                st.ip_wait_from = None
+            if io:
+                if st.io_base is None:
+                    st.io_base = io
+                if st.io_prev:
+                    pio, pt = st.io_prev
+                    dt = max(now - pt, 0.1)
+                    st.rx_bps = max(io.bytes_recv - pio.bytes_recv, 0) * 8 / dt
+                    st.tx_bps = max(io.bytes_sent - pio.bytes_sent, 0) * 8 / dt
+                st.io_prev = (io, now)
+                st.io = io
+        if changed:
+            self.kick.set()
+        if came_up:
+            self.restart_sniffer()
+
+    # ---------------------------------------------------------- detail loop (PowerShell, ~3 s)
+    def detail_loop(self):
+        n = 0
+        while True:
+            self.kick.wait(3)
+            self.kick.clear()
+            n += 1
+            try:
+                if n % 10 == 0:
+                    self.load_adapters()
+                self.detail_tick()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def detail_tick(self):
+        if not IS_WIN:
+            return
+        name = self.st.sel
+        if not name:
+            return
+        data = N.ps_json(DETAIL_PS.replace("__NAME__", N.psq(name)))
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        st = self.st
+        with st.lock:
+            if st.sel != name:
+                return
+            st.d = data
+            bc, mc = data.get("RxBcast"), data.get("RxMcast")
+            if isinstance(bc, (int, float)) and isinstance(mc, (int, float)):
+                if st.bc_prev:
+                    pbc, pmc, pt = st.bc_prev
+                    dt = max(now - pt, 0.5)
+                    st.bc_pps = max(bc - pbc, 0) / dt
+                    st.mc_pps = max(mc - pmc, 0) / dt
+                st.bc_prev = (bc, mc, now)
+            if "Duplicate" in N.as_list(data.get("V4State")) and not st.dup_mac:
+                st.dup_mac = "(flagged by Windows)"
+
+    # ---------------------------------------------------------- health loop (gateway / DNS / internet)
+    def health_loop(self):
+        while True:
+            try:
+                self.health_tick()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(4)
+
+    def health_tick(self):
+        st = self.st
+        with st.lock:
+            name, up, ip = st.sel, st.link, st.ipv4
+            gw = N.first_v4(st.d.get("Gateway"))
+            dns = N.first_v4(st.d.get("Dns"))
+        sn = self.sniffer
+        if sn is not None and not getattr(sn, "running", True):
+            with st.lock:
+                st.sniff_msg = "Capture stopped — is Npcap installed?"
+        if not up or not ip or ip.startswith("169.254."):
+            return
+        gw_ms = self.echo_ms(gw, ip) if gw else PENDING
+        dns_ms = N.dns_probe(dns, ip) if dns else PENDING
+        net_ms = N.tcp_probe("1.1.1.1", 443, ip)
+        if net_ms is None:
+            net_ms = N.tcp_probe("8.8.8.8", 443, ip)
+        with st.lock:
+            if st.sel == name and st.link:
+                st.gw_ms, st.dns_ms, st.net_ms = gw_ms, dns_ms, net_ms
+        if net_ms is not None and not self.oui.available() and not self.oui_tried:
+            self.oui_tried = True
+            threading.Thread(target=self.update_oui, args=(True,), daemon=True).start()
+
+    # ---------------------------------------------------------- active probes + auto-log (2 s)
+    def probe_loop(self):
+        while True:
+            try:
+                self.probe_tick()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.maybe_autolog()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+
+    def probe_tick(self):
+        st = self.st
+        now = time.time()
+        actions = []
+        with st.lock:
+            if not st.link or self.l2sock is None or st.blink["running"]:
+                return
+            mac, ip, sel = self.my_mac(), st.ipv4, st.sel
+            ok_ip = bool(ip) and not ip.startswith("169.254.")
+            gw = N.first_v4(st.d.get("Gateway"))
+            if not mac:
+                return
+            if not st.eapol_sent and now - st.l2_since > 2:
+                st.eapol_sent = True
+                actions.append(("eapol",))
+            if ok_ip and not st.dhcp_done:
+                st.dhcp_done = True
+                actions.append(("dhcp",))
+            if ok_ip and not st.dup_done:
+                st.dup_done = True
+                actions.append(("dup",))
+            if ok_ip and gw and not st.gw_mac and not st.gw_arp_sent:
+                st.gw_arp_sent = True
+                actions.append(("gwarp", gw))
+            if self.settings.get("announce") and now - st.last_announce > 30:
+                st.last_announce = now
+                actions.append(("announce",))
+        for a in actions:
+            if a[0] == "eapol":
+                self.send(N.build_eapol_start(mac))
+            elif a[0] == "dhcp":
+                threading.Thread(target=self.run_dhcp_check, daemon=True).start()
+            elif a[0] == "dup":
+                self.send(N.build_arp_request(mac, None, ip))
+                time.sleep(0.3)
+                self.send(N.build_arp_request(mac, None, ip))
+            elif a[0] == "gwarp":
+                self.send(N.build_arp_request(mac, ip, a[1]))
+            elif a[0] == "announce":
+                host = self.hostname()
+                self.send(N.build_lldp(mac, sel, host, ip=ip if ok_ip else None))
+                self.send(N.build_cdp(mac, host, sel, ip if ok_ip else None))
+
+    def hostname(self):
+        return self.settings.get("hostname") or f"PortCheck-{socket.gethostname()}"
+
+    def run_dhcp_check(self):
+        st = self.st
+        with st.lock:
+            mac = self.my_mac()
+            xid = random.getrandbits(32)
+            st.dhcp_scan = {"xid": xid, "status": "running", "offers": {}, "ts": time.time()}
+        frame = N.build_dhcp_discover(mac, xid)
+        self.send(frame)
+        time.sleep(1.5)
+        self.send(frame)
+        time.sleep(3.5)
+        with st.lock:
+            if st.dhcp_scan and st.dhcp_scan["xid"] == xid:
+                st.dhcp_scan["status"] = "done"
+
+    def rerun_checks(self):
+        with self.st.lock:
+            self.st.reset_l2(time.time())
+            self.st.nb = {}
+        self.restart_sniffer()
+        self.st.say("Re-running L2 checks…", 3)
+
+    def maybe_autolog(self):
+        if not self.settings.get("autolog"):
+            return
+        s = self.st.snapshot()
+        now = time.time()
+        if not s["link"] or s["blink"]["running"]:
+            return
+        if s["gw_ms"] == PENDING and now - s["l2_since"] < 25:
+            return
+        rec = build_record(s, self.oui)
+        if not rec["switch"] or not rec["port"]:
+            return
+        sig = tuple(rec[k] for k in SIG_FIELDS)
+        if sig == self.last_sig and now - self.last_log < 600:
+            return
+        if sig != self.last_sig and now - self.last_log < 10:
+            return
+        self.last_sig, self.last_log = sig, now
+        new, err = self.portlog.upsert(rec)
+        if err:
+            self.st.say(err, 5)
+        elif new:
+            self.st.say(f"Logged new port: {rec['switch']} {rec['port']}", 4)
+
+    def save(self, label):
+        s = self.st.snapshot()
+        rec = build_record(s, self.oui, label)
+        _, err = self.portlog.upsert(rec, manual=True)
+        where = f"{rec['switch']} {rec['port']}".strip() or "this port"
+        self.st.say(err or f"Saved {where}" + (f" — {label}" if label else ""), 4)
+
+    # ---------------------------------------------------------- capture (scapy + Npcap)
+    def restart_sniffer(self):
+        self.sniff_gen += 1
+        old, oldsock = self.sniffer, self.l2sock
+        self.sniffer = self.l2sock = None
+        threading.Thread(target=self._sniff_start, args=(self.sniff_gen, old, oldsock),
+                         daemon=True).start()
+
+    def _set_sniff(self, gen, msg):
+        with self.st.lock:
+            if gen == self.sniff_gen:
+                self.st.sniff_msg = msg
+
+    def _sniff_start(self, gen, old, oldsock):
+        for obj, meth in ((old, "stop"), (oldsock, "close")):
+            if obj is not None:
+                try:
+                    getattr(obj, meth)()
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            from scapy.all import AsyncSniffer, conf
+            from scapy.layers.l2 import Ether
+        except Exception:  # noqa: BLE001
+            self._set_sniff(gen, "Capture off — run: py -m pip install scapy")
+            return
+        if IS_WIN and not getattr(conf, "use_pcap", False):
+            self._set_sniff(gen, "Capture off — install Npcap (npcap.com)")
+            return
+        try:
+            conf.layers.filter([Ether])      # we decode raw bytes ourselves; keeps scapy fast
+        except Exception:  # noqa: BLE001
+            pass
+        with self.st.lock:
+            name, mac = self.st.sel, self.my_mac()
+        if not name:
+            return
+        iface = None
+        try:
+            for i in conf.ifaces.values():
+                if mac and N.norm_mac(getattr(i, "mac", "")) == mac:
+                    iface = i
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if iface is None:
+            iface = name
+        try:
+            sn = AsyncSniffer(iface=iface, filter=N.BPF, store=False,
+                              prn=lambda pkt, g=gen: self._on_frame(g, bytes(pkt)))
+            sn.start()
+        except Exception as e:  # noqa: BLE001
+            self._set_sniff(gen, f"Capture error: {e}"[:80])
+            return
+        sock = None
+        try:
+            sock = conf.L2socket(iface=iface)
+        except Exception:  # noqa: BLE001
+            pass
+        if gen != self.sniff_gen:
+            for obj, meth in ((sn, "stop"), (sock, "close")):
+                try:
+                    if obj is not None:
+                        getattr(obj, meth)()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        self.sniffer, self.l2sock = sn, sock
+        self._set_sniff(gen, "listening")
+
+    def send(self, frame):
+        sock = self.l2sock
+        if sock is None:
+            return False
+        try:
+            from scapy.packet import Raw
+            with self.send_lock:
+                sock.send(Raw(load=frame))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_frame(self, gen, raw):
+        try:
+            evs = N.classify(raw)
+        except Exception:  # noqa: BLE001
+            return
+        if not evs:
+            return
+        now = time.time()
+        st = self.st
+        mdns_msgs = []
+        with st.lock:
+            if gen != self.sniff_gen:
+                return
+            my = self.my_mac()
+            for kind, info in evs:
+                if kind == "MDNS":
+                    mdns_msgs.append(info)
+                else:
+                    try:
+                        self._handle(kind, info, now, my)
+                    except Exception:  # noqa: BLE001
+                        pass
+        for m in mdns_msgs:
+            self.mdns.ingest(m, m.get("ip_src"), multicast=m.get("ip_dst") in ("224.0.0.251", "ff02::fb"))
+
+    def _handle(self, kind, info, now, my):
+        """Runs with st.lock held."""
+        st = self.st
+        src = info.get("src")
+        if kind == "VLAN":
+            if src != my:
+                st.tagged.add(info["vlan"])
+            return
+        if src == my and kind in ("CDP", "LLDP", "EAPOL", "DTP", "STP"):
+            return                                      # our own announcements / probes
+        if kind in ("CDP", "LLDP"):
+            st.nb[kind] = (info, now)
+        elif kind == "DTP":
+            st.dtp = dict(info, ts=now)
+        elif kind == "STP":
+            if not info.get("tcn") or not st.stp:
+                st.stp = dict(info, ts=now)
+            if info.get("tc") or info.get("tcn"):
+                st.stp_tc_at = now
+        elif kind == "EAPOL":
+            if info.get("code") in ("Request", "Success", "Failure"):
+                st.dot1x = dict(info, ts=now)
+        elif kind == "ARP":
+            self._on_arp(info, now, my)
+        elif kind == "DHCP":
+            self._on_dhcp(info, now, my)
+        elif kind == "RA":
+            st.ra = dict(info, ts=now)
+
+    def _on_arp(self, a, now, my):
+        st = self.st
+        ip = st.ipv4
+        if (ip and a["spa"] == ip and a["sha"] != my and a["sha"] != "00:00:00:00:00:00"):
+            st.dup_mac = a["sha"]
+        gw = N.first_v4(st.d.get("Gateway"))
+        if gw and a["spa"] == gw:
+            st.gw_mac = a["sha"]
+        sc = st.arp_scan
+        if sc["range"] and a["spa"] != "0.0.0.0":
+            net, mask = sc["range"]
+            try:
+                v = N.u32(socket.inet_aton(a["spa"]), 0)
+            except OSError:
+                return
+            if v & mask == net:
+                macs = sc["found"].setdefault(a["spa"], [])
+                if a["sha"] not in macs:
+                    macs.append(a["sha"])
+
+    def _on_dhcp(self, d, now, my):
+        st = self.st
+        if d["op"] != 2:
+            return
+        srv = d.get("server") or d.get("ip_src")
+        st.dhcp_seen[srv] = {"mac": d.get("src"), "ts": now, "msg": d.get("msg")}
+        sc = st.dhcp_scan
+        if sc and d["xid"] == sc["xid"] and d["msg"] == "OFFER":
+            sc["offers"][srv] = d
+        if d.get("chaddr") == my and d.get("msg") == "ACK":
+            st.dhcp_ack = d
+
+    # ---------------------------------------------------------- primitives (overridden in demo)
+    def echo(self, dst, src, ttl=128, timeout_ms=1000):
+        return N.icmp_echo(dst, src, ttl=ttl, timeout_ms=timeout_ms)
+
+    def echo_ms(self, dst, src):
+        status, _, rtt = self.echo(dst, src)
+        return rtt if status == "ok" else None
+
+    def _set_admin(self, name, enabled):
+        if IS_WIN:
+            N.run(f'netsh interface set interface name="{name}" admin={"enabled" if enabled else "disabled"}', 20)
+
+    def _arp_table(self, name):
+        rows = []
+        for r in N.as_list(N.ps_json(NEIGH_PS.replace("__NAME__", N.psq(name)))):
+            ip = r.get("IPAddress", "")
+            if not N.is_ipv4(ip) or 224 <= int(ip.split(".")[0]) <= 239:
+                continue
+            rows.append((ip, N.norm_mac(r.get("LinkLayerAddress")), r.get("State", "")))
+        return rows
+
+    def _iperf(self, exe, server, src, reverse):
+        return N.run_iperf(exe, server, src, reverse=reverse, port=int(self.settings.get("iperf_port") or 5201))
+
+    def _http(self, src, which):
+        return N.http_download(src) if which == "down" else N.http_upload(src)
+
+    def _mdns_scan(self, src):
+        self.mdns.scan(src)
+
+    # ---------------------------------------------------------- simple actions
+    def next_adapter(self):
+        st = self.st
+        with st.lock:
+            names = [a["name"] for a in st.adapters]
+            if len(names) < 2:
+                st.toast, st.toast_until = "Only one Ethernet adapter found", time.time() + 3
+                return
+            st.sel = names[(names.index(st.sel) + 1) % len(names)] if st.sel in names else names[0]
+            st.reset_adapter()
+            st.toast, st.toast_until = f"Switched to {st.sel}", time.time() + 3
+        self.mdns.reset()
+        self.kick.set()
+        self.restart_sniffer()
+
+    def reset_counters(self):
+        with self.st.lock:
+            self.st.io_base = self.st.io
+            self.st.drops = 0
+        self.st.say("Counters reset", 2)
+
+    def renew(self):
+        threading.Thread(target=self._renew, daemon=True).start()
+
+    def _renew(self):
+        name = self.st.sel
+        if not name:
+            return
+        self.st.say("Releasing DHCP lease…", 30)
+        N.run(["ipconfig", "/release", name], 30)
+        with self.st.lock:
+            self.st.ip_wait_from = time.time()
+            self.st.time_to_ip = None
+            self.st.gw_ms = self.st.dns_ms = self.st.net_ms = PENDING
+            self.st.dhcp_done = False
+        self.st.say("Requesting new address…", 45)
+        code, _, _ = N.run(["ipconfig", "/renew", name], 45)
+        self.kick.set()
+        if code == 0:
+            self.st.say("DHCP renew done", 3)
+        else:
+            self.st.say("Renew failed — " + ("needs admin" if not N.is_admin() else "no DHCP reply"), 5)
+
+    def bounce(self):
+        threading.Thread(target=self._bounce, daemon=True).start()
+
+    def _bounce(self):
+        name = self.st.sel
+        if not name:
+            return
+        if not N.is_admin():
+            self.st.say("Bounce needs admin", 5)
+            return
+        self.st.say("Bouncing link…", 15)
+        N.powershell(f"Restart-NetAdapter -Name {N.psq(name)} -Confirm:$false", 30)
+        self.kick.set()
+
+    def update_oui(self, quiet=False):
+        try:
+            n = self.oui.download()
+            if not quiet:
+                self.st.say(f"Vendor list updated ({n:,} vendors)", 4)
+        except Exception as e:  # noqa: BLE001
+            if not quiet:
+                self.st.say(f"Vendor download failed: {e}"[:70], 5)
+
+    # ---------------------------------------------------------- tool targets
+    def resolve(self, kind):
+        with self.st.lock:
+            d = self.st.d
+            src = self.st.ipv4
+            if kind == "gateway":
+                tgt = N.first_v4(d.get("Gateway"))
+            elif kind == "dns":
+                tgt = N.first_v4(d.get("Dns"))
+            elif kind == "switch":
+                tgt = N.merge_neighbors(self.st.nb).get("mgmt_ip")
+            else:
+                tgt = kind
+        if src and src.startswith("169.254."):
+            src = None
+        return tgt, src
+
+    def _new_stop(self, name):
+        old = self.stops.get(name)
+        if old:
+            old.set()
+        ev = threading.Event()
+        self.stops[name] = ev
+        return ev
+
+    # ---------------------------------------------------------- ping
+    def ping_toggle(self):
+        with self.st.lock:
+            running = self.st.ping["running"]
+        if running:
+            self.stops["ping"].set()
+            return
+        ev = self._new_stop("ping")
+        threading.Thread(target=self._ping_loop, args=(ev,), daemon=True).start()
+
+    def ping_next_target(self):
+        with self.st.lock:
+            p = self.st.ping
+            kinds = [k for k, _ in PING_TARGETS]
+            i = (kinds.index(p["kind"]) + 1) % len(kinds) if p["kind"] in kinds else 0
+            running = p["running"]
+            fresh = new_ping()
+            fresh["kind"], fresh["label"], fresh["running"] = PING_TARGETS[i][0], PING_TARGETS[i][1], running
+            self.st.ping = fresh
+
+    def _ping_loop(self, ev):
+        st = self.st
+        with st.lock:
+            st.ping["running"] = True
+        try:
+            while not ev.is_set():
+                t0 = time.time()
+                with st.lock:
+                    kind = st.ping["kind"]
+                tgt, src = self.resolve(kind)
+                if not tgt:
+                    with st.lock:
+                        st.ping["target"] = None
+                    ev.wait(1)
+                    continue
+                status, _, rtt = self.echo(tgt, src, timeout_ms=1000)
+                with st.lock:
+                    p = st.ping
+                    if p["kind"] != kind:
+                        continue
+                    p["target"] = tgt
+                    p["sent"] += 1
+                    if status == "ok":
+                        p["recv"] += 1
+                        p["rtts"].append(rtt)
+                        p["min"] = rtt if p["min"] is None else min(p["min"], rtt)
+                        p["max"] = rtt if p["max"] is None else max(p["max"], rtt)
+                        p["sum"] += rtt
+                        if p["last"] is not None:
+                            p["jit"] += abs(rtt - p["last"])
+                            p["jn"] += 1
+                        p["last"] = rtt
+                        p["log"].appendleft((f"#{p['sent']}  reply  {fmt_ms(rtt)}", OK))
+                    else:
+                        p["rtts"].append(None)
+                        p["log"].appendleft((f"#{p['sent']}  {status}", BAD))
+                ev.wait(max(0.0, 0.25 - (time.time() - t0)))
+        finally:
+            with st.lock:
+                st.ping["running"] = False
+
+    # ---------------------------------------------------------- traceroute
+    def trace_next_target(self):
+        with self.st.lock:
+            t = self.st.trace
+            if t["running"]:
+                return
+            kinds = [k for k, _ in TRACE_TARGETS]
+            i = (kinds.index(t["kind"]) + 1) % len(kinds) if t["kind"] in kinds else 0
+            t["kind"], t["label"], t["hops"], t["target"] = TRACE_TARGETS[i][0], TRACE_TARGETS[i][1], [], None
+
+    def trace_toggle(self):
+        with self.st.lock:
+            running = self.st.trace["running"]
+        if running:
+            self.stops["trace"].set()
+            return
+        ev = self._new_stop("trace")
+        threading.Thread(target=self._trace, args=(ev,), daemon=True).start()
+
+    def _trace(self, ev):
+        st = self.st
+        with st.lock:
+            kind = st.trace["kind"]
+            st.trace.update(running=True, hops=[])
+        tgt, src = self.resolve(kind)
+        try:
+            if not tgt:
+                with st.lock:
+                    st.trace["hops"] = [(0, None, None, "no target yet")]
+                return
+            with st.lock:
+                st.trace["target"] = tgt
+            for ttl in range(1, 21):
+                if ev.is_set():
+                    break
+                status, ip, rtt = self.echo(tgt, src, ttl=ttl, timeout_ms=1000)
+                with st.lock:
+                    st.trace["hops"] = st.trace["hops"] + [(ttl, ip, rtt, status)]
+                if status in ("ok", "unreach"):
+                    break
+        finally:
+            with st.lock:
+                st.trace["running"] = False
+
+    # ---------------------------------------------------------- speed tests
+    def speed_iperf(self):
+        server = (self.settings.get("iperf_server") or "").strip()
+        if not server:
+            self.st.say("Set the iperf3 server in Tools › Settings first", 5)
+            return
+        exe = N.find_iperf([SCRIPT_DIR, DATA_DIR])
+        if not exe and not DEMO:
+            with self.st.lock:
+                self.st.speed = {"running": False, "mode": "iperf3", "down": None, "up": None,
+                                 "lines": [("iperf3.exe not found.", BAD),
+                                           ("Download iperf3 for Windows and put iperf3.exe in:", FG),
+                                           (SCRIPT_DIR, HDR)]}
+            return
+        self._speed_run("iperf3", lambda src, rev: self._iperf(exe, server, src, rev), server)
+
+    def speed_http(self):
+        def one(src, rev):
+            try:
+                return self._http(src, "down" if rev else "up"), None, None
+            except Exception as e:  # noqa: BLE001
+                return None, None, str(e)[:90]
+        self._speed_run("internet", one, N.SPEED_HOST)
+
+    def _speed_run(self, mode, fn, server):
+        with self.st.lock:
+            if self.st.speed["running"]:
+                return
+            self.st.speed = {"running": True, "mode": mode, "down": None, "up": None,
+                             "lines": [(f"{mode} test against {server}", HDR)]}
+
+        def work():
+            _, src = self.resolve("gateway")
+            for rev, key, label in ((True, "down", "Download"), (False, "up", "Upload")):
+                with self.st.lock:
+                    self.st.speed["lines"].append((f"{label}…", DIM))
+                bps, retr, err = fn(src, rev)
+                with self.st.lock:
+                    sp = self.st.speed
+                    if err:
+                        sp["lines"].append((f"{label} failed: {err}", BAD))
+                    else:
+                        sp[key] = bps
+                        extra = f"  ({retr} retransmits)" if retr else ""
+                        sp["lines"].append((f"{label}: {N.fmt_mbps(bps)}{extra}", OK))
+            with self.st.lock:
+                self.st.speed["running"] = False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------------------------------------------------- ARP
+    def arp_refresh(self):
+        with self.st.lock:
+            name = self.st.sel
+            if self.st.arp_table["running"] or not name:
+                return
+            self.st.arp_table["running"] = True
+
+        def work():
+            rows = []
+            try:
+                rows = self._arp_table(name)
+            finally:
+                rows.sort(key=lambda r: N.u32(socket.inet_aton(r[0]), 0))
+                with self.st.lock:
+                    self.st.arp_table = {"running": False, "rows": rows, "ts": time.time()}
+        threading.Thread(target=work, daemon=True).start()
+
+    def arp_scan_toggle(self):
+        with self.st.lock:
+            sc = self.st.arp_scan
+            if sc["running"]:
+                self.stops["arpscan"].set()
+                return
+            ip, mask, mac = self.st.ipv4, self.st.mask, self.my_mac()
+        if not ip or not mask or ip.startswith("169.254."):
+            self.st.say("Need an IP address to scan", 3)
+            return
+        if self.l2sock is None:
+            self.st.say("ARP scan needs Npcap", 4)
+            return
+        ev = self._new_stop("arpscan")
+        threading.Thread(target=self._arp_scan, args=(ev, ip, mask, mac), daemon=True).start()
+
+    def _arp_scan(self, ev, ip, mask, mac):
+        net, hosts, limited = N.scan_hosts(ip, mask)
+        with self.st.lock:
+            self.st.arp_scan = {"running": True, "net": str(net), "limited": limited,
+                                "range": (int(net.network_address), int(net.netmask)),
+                                "found": {ip: [mac]}, "sent": 0, "total": len(hosts)}
+        try:
+            for rnd in range(2):
+                for i, h in enumerate(hosts):
+                    if ev.is_set():
+                        return
+                    if rnd == 1:
+                        with self.st.lock:
+                            if h in self.st.arp_scan["found"]:
+                                continue
+                    self.send(N.build_arp_request(mac, ip, h))
+                    if i % 16 == 0:
+                        with self.st.lock:
+                            self.st.arp_scan["sent"] = i + rnd * len(hosts)
+                    time.sleep(0.004)
+                ev.wait(1.5)
+            ev.wait(1.5)
+        finally:
+            with self.st.lock:
+                self.st.arp_scan["running"] = False
+                self.st.arp_scan["sent"] = self.st.arp_scan["total"]
+
+    # ---------------------------------------------------------- mDNS
+    def mdns_scan(self):
+        if self.mdns.snapshot()["running"]:
+            return
+        _, src = self.resolve("gateway")
+        if not src:
+            self.st.say("Need an IP address for mDNS", 3)
+            return
+        threading.Thread(target=self._mdns_scan, args=(src,), daemon=True).start()
+
+    # ---------------------------------------------------------- port finder
+    def blink_toggle(self):
+        with self.st.lock:
+            running, name = self.st.blink["running"], self.st.sel
+        if running:
+            self.stops["blink"].set()
+            return
+        if not name:
+            return
+        if not N.is_admin():
+            self.st.say("Port finder needs admin", 4)
+            return
+        ev = self._new_stop("blink")
+        threading.Thread(target=self._blink, args=(ev, name), daemon=True).start()
+
+    def _blink(self, ev, name):
+        lock = os.path.join(DATA_DIR, "blink.lock")
+        try:
+            with open(lock, "w", encoding="utf-8") as f:
+                f.write(name)
+        except OSError:
+            pass
+        with self.st.lock:
+            self.st.blink = {"running": True, "cycles": 0}
+        try:
+            while not ev.is_set():
+                self._set_admin(name, False)
+                ev.wait(1.5)
+                self._set_admin(name, True)
+                with self.st.lock:
+                    self.st.blink["cycles"] += 1
+                ev.wait(3.0)
+        finally:
+            self._set_admin(name, True)
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+            with self.st.lock:
+                self.st.blink["running"] = False
+
+
+# ================================================================ demo backend
+class DemoBackend(Backend):
+    """Fake data so every screen can be previewed without a switch."""
+
+    def start(self):
+        st = self.st
+        with st.lock:
+            st.adapters = [{"name": "Ethernet", "desc": "Realtek PCIe GbE Family Controller",
+                            "mac": "00:e0:4c:68:12:9a", "up": True},
+                           {"name": "Ethernet 2", "desc": "ASIX USB 2.5G Ethernet",
+                            "mac": "00:0e:c6:aa:41:07", "up": False}]
+            st.sel = "Ethernet"
+            st.mac = "00:e0:4c:68:12:9a"
+            st.sniff_msg = "listening"
+        self.l2sock = object()
+        threading.Thread(target=self.loop, daemon=True).start()
+        threading.Thread(target=self.probe_loop, daemon=True).start()
+
+    def send(self, frame):
+        return True
+
+    def loop(self):
+        t0 = time.time()
+        while True:
+            t = time.time() - t0
+            st = self.st
+            with st.lock:
+                if t < 2:
+                    st.link = False
+                elif t < 5:
+                    if not st.link:
+                        st.link_up_at = st.ip_wait_from = time.time()
+                        st.l2_since = time.time() - 70
+                    st.link, st.speed_mbps = True, 1000
+                    st.d = {"FullDuplex": True, "DhcpEnabled": True}
+                else:
+                    st.link, st.speed_mbps = True, 1000
+                    st.ipv4, st.mask = "10.20.30.147", "255.255.255.0"
+                    if st.time_to_ip is None:
+                        st.time_to_ip, st.ip_wait_from = 2.8, None
+                    st.d = {"FullDuplex": True, "DhcpEnabled": True, "DhcpServer": "10.20.1.10",
+                            "LeaseExpires": "Oct 10 4:52 PM", "Gateway": ["10.20.30.1"],
+                            "Dns": ["10.20.1.10", "10.20.1.11"], "GwMac": "00-00-0C-07-AC-1E",
+                            "V6": [{"IPAddress": "fe80::1c4a:9e2f:6d01:7a3b", "Origin": "WellKnown"},
+                                   {"IPAddress": "2001:db8:30::1c4a:9e2f", "Origin": "RouterAdvertisement"}]}
+                    st.gw_ms, st.dns_ms, st.net_ms = 0.9, 4.2, 18.6
+                    st.stp = {"proto": "Rapid-PVST", "vlan": 30, "root_prio": 24576,
+                              "root_mac": "70:db:98:1a:00:01", "cost": 4}
+                    st.dhcp_scan = {"xid": 1, "status": "done", "ts": time.time(), "offers": {
+                        "10.20.1.10": {"tftp_ips": ["10.1.1.5", "10.1.1.6"]}}}
+                    st.ra = {"router": "fe80::1", "m": False, "o": True, "prefixes": ["2001:db8:30::/64"]}
+                    st.bc_pps, st.mc_pps = random.uniform(8, 20), random.uniform(30, 60)
+                    st.mac = "00:e0:4c:68:12:9a"
+                if t > 7:
+                    st.nb["CDP"] = ({"name": "IDF2-ACC-SW01.lab.local", "port": "GigabitEthernet1/0/23",
+                                     "vlan": 30, "voice_vlan": 130, "mgmt_ip": "10.20.0.12",
+                                     "platform": "cisco C9200L-48P-4G", "duplex": "full",
+                                     "poe": "15.4 W"}, time.time() - 12)
+                    st.nb["LLDP"] = ({"name": "IDF2-ACC-SW01", "port": "Gi1/0/23",
+                                      "autoneg": "Auto", "mau": "1000BASE-T FD"}, time.time() - 4)
+                st.rx_bps = random.uniform(0.2e6, 1.8e6)
+                st.tx_bps = random.uniform(0.05e6, 0.4e6)
+            time.sleep(1)
+
+    def echo(self, dst, src, ttl=128, timeout_ms=1000):
+        time.sleep(0.05)
+        if ttl < 6:
+            hops = ["10.20.30.2", "10.20.0.1", "172.16.1.1", "68.85.10.1", "162.158.4.1"]
+            return ("ttl", hops[ttl - 1], random.uniform(1, 4) * ttl)
+        if random.random() < 0.02:
+            return ("timeout", None, None)
+        return ("ok", dst, random.uniform(0.4, 2.5))
+
+    def _arp_table(self, name):
+        return [("10.20.30.1", "00:00:0c:07:ac:1e", "Reachable"),
+                ("10.20.30.2", "70:db:98:1a:00:41", "Stale"),
+                ("10.20.30.3", "70:db:98:1a:00:42", "Stale"),
+                ("10.20.30.55", "f0:b3:ec:12:9a:01", "Reachable")]
+
+    def arp_scan_toggle(self):
+        def work():
+            with self.st.lock:
+                self.st.arp_scan = {"running": True, "net": "10.20.30.0/24", "limited": False,
+                                    "range": (0, 0), "found": {}, "sent": 0, "total": 253}
+            fake = {"10.20.30.1": ["00:00:0c:07:ac:1e"], "10.20.30.2": ["70:db:98:1a:00:41"],
+                    "10.20.30.3": ["70:db:98:1a:00:42"], "10.20.30.20": ["3c:22:fb:01:02:03"],
+                    "10.20.30.55": ["f0:b3:ec:12:9a:01"], "10.20.30.88": ["00:1b:a9:44:55:66", "b8:27:eb:01:02:03"],
+                    "10.20.30.147": ["00:e0:4c:68:12:9a"]}
+            for i, (ip, macs) in enumerate(fake.items()):
+                time.sleep(0.3)
+                with self.st.lock:
+                    self.st.arp_scan["found"][ip] = macs
+                    self.st.arp_scan["sent"] = (i + 1) * 36
+            with self.st.lock:
+                self.st.arp_scan.update(running=False, sent=253)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mdns_scan(self, src):
+        m = self.mdns
+        with m.lock:
+            m.running = True
+        time.sleep(1.5)
+        with m.lock:
+            m.inst.update({("Living Room TV", "_airplay._tcp.local"): {"host": "lr-tv.local", "port": 7000},
+                           ("Conf Room Display", "_googlecast._tcp.local"): {"host": "cast-1.local", "port": 8009},
+                           ("HP LaserJet 4th Floor", "_ipp._tcp.local"): {"host": "hp-4f.local", "port": 631},
+                           ("HP LaserJet 4th Floor", "_uscan._tcp.local"): {"host": "hp-4f.local", "port": 8080},
+                           ("Sonos Lobby", "_sonos._tcp.local"): {"host": "sonos-lobby.local", "port": 1443}})
+            m.hosts.update({"lr-tv.local": {"10.20.30.55"}, "cast-1.local": {"10.20.30.61"},
+                            "hp-4f.local": {"10.20.30.20"}, "sonos-lobby.local": {"10.20.30.70"}})
+            m.responders |= {"10.20.30.55", "10.20.30.61", "10.20.30.20", "10.20.30.70"}
+            m.unicast_replies += 9
+            m.multicast_seen += 3
+            m.running = False
+            m.last_scan = time.time()
+
+    def _iperf(self, exe, server, src, reverse):
+        time.sleep(1.2)
+        return (941e6 if reverse else 936e6), (0 if reverse else 12), None
+
+    def _http(self, src, which):
+        time.sleep(1.2)
+        return 482e6 if which == "down" else 41e6
+
+    def _set_admin(self, name, enabled):
+        pass
+
+    def renew(self):
+        self.st.say("DHCP renew (demo)", 2)
+
+    def bounce(self):
+        self.st.say("Bounce link (demo)", 2)
+
+    def blink_toggle(self):
+        with self.st.lock:
+            self.st.blink["running"] = not self.st.blink["running"]
+
+    def update_oui(self, quiet=False):
+        self.st.say("Vendor list updated (demo)", 2)
+
+
+# ================================================================ UI widgets
+class Tile(tk.Frame):
+    def __init__(self, master, ui, title):
+        super().__init__(master, bg=PANEL)
+        self.ui = ui
+        self.pack_propagate(False)
+        pad = ui.pad
+        top = tk.Frame(self, bg=PANEL)
+        top.pack(fill="x", padx=pad, pady=(pad // 2 + 1, 0))
+        self.t = tk.Label(top, text=title.upper(), bg=PANEL, fg=DIM, anchor="w",
+                          font=ui.font(ui.sz["title"], "bold"))
+        self.t.pack(side="left")
+        self.n = tk.Label(top, text="", bg=PANEL, fg=DIM, anchor="e",
+                          font=ui.font(ui.sz["title"], "bold"))
+        self.n.pack(side="right")
+        self.v = tk.Label(self, text="—", bg=PANEL, fg=FG, anchor="w",
+                          font=ui.font(ui.sz["val"], "bold"))
+        self.v.pack(fill="both", expand=True, padx=pad, pady=(0, pad // 2))
+        self._last = None
+
+    def set(self, value, color=FG, note="", note_color=None):
+        value = str(value) if value not in (None, "") else "—"
+        if note_color is None:
+            note_color = color if color in (BAD, WARN) else DIM
+        w = self.winfo_width()
+        key = (value, color, note, note_color, w)
+        if key == self._last:
+            return
+        self._last = key
+        self.n.config(text=note, fg=note_color)
+        self.ui.fit(self.v, value, self.ui.sz["val"], w - 2 * self.ui.pad, color)
+
+
+class ListView(tk.Canvas):
+    """Touch-scrollable list (drag to scroll)."""
+
+    def __init__(self, master, ui):
+        super().__init__(master, bg=PANEL, highlightthickness=0, yscrollincrement=8)
+        self.ui = ui
+        self._rows = None
+        self._empty = ""
+        self.bind("<ButtonPress-1>", lambda e: self.scan_mark(0, e.y))
+        self.bind("<B1-Motion>", lambda e: self.scan_dragto(0, e.y, gain=1))
+        self.bind("<MouseWheel>", lambda e: self.yview_scroll(int(-e.delta / 120) * 4, "units"))
+        self.bind("<Configure>", lambda e: self.redraw())
+
+    def set_rows(self, rows, empty=""):
+        if rows == self._rows and empty == self._empty:
+            return
+        self._rows, self._empty = rows, empty
+        self.redraw()
+
+    def redraw(self):
+        w = self.winfo_width()
+        if w < 20:
+            return
+        top = self.yview()[0]
+        self.delete("all")
+        ui, pad = self.ui, self.ui.pad
+        fonts = {"hdr": ui.font(ui.sz["row"], "bold"), "row": ui.font(ui.sz["row"]),
+                 "mono": ui.mono(ui.sz["row"]), "dim": ui.font(ui.sz["rowsm"])}
+        y = pad
+        rows = self._rows or []
+        if not rows:
+            self.create_text(pad, y, anchor="nw", text=self._empty, fill=DIM, font=fonts["row"],
+                             width=w - 2 * pad)
+        for text, color, kind in rows:
+            if kind == "hdr" and y > pad:
+                y += pad // 2
+            item = self.create_text(pad, y, anchor="nw", text=text, fill=color,
+                                    font=fonts.get(kind, fonts["row"]), width=w - 2 * pad)
+            bb = self.bbox(item)
+            y = (bb[3] if bb else y + ui.sz["row"]) + max(2, pad // 3)
+        self.configure(scrollregion=(0, 0, w, max(y + pad, self.winfo_height())))
+        self.yview_moveto(top)
+
+
+class ToolView(tk.Frame):
+    def __init__(self, master, ui, title, actions, chart=False):
+        super().__init__(master, bg=BG)
+        self.ui = ui
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x")
+        ui.button(hdr, "‹ Back", ui.show_tools, ui.sz["small"], bg=GREY, padx=ui.pad * 2).pack(side="left")
+        tk.Label(hdr, text=title, bg=BG, fg=FG, font=ui.font(ui.sz["sub"], "bold")).pack(
+            side="left", padx=ui.pad)
+        self.act = []
+        for text, cmd in reversed(actions):
+            b = ui.button(hdr, text, cmd, ui.sz["small"], bg=BLUE, padx=ui.pad)
+            b.pack(side="right", padx=(ui.pad // 2, 0))
+            self.act.insert(0, b)
+        self.summary = tk.Label(self, text="", bg=BG, fg=FG, anchor="w",
+                                font=ui.font(ui.sz["val"], "bold"))
+        self.summary.pack(fill="x", pady=(ui.pad // 2, 0))
+        self.sub = tk.Label(self, text="", bg=BG, fg=DIM, anchor="w", font=ui.font(ui.sz["small"]))
+        self.sub.pack(fill="x")
+        self.chart = None
+        if chart:
+            self.chart = tk.Canvas(self, bg=PANEL, highlightthickness=0, height=int(ui.H * 0.15))
+            self.chart.pack(fill="x", pady=(ui.pad // 2, 0))
+        self.list = ListView(self, ui)
+        self.list.pack(fill="both", expand=True, pady=(ui.pad // 2, 0))
+        self._sum = None
+
+    def set_action(self, i, text, bg=BLUE):
+        b = self.act[i]
+        if b.cget("text") != text or b.cget("bg") != bg:
+            b.config(text=text, bg=bg)
+
+    def set_summary(self, text, color=FG, sub="", sub_color=DIM):
+        key = (text, color, sub, sub_color, self.winfo_width())
+        if key == self._sum:
+            return
+        self._sum = key
+        self.ui.fit(self.summary, text, self.ui.sz["val"], self.winfo_width(), color)
+        self.sub.config(text=sub, fg=sub_color)
+
+
+class Keyboard(tk.Frame):
+    """On-screen keyboard overlay for the touchscreen (physical keys work too)."""
+    ROWS = ["1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm._/"]
+
+    def __init__(self, ui, title, initial, on_ok, info=""):
+        super().__init__(ui.root, bg=BG)
+        self.ui, self.on_ok, self.value, self.shift = ui, on_ok, initial or "", False
+        pad = ui.pad
+        self.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.lift()
+        tk.Label(self, text=title, bg=BG, fg=FG, anchor="w", font=ui.font(ui.sz["sub"], "bold")).pack(
+            fill="x", padx=pad, pady=(pad, 0))
+        if info:
+            tk.Label(self, text=info, bg=BG, fg=DIM, anchor="w", font=ui.font(ui.sz["small"]),
+                     wraplength=ui.W - 2 * pad, justify="left").pack(fill="x", padx=pad)
+        self.disp = tk.Label(self, text="", bg=PANEL, fg=FG, anchor="w",
+                             font=ui.font(ui.sz["val"], "bold"), padx=pad, pady=pad // 2)
+        self.disp.pack(fill="x", padx=pad, pady=pad // 2)
+        grid = tk.Frame(self, bg=BG)
+        grid.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+        ks = ui.sz["key"]
+        self.keys = []
+        for r, row in enumerate(self.ROWS):
+            for c, ch in enumerate(row):
+                b = ui.button(grid, ch, lambda ch=ch: self.type(ch), ks, bg=PANEL)
+                b.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+                self.keys.append((b, ch))
+        specials = [(0, 2, "Shift", self.toggle_shift, GREY), (2, 5, "space", lambda: self.type(" "), PANEL),
+                    (7, 3, "Delete", self.back, GREY)]
+        for col, span, text, cmd, bg in specials:
+            ui.button(grid, text, cmd, ks, bg=bg).grid(row=4, column=col, columnspan=span,
+                                                       sticky="nsew", padx=1, pady=1)
+        ui.button(grid, "Cancel", self.close, ks, bg=GREY).grid(row=5, column=0, columnspan=4,
+                                                                sticky="nsew", padx=1, pady=(pad // 2, 1))
+        ui.button(grid, "Clear", self.clear, ks, bg=GREY).grid(row=5, column=4, columnspan=2,
+                                                               sticky="nsew", padx=1, pady=(pad // 2, 1))
+        ui.button(grid, "OK", self.ok, ks, bg=GREEN).grid(row=5, column=6, columnspan=4,
+                                                          sticky="nsew", padx=1, pady=(pad // 2, 1))
+        for c in range(10):
+            grid.columnconfigure(c, weight=1, uniform="k")
+        for r in range(6):
+            grid.rowconfigure(r, weight=1, uniform="r")
+        ui.overlay = self
+        self.render()
+
+    def render(self):
+        self.disp.config(text=self.value + "|")
+        for b, ch in self.keys:
+            b.config(text=ch.upper() if self.shift else ch)
+
+    def type(self, ch):
+        self.value += ch.upper() if self.shift else ch
+        if self.shift:
+            self.shift = False
+        self.render()
+
+    def toggle_shift(self):
+        self.shift = not self.shift
+        self.render()
+
+    def back(self):
+        self.value = self.value[:-1]
+        self.render()
+
+    def clear(self):
+        self.value = ""
+        self.render()
+
+    def ok(self):
+        v = self.value.strip()
+        self.close()
+        self.on_ok(v)
+
+    def close(self):
+        self.ui.overlay = None
+        self.destroy()
+
+    def key(self, e):
+        if e.keysym == "BackSpace":
+            self.back()
+        elif e.keysym in ("Return", "KP_Enter"):
+            self.ok()
+        elif e.keysym == "Escape":
+            self.close()
+        elif e.char and e.char.isprintable():
+            self.value += e.char
+            self.render()
+
+
+# ================================================================ UI
+class UI:
+    MAIN = ("PORT", "SWITCH", "L2", "STATS", "TOOLS")
+
+    def __init__(self, root, st, be, size):
+        self.root, self.st, self.be = root, st, be
+        self.W, self.H = size
+        H = self.H
+        fams = set(tkfont.families(root))
+        self.fam = next((f for f in ("Segoe UI", "Inter", "DejaVu Sans", "Helvetica") if f in fams),
+                        "TkDefaultFont")
+        self.mono_fam = next((f for f in ("Consolas", "Cascadia Mono", "DejaVu Sans Mono", "Courier New")
+                              if f in fams), "TkFixedFont")
+        self._fonts = {}
+        self.pad = max(6, int(H * 0.016))
+        self.sz = {"big": int(H * 0.08), "sub": int(H * 0.04), "title": max(10, int(H * 0.028)),
+                   "val": int(H * 0.058), "nav": int(H * 0.036), "small": max(11, int(H * 0.032)),
+                   "row": max(12, int(H * 0.036)), "rowsm": max(10, int(H * 0.028)),
+                   "key": int(H * 0.042), "toolbtn": int(H * 0.042)}
+        self.overlay = None
+        root.configure(bg=BG)
+
+        # banner (tap = next adapter)
+        self.banner = tk.Frame(root, bg=GREY)
+        self.banner.pack(side="top", fill="x")
+        self.b_big = tk.Label(self.banner, text="STARTING", bg=GREY, fg="white",
+                              font=self.font(self.sz["big"], "bold"))
+        self.b_big.pack(fill="x", pady=(self.pad // 2, 0))
+        self.b_sub = tk.Label(self.banner, text="", bg=GREY, fg="white", font=self.font(self.sz["sub"]))
+        self.b_sub.pack(fill="x", pady=(0, self.pad // 2))
+        self._press = (0, 0)
+        root.bind_all("<ButtonPress-1>", lambda e: setattr(self, "_press", (e.x_root, e.y_root)), add="+")
+        root.bind_all("<ButtonRelease-1>", self._maybe_swipe, add="+")
+        for w in (self.banner, self.b_big, self.b_sub):
+            self.on_tap(w, self.be.next_adapter)
+
+        # nav
+        self.nav = tk.Frame(root, bg=BG)
+        self.nav.pack(side="bottom", fill="x", padx=self.pad, pady=self.pad)
+        self.nav_btns = {}
+        for i, name in enumerate(self.MAIN + ("SAVE",)):
+            self.nav.columnconfigure(i, weight=1, uniform="nav")
+            cmd = self.open_save if name == "SAVE" else (lambda n=name: self.show(n))
+            b = self.button(self.nav, name, cmd, self.sz["nav"])
+            b.grid(row=0, column=i, sticky="nsew", padx=self.pad // 3)
+            self.nav_btns[name] = b
+
+        # body
+        self.body = tk.Frame(root, bg=BG)
+        self.body.pack(side="top", fill="both", expand=True, padx=self.pad, pady=(self.pad // 2, 0))
+        self.views, self.tiles = {}, {}
+        self.build_grid("PORT", ["Speed", "Duplex", "IP address", "Gateway",
+                                 "DHCP server", "DNS", "Time to IP", "Internet"])
+        self.build_grid("SWITCH", ["Switch", "Port", "Data VLAN", "Voice VLAN",
+                                   "Mgmt IP", "Model", "PoE", "Negotiation"])
+        self.sw_foot = tk.Label(self.views["SWITCH"], text="", bg=BG, fg=DIM, anchor="w",
+                                font=self.font(self.sz["small"]))
+        self.sw_foot.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(self.pad // 3, 0))
+        self.build_grid("L2", ["802.1X", "Spanning tree", "Trunk / DTP", "DHCP servers",
+                               "Phone options", "Gateway MAC", "IPv6", "Broadcast"])
+        self.l2_foot = tk.Label(self.views["L2"], text="", bg=BG, fg=DIM, anchor="w",
+                                font=self.font(self.sz["small"]))
+        self.l2_foot.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(self.pad // 3, 0))
+        self.build_grid("STATS", ["MAC", "Adapter", "RX errors", "TX errors",
+                                  "RX discards", "TX discards", "Throughput", "Link drops"])
+        actions = tk.Frame(self.views["STATS"], bg=BG)
+        actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(self.pad // 3, 0))
+        for i, (label, cmd) in enumerate((("Next adapter", self.be.next_adapter),
+                                          ("Reset", self.be.reset_counters),
+                                          ("Renew DHCP", self.be.renew),
+                                          ("Bounce", self.be.bounce))):
+            actions.columnconfigure(i, weight=1, uniform="act")
+            self.button(actions, label, cmd, self.sz["small"], bg=GREY).grid(
+                row=0, column=i, sticky="nsew", padx=self.pad // 3)
+        self.build_tools_grid()
+        self.tools = {
+            "ping": ToolView(self.body, self, "Ping", [("Start", self.be.ping_toggle),
+                                                     ("Target ›", self.be.ping_next_target)], chart=True),
+            "trace": ToolView(self.body, self, "Traceroute", [("Run", self.be.trace_toggle),
+                                                             ("Target ›", self.be.trace_next_target)]),
+            "speed": ToolView(self.body, self, "Speed test", [("iperf3", self.be.speed_iperf),
+                                                             ("Internet", self.be.speed_http)]),
+            "arp": ToolView(self.body, self, "ARP table", [("Refresh", self.be.arp_refresh)]),
+            "arpscan": ToolView(self.body, self, "ARP scan", [("Scan", self.be.arp_scan_toggle)]),
+            "mdns": ToolView(self.body, self, "mDNS browser", [("Scan", self.be.mdns_scan),
+                                                              ("Clear", self.be.mdns.reset)]),
+            "blink": ToolView(self.body, self, "Port finder", [("Start", self.be.blink_toggle)]),
+            "log": ToolView(self.body, self, "Port log", [("Open folder", self.open_data)]),
+        }
+        self.views.update(self.tools)
+        self.build_settings()
+
+        root.bind("<Key>", self._on_key)
+        self.cur = None
+        self.show("PORT")
+        self.refresh()
+
+    # ---------------------------------------------------------- building blocks
+    def font(self, px, weight="normal"):
+        key = (self.fam, px, weight)
+        if key not in self._fonts:
+            self._fonts[key] = tkfont.Font(self.root, family=self.fam, size=-px, weight=weight)
+        return self._fonts[key]
+
+    def mono(self, px):
+        key = (self.mono_fam, px, "normal")
+        if key not in self._fonts:
+            self._fonts[key] = tkfont.Font(self.root, family=self.mono_fam, size=-px)
+        return self._fonts[key]
+
+    def fit(self, label, text, max_px, width, color=FG):
+        size = max_px
+        if width > 40:
+            while size > 9 and self.font(size, "bold").measure(text) > width:
+                size -= 1
+        label.config(text=text, fg=color, font=self.font(size, "bold"))
+
+    def button(self, parent, text, cmd, px, bg=PANEL, padx=0):
+        b = tk.Label(parent, text=text, bg=bg, fg=FG, font=self.font(px, "bold"),
+                     pady=max(4, px // 3), padx=padx, cursor="hand2")
+        self.on_tap(b, cmd)
+        return b
+
+    def _moved(self, e):
+        return max(abs(e.x_root - self._press[0]), abs(e.y_root - self._press[1]))
+
+    def on_tap(self, widget, cmd):
+        """Fire on release, only if the finger didn't travel (so swipes don't press buttons)."""
+        widget.bind("<ButtonRelease-1>", lambda e: cmd() if self._moved(e) < self.W * 0.04 else None)
+
+    def _maybe_swipe(self, e):
+        if self.overlay or self.cur not in self.MAIN:
+            return
+        dx = e.x_root - self._press[0]
+        dy = e.y_root - self._press[1]
+        if abs(dx) > self.W * 0.15 and abs(dx) > 1.5 * abs(dy):
+            self.step(-1 if dx > 0 else 1)
+
+    def build_grid(self, name, titles):
+        page = tk.Frame(self.body, bg=BG)
+        self.views[name] = page
+        for c in range(2):
+            page.columnconfigure(c, weight=1, uniform="c")
+        for r in range(4):
+            page.rowconfigure(r, weight=1, uniform="r")
+        for i, title in enumerate(titles):
+            t = Tile(page, self, title)
+            t.grid(row=i // 2, column=i % 2, sticky="nsew",
+                   padx=(0, self.pad // 3) if i % 2 == 0 else (self.pad // 3, 0), pady=self.pad // 3)
+            self.tiles[(name, title)] = t
+
+    def build_tools_grid(self):
+        page = tk.Frame(self.body, bg=BG)
+        self.views["TOOLS"] = page
+        items = [("Ping", lambda: self.show("ping")), ("Traceroute", lambda: self.show("trace")),
+                 ("Speed test", lambda: self.show("speed")), ("ARP table", self.open_arp),
+                 ("ARP scan", lambda: self.show("arpscan")), ("mDNS browser", self.open_mdns),
+                 ("Port finder", lambda: self.show("blink")), ("Port log", lambda: self.show("log")),
+                 ("Re-run checks", self.be.rerun_checks), ("Settings", lambda: self.show("settings"))]
+        for c in range(2):
+            page.columnconfigure(c, weight=1, uniform="c")
+        for r in range(5):
+            page.rowconfigure(r, weight=1, uniform="r")
+        for i, (label, cmd) in enumerate(items):
+            self.button(page, label, cmd, self.sz["toolbtn"]).grid(
+                row=i // 2, column=i % 2, sticky="nsew",
+                padx=(0, self.pad // 3) if i % 2 == 0 else (self.pad // 3, 0), pady=self.pad // 3)
+
+    def build_settings(self):
+        page = tk.Frame(self.body, bg=BG)
+        self.views["settings"] = page
+        hdr = tk.Frame(page, bg=BG)
+        hdr.pack(fill="x")
+        self.button(hdr, "‹ Back", self.show_tools, self.sz["small"], bg=GREY, padx=self.pad * 2).pack(side="left")
+        tk.Label(hdr, text="Settings", bg=BG, fg=FG, font=self.font(self.sz["sub"], "bold")).pack(
+            side="left", padx=self.pad)
+        lst = tk.Frame(page, bg=BG)
+        lst.pack(fill="both", expand=True, pady=(self.pad // 2, 0))
+        self.set_btns = {}
+        rows = [("announce", self.toggle("announce")), ("autolog", self.toggle("autolog")),
+                ("hostname", self.edit_hostname), ("iperf", self.edit_iperf),
+                ("oui", lambda: threading.Thread(target=self.be.update_oui, daemon=True).start()),
+                ("folder", self.open_data), ("exit", self.quit)]
+        for r, (key, cmd) in enumerate(rows):
+            lst.rowconfigure(r, weight=1, uniform="s")
+            b = self.button(lst, "", cmd, self.sz["small"], bg=RED if key == "exit" else PANEL)
+            b.config(anchor="w", padx=self.pad * 2)
+            b.grid(row=r, column=0, sticky="nsew", pady=self.pad // 4)
+            self.set_btns[key] = b
+        lst.columnconfigure(0, weight=1)
+
+    # ---------------------------------------------------------- navigation
+    def show(self, name):
+        if self.cur == name:
+            return
+        if self.cur:
+            self.views[self.cur].pack_forget()
+        self.views[name].pack(fill="both", expand=True)
+        self.cur = name
+        active = name if name in self.MAIN else "TOOLS"
+        for n, b in self.nav_btns.items():
+            b.config(bg=BLUE if n == active else (GREEN if n == "SAVE" else PANEL))
+
+    def show_tools(self):
+        self.show("TOOLS")
+
+    def step(self, d):
+        i = self.MAIN.index(self.cur)
+        self.show(self.MAIN[(i + d) % len(self.MAIN)])
+
+    def open_arp(self):
+        self.show("arp")
+        self.be.arp_refresh()
+
+    def open_mdns(self):
+        self.show("mdns")
+        if not self.be.mdns.snapshot()["last_scan"]:
+            self.be.mdns_scan()
+
+    def open_data(self):
+        try:
+            if IS_WIN:
+                os.startfile(DATA_DIR)  # noqa: S606
+            else:
+                self.st.say(DATA_DIR, 4)
+        except OSError as e:
+            self.st.say(str(e)[:60], 4)
+
+    def open_save(self):
+        if self.overlay:
+            return
+        s = self.st.snapshot()
+        rec = build_record(s, self.be.oui)
+        if rec["switch"]:
+            info = f"{rec['switch']} · {rec['port']} · VLAN {rec['vlan'] or '?'} · {rec['speed']}"
+        else:
+            info = "No CDP/LLDP neighbor yet — saved to history.csv only"
+        initial = self.be.portlog.label_for(rec)
+        Keyboard(self, "Save this port — label (optional)", initial, self.be.save, info)
+
+    def toggle(self, key):
+        def f():
+            self.be.settings.set(key, not self.be.settings.get(key))
+            if key == "announce" and self.be.settings.get(key):
+                with self.st.lock:
+                    self.st.last_announce = 0
+        return f
+
+    def edit_hostname(self):
+        Keyboard(self, "Name this box announces to the switch", self.be.hostname(),
+                 lambda v: self.be.settings.set("hostname", v),
+                 "Shows up in 'show cdp neighbors' / 'show lldp neighbors'.")
+
+    def edit_iperf(self):
+        Keyboard(self, "iperf3 server (IP or name, optional :port)",
+                 self.be.settings.get("iperf_server"), self._set_iperf,
+                 "Run 'iperf3 -s' on a PC or server, then enter its address here.")
+
+    def _set_iperf(self, v):
+        host, _, port = v.partition(":")
+        self.be.settings.set("iperf_server", host.strip())
+        if port.strip().isdigit():
+            self.be.settings.set("iperf_port", int(port))
+
+    def quit(self):
+        try:
+            self.be.shutdown()
+        finally:
+            self.root.destroy()
+
+    def _on_key(self, e):
+        if self.overlay:
+            self.overlay.key(e)
+            return "break"
+        ch = (e.char or "").lower()
+        if e.keysym == "F11":
+            self.root.attributes("-fullscreen", not self.root.attributes("-fullscreen"))
+        elif e.keysym == "Escape":
+            if self.cur not in self.MAIN:
+                self.show("TOOLS")
+            else:
+                self.root.attributes("-fullscreen", False)
+        elif e.keysym in ("Left", "Right") and self.cur in self.MAIN:
+            self.step(-1 if e.keysym == "Left" else 1)
+        elif ch in "12345" and ch:
+            self.show(self.MAIN[int(ch) - 1])
+        elif ch == "s":
+            self.open_save()
+        elif ch == "r":
+            self.be.renew()
+        elif ch == "a":
+            self.be.next_adapter()
+        elif ch == "q":
+            self.quit()
+
+    # ---------------------------------------------------------- refresh
+    def refresh(self):
+        try:
+            self.render(self.st.snapshot())
+        except Exception as e:  # noqa: BLE001
+            if DEMO:
+                import traceback
+                traceback.print_exc()
+            _ = e
+        self.root.after(500, self.refresh)
+
+    def tile(self, page, title):
+        return self.tiles[(page, title)]
+
+    def render(self, s):
+        now = time.time()
+        self.render_banner(s, now)
+        if self.cur == "PORT":
+            self.render_port(s, now)
+        elif self.cur == "SWITCH":
+            self.render_switch(s, now)
+        elif self.cur == "L2":
+            self.render_l2(s, now)
+        elif self.cur == "STATS":
+            self.render_stats(s)
+        elif self.cur == "settings":
+            self.render_settings()
+        elif self.cur in self.tools:
+            getattr(self, "render_" + self.cur)(s, self.tools[self.cur], now)
+
+    def render_banner(self, s, now):
+        d = s["d"]
+        up, ip = s["link"], s["ipv4"]
+        nb = N.merge_neighbors(s["nb"])
+        gw = N.first_v4(d.get("Gateway"))
+        x = s["dot1x"]
+        if not s["sel"]:
+            color, big, sub = GREY, "NO ETHERNET ADAPTER", "Plug in a USB NIC or check drivers"
+        elif s["blink"]["running"]:
+            color, big, sub = BLUE, "PORT FINDER ON", "Watch the switch for the blinking LED"
+        elif up is None:
+            color, big, sub = GREY, "CHECKING…", s["sel"]
+        elif not up:
+            color, big, sub = RED, "NO LINK", "Check cable · port shut / err-disabled?"
+        elif s["dup_mac"]:
+            color, big, sub = RED, "DUPLICATE IP", f"{ip} also used by {s['dup_mac']}"
+        elif not good_ip(s):
+            waited = now - s["ip_wait_from"] if s["ip_wait_from"] else None
+            if x and x.get("code") in ("Request", "Failure"):
+                color, big, sub = AMBER, "802.1X · NO ACCESS", "Port wants authentication (EAP)"
+            elif ip:
+                color, big = AMBER, "NO DHCP"
+                sub = f"Self-assigned {ip} · link {N.fmt_speed(s['speed_mbps'])}"
+            else:
+                color, big = AMBER, "WAITING FOR IP"
+                sub = f"Link {N.fmt_speed(s['speed_mbps'])}" + (f" · {waited:.0f}s" if waited else "")
+        elif s["gw_ms"] == PENDING and gw:
+            color, big, sub = BLUE, "TESTING…", f"{ip} · pinging gateway"
+        elif gw and s["gw_ms"] is None:
+            color, big, sub = AMBER, "GATEWAY NOT REPLYING", f"{ip} · wrong VLAN?"
+        elif len(dhcp_servers(s)) > 1:
+            color, big, sub = AMBER, "MULTIPLE DHCP SERVERS", ", ".join(dhcp_servers(s)[:3])
+        elif s["net_ms"] is None:
+            color, big, sub = AMBER, "NO INTERNET", f"{ip} · gateway OK"
+        else:
+            color, big = GREEN, f"GOOD · {N.fmt_speed(s['speed_mbps'])}"
+            vlan = nb.get("vlan")
+            sub = f"{ip}" + (f" · VLAN {vlan}" if vlan else "") + (
+                f" · {nb['port']}" if nb.get("port") else "")
+        if s["toast"] and now < s["toast_until"]:
+            sub = s["toast"]
+        elif len(s["adapters"]) > 1 and s["sel"]:
+            sub = f"{sub}   [{s['sel']} ›]"
+        for w in (self.banner, self.b_big, self.b_sub):
+            if w.cget("bg") != color:
+                w.config(bg=color)
+        if self.b_big.cget("text") != big:
+            self.b_big.config(text=big)
+        if self.b_sub.cget("text") != sub:
+            self.b_sub.config(text=sub)
+
+    def render_port(self, s, now):
+        T = lambda t: self.tile("PORT", t)  # noqa: E731
+        d, up, ip = s["d"], s["link"], s["ipv4"]
+        nb = N.merge_neighbors(s["nb"])
+        spd = s["speed_mbps"]
+        T("Speed").set(N.fmt_speed(spd) if up else "—",
+                       OK if spd >= 1000 else WARN if spd >= 100 else BAD if spd else FG)
+        full = d.get("FullDuplex")
+        sw_duplex = nb.get("duplex")
+        if not up or full is None:
+            T("Duplex").set("—")
+        elif full is False:
+            T("Duplex").set("HALF", BAD)
+        elif sw_duplex == "half":
+            T("Duplex").set("Full", BAD, "SWITCH SAYS HALF")
+        else:
+            T("Duplex").set("Full", OK, "switch agrees" if sw_duplex else "")
+        if ip and up:
+            pl = N.prefix_len(s["mask"])
+            apipa = ip.startswith("169.254.")
+            if s["dup_mac"]:
+                note, nc = "DUPLICATE!", BAD
+            elif apipa:
+                note, nc = "APIPA", WARN
+            else:
+                note = "DHCP" if d.get("DhcpEnabled") else ("STATIC" if d.get("DhcpEnabled") is False else "")
+                nc = DIM
+            T("IP address").set(f"{ip}/{pl}" if pl else ip, BAD if s["dup_mac"] else WARN if apipa else FG,
+                                note, nc)
+        else:
+            T("IP address").set("—")
+        gw = N.first_v4(d.get("Gateway"))
+        T("Gateway").set(gw if up else "—", FG, *self.probe_note(s["gw_ms"], up and gw))
+        srv = d.get("DhcpServer")
+        srv = srv if N.is_ipv4(srv) and srv != "255.255.255.255" else None
+        T("DHCP server").set(srv if up else "—", FG,
+                             f"until {d['LeaseExpires']}" if up and srv and d.get("LeaseExpires") else "")
+        dns_list = [x for x in N.as_list(d.get("Dns")) if N.is_ipv4(x)]
+        T("DNS").set(", ".join(dns_list[:2]) if up and dns_list else "—", FG,
+                     *self.probe_note(s["dns_ms"], up and dns_list))
+        if s["time_to_ip"] is not None and up:
+            tti = s["time_to_ip"]
+            T("Time to IP").set(f"{tti:.1f} s", OK if tti < 8 else WARN if tti < 35 else BAD,
+                                "portfast off?" if tti >= 25 else "since link up")
+        elif up and s["ip_wait_from"] and not good_ip(s):
+            T("Time to IP").set(f"{now - s['ip_wait_from']:.0f} s…", WARN, "waiting")
+        else:
+            T("Time to IP").set("—", FG, "plug in to time it" if not up else "")
+        nm = s["net_ms"]
+        if not good_ip(s):
+            T("Internet").set("—")
+        elif nm == PENDING:
+            T("Internet").set("Testing…", DIM)
+        elif nm is None:
+            T("Internet").set("No route out", WARN)
+        else:
+            T("Internet").set("Reachable", OK, fmt_ms(nm))
+
+    def render_switch(self, s, now):
+        T = lambda t: self.tile("SWITCH", t)  # noqa: E731
+        nb = N.merge_neighbors(s["nb"])
+        protos = [p for p in ("CDP", "LLDP") if p in s["nb"]]
+        T("Switch").set(nb.get("name") or nb.get("chassis"), FG, "+".join(protos))
+        T("Port").set(nb.get("port"))
+        vlan = nb.get("vlan")
+        T("Data VLAN").set(vlan, OK if vlan else FG, nb.get("vlan_name", ""))
+        T("Voice VLAN").set(nb.get("voice_vlan"))
+        T("Mgmt IP").set(nb.get("mgmt_ip"))
+        T("Model").set((nb.get("platform") or "")[:60])
+        T("PoE").set(nb.get("poe"))
+        neg = " · ".join(x for x in (nb.get("autoneg"), nb.get("mau")) if x)
+        if not neg and nb.get("duplex"):
+            neg = f"{nb['duplex'].title()} duplex"
+        T("Negotiation").set(neg)
+        if not sniff_ok(s):
+            self.sw_foot.config(text=s["sniff_msg"], fg=WARN)
+        elif not s["link"]:
+            self.sw_foot.config(text="Waiting for link…", fg=DIM)
+        elif not protos:
+            self.sw_foot.config(text=f"Listening {now - s['l2_since']:.0f}s — CDP every 60s, LLDP every 30s",
+                                fg=DIM)
+        else:
+            parts = [f"{p} {now - s['nb'][p][1]:.0f}s ago" for p in protos]
+            self.sw_foot.config(text="Heard: " + " · ".join(parts), fg=OK)
+
+    def render_l2(self, s, now):
+        T = lambda t: self.tile("L2", t)  # noqa: E731
+        T("802.1X").set(*sum_dot1x(s, now))
+        T("Spanning tree").set(*sum_stp(s, now))
+        T("Trunk / DTP").set(*sum_trunk(s, now))
+        T("DHCP servers").set(*sum_dhcp(s, now))
+        T("Phone options").set(*sum_phone(s))
+        T("Gateway MAC").set(*sum_gw(s, self.be.oui))
+        T("IPv6").set(*sum_v6(s, now))
+        T("Broadcast").set(*sum_bcast(s))
+        if not sniff_ok(s):
+            self.l2_foot.config(text=s["sniff_msg"], fg=WARN)
+        else:
+            ann = f"Announcing as {self.be.hostname()}" if self.be.settings.get("announce") else "Not announcing"
+            self.l2_foot.config(text=f"{ann} · listening {now - s['l2_since']:.0f}s", fg=DIM)
+
+    def render_stats(self, s):
+        T = lambda t: self.tile("STATS", t)  # noqa: E731
+        adapter = next((a for a in s["adapters"] if a["name"] == s["sel"]), {})
+        mac = s["mac"] or adapter.get("mac")
+        T("MAC").set(mac, FG, self.be.oui.vendor(mac) if mac else "")
+        T("Adapter").set(adapter.get("desc") or s["sel"], FG, s["sel"] or "")
+        io, base = s["io"], s["io_base"]
+        for title, attr in (("RX errors", "errin"), ("TX errors", "errout"),
+                            ("RX discards", "dropin"), ("TX discards", "dropout")):
+            if io is not None and base is not None:
+                n = getattr(io, attr) - getattr(base, attr)
+                T(title).set(f"{n:,}", BAD if n > 0 else OK, "since reset")
+            else:
+                T(title).set("—")
+        T("Throughput").set(f"↓ {N.fmt_rate(s['rx_bps'])}   ↑ {N.fmt_rate(s['tx_bps'])}" if s["link"] else "—")
+        T("Link drops").set(s["drops"], BAD if s["drops"] else OK, "since reset")
+
+    def render_settings(self):
+        g = self.be.settings.get
+        n_oui = len(self.be.oui.map)
+        texts = {
+            "announce": f"Announce to switch (LLDP + CDP):  {'ON' if g('announce') else 'OFF'}",
+            "autolog": f"Auto-log every port to ports.csv:  {'ON' if g('autolog') else 'OFF'}",
+            "hostname": f"Name sent to switch:  {self.be.hostname()}",
+            "iperf": "iperf3 server:  " + ((g('iperf_server') + (f":{g('iperf_port')}" if g('iperf_port') != 5201 else ""))
+                                           if g("iperf_server") else "(tap to set)"),
+            "oui": f"Update MAC vendor list  ({n_oui:,} vendors loaded)" if n_oui else "Download MAC vendor list",
+            "folder": f"Open data folder  ({DATA_DIR})",
+            "exit": "Exit PortCheck",
+        }
+        for k, t in texts.items():
+            b = self.set_btns[k]
+            if b.cget("text") != t:
+                b.config(text=t)
+
+    @staticmethod
+    def probe_note(v, active):
+        if not active:
+            return ("",)
+        if v == PENDING:
+            return ("testing…", DIM)
+        if v is None:
+            return ("NO REPLY", BAD)
+        return (fmt_ms(v), OK)
+
+    # ---------------------------------------------------------- tool renders
+    def render_ping(self, s, v, now):
+        p = s["ping"]
+        v.set_action(0, "Stop" if p["running"] else "Start", RED if p["running"] else BLUE)
+        tgt = p["target"] or "(no address yet)"
+        if p["sent"]:
+            loss = 100 * (p["sent"] - p["recv"]) / p["sent"]
+            avg = p["sum"] / p["recv"] if p["recv"] else None
+            jit = p["jit"] / p["jn"] if p["jn"] else 0
+            color = OK if loss == 0 else WARN if loss < 5 else BAD
+            summ = f"{loss:.1f}% loss · avg {fmt_ms(avg) or '—'} · jitter {jit:.1f} ms"
+            sub = (f"{p['label']} {tgt} · sent {p['sent']} · min {fmt_ms(p['min']) or '—'}"
+                   f" · max {fmt_ms(p['max']) or '—'}")
+        else:
+            color, summ = FG, f"{p['label']}: {tgt}"
+            sub = "Tap Start — 4 pings a second. Target › cycles gateway / DNS / switch / internet."
+        v.set_summary(summ, color, sub)
+        self.draw_chart(v.chart, list(p["rtts"]))
+        v.list.set_rows([(t, c, "mono") for t, c in p["log"]], "")
+
+    def draw_chart(self, c, rtts):
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 20 or not rtts:
+            return
+        n = 120
+        bw = w / n
+        vals = [r for r in rtts if r is not None]
+        top = max(max(vals) if vals else 1, 2) * 1.15
+        for i, r in enumerate(rtts):
+            x = (n - len(rtts) + i) * bw
+            if r is None:
+                c.create_rectangle(x, 0, x + bw - 1, h, fill=BAD, width=0)
+            else:
+                bh = max(2, h * r / top)
+                c.create_rectangle(x, h - bh, x + bw - 1, h, fill=OK if r < 20 else WARN, width=0)
+        c.create_text(6, 4, anchor="nw", text=f"{top:.0f} ms", fill=DIM, font=self.font(self.sz["rowsm"]))
+
+    def render_trace(self, s, v, now):
+        t = s["trace"]
+        v.set_action(0, "Stop" if t["running"] else "Run", RED if t["running"] else BLUE)
+        state = "running…" if t["running"] else ("done" if t["hops"] else "tap Run")
+        v.set_summary(f"{t['label']}: {t['target'] or '—'}", FG,
+                      f"{state} · up to 20 hops, sourced from the Ethernet port")
+        rows = []
+        for ttl, ip, rtt, status in t["hops"]:
+            if ttl == 0:
+                rows.append((status, WARN, "row"))
+                continue
+            vendor = ""
+            if ip and status == "ttl" and ttl == 1:
+                vendor = "  (first hop)"
+            label = f"{ttl:>2}  {ip or '*':<16} {fmt_ms(rtt) if ip else 'timeout'}{vendor}"
+            rows.append((label, OK if status == "ok" else BAD if not ip else FG, "mono"))
+        v.list.set_rows(rows, "")
+
+    def render_speed(self, s, v, now):
+        sp = s["speed"]
+        if sp["down"] is not None or sp["up"] is not None:
+            summ = f"↓ {N.fmt_mbps(sp['down'])}    ↑ {N.fmt_mbps(sp['up'])}"
+        else:
+            summ = "Running…" if sp["running"] else "Pick a test"
+        srv = self.be.settings.get("iperf_server")
+        sub = (f"iperf3 server: {srv or 'not set (Settings)'} · Internet = {N.SPEED_HOST}")
+        v.set_summary(summ, OK if sp["down"] else FG, sub)
+        v.list.set_rows([(t, c, "row") for t, c in sp["lines"]],
+                        "iperf3 tests against your own server (best for LAN speed). "
+                        "Internet tests download/upload through this port.")
+
+    def render_arp(self, s, v, now):
+        a = s["arp_table"]
+        rows = []
+        for ip, mac, state in a["rows"]:
+            vendor = self.be.oui.lookup(mac)
+            rows.append((f"{ip:<15} {mac}  {state}", FG, "mono"))
+            if vendor:
+                rows.append(("      " + vendor, DIM, "dim"))
+        when = time.strftime("%H:%M:%S", time.localtime(a["ts"])) if a["ts"] else "—"
+        v.set_summary(f"{len(a['rows'])} entries", FG,
+                      "Loading…" if a["running"] else f"Windows ARP cache for {s['sel']} · {when}")
+        v.list.set_rows(rows, "No entries yet")
+
+    def render_arpscan(self, s, v, now):
+        a = s["arp_scan"]
+        v.set_action(0, "Stop" if a["running"] else "Scan", RED if a["running"] else BLUE)
+        found = a["found"]
+        dups = {ip: m for ip, m in found.items() if len(m) > 1}
+        if a["net"]:
+            summ = f"{len(found)} hosts on {a['net']}"
+            if a["running"]:
+                sub = f"Scanning… {a['sent']}/{a['total'] * 2 if a['total'] else 0} requests"
+            else:
+                sub = "Done" + (" · subnet too big, scanned the /24 around you" if a["limited"] else "")
+            if dups:
+                sub = f"{len(dups)} DUPLICATE IP(s)! · " + sub
+        else:
+            summ, sub = "Find every host on this subnet", "Tap Scan (needs Npcap)"
+        v.set_summary(summ, BAD if dups else FG, sub, BAD if dups else DIM)
+        rows = []
+        my_ip = s["ipv4"]
+        for ip in sorted(found, key=lambda x: N.u32(socket.inet_aton(x), 0)):
+            macs = found[ip]
+            tag = "  ← this box" if ip == my_ip else ""
+            rows.append((f"{ip:<15} {macs[0]}{tag}", BAD if len(macs) > 1 else FG, "mono"))
+            vendor = self.be.oui.lookup(macs[0])
+            if vendor:
+                rows.append(("      " + vendor, DIM, "dim"))
+            for m in macs[1:]:
+                rows.append((f"{'  DUPLICATE':<15} {m}  {self.be.oui.lookup(m)}", BAD, "mono"))
+        v.list.set_rows(rows, "")
+
+    def render_mdns(self, s, v, now):
+        m = self.be.mdns.snapshot()
+        n_inst = len(m["inst"])
+        n_dev = len(m["responders"])
+        v.set_action(0, "Scanning" if m["running"] else "Scan", GREY if m["running"] else BLUE)
+        if m["error"]:
+            v.set_summary("mDNS error", BAD, m["error"])
+        elif m["running"] and not n_inst:
+            v.set_summary("Scanning…", DIM, "Asking every device on this VLAN")
+        elif m["last_scan"] and not n_dev:
+            v.set_summary("No mDNS replies", WARN,
+                          "Nothing answered on this VLAN — blocked, isolated, or no devices")
+        else:
+            mc = "yes" if m["multicast_seen"] else "none yet"
+            v.set_summary(f"{n_inst} services · {n_dev} devices", OK if n_inst else FG,
+                          f"Multicast announcements seen: {mc} · replies: {m['unicast_replies']}")
+        rows = [(t, HDR if k == "hdr" else FG, k) for t, k in N.mdns_rows(m)]
+        v.list.set_rows(rows, "Tap Scan to browse Bonjour / mDNS services")
+
+    def render_blink(self, s, v, now):
+        b = s["blink"]
+        v.set_action(0, "Stop" if b["running"] else "Start", RED if b["running"] else BLUE)
+        if b["running"]:
+            v.set_summary(f"Blinking… {b['cycles']} cycles", WARN,
+                          "The port LED goes dark ~1.5 s every 4.5 s. Tap Stop when you find it.")
+        else:
+            v.set_summary("Find this port on the switch", FG, "Tap Start, then watch the switch")
+        v.list.set_rows([
+            ("How it works", HDR, "hdr"),
+            ("PortCheck disables and re-enables this Ethernet adapter on a loop, so the switch "
+             "port's link LED flashes off and on — like a toner, but for switch ports.", FG, "row"),
+            ("Tip", HDR, "hdr"),
+            ("Also try 'show cdp neighbors' or 'show lldp neighbors' on the switch: this box "
+             f"announces itself as {self.be.hostname()}.", FG, "row"),
+            ("Needs admin. The adapter is always re-enabled when you stop or exit.", DIM, "dim"),
+        ])
+
+    def render_log(self, s, v, now):
+        rows = self.be.portlog.rows()
+        v.set_summary(f"{len(rows)} ports logged", FG, os.path.join(DATA_DIR, "ports.csv"))
+        out = []
+        for r in rows:
+            head = f"{r.get('switch', '')}  {r.get('port', '')}"
+            if r.get("label"):
+                head += f"  —  {r['label']}"
+            out.append((head, HDR, "hdr"))
+            bits = [f"VLAN {r['vlan']}" if r.get("vlan") else "", r.get("speed", ""),
+                    r.get("ip", ""), f"voice {r['voice_vlan']}" if r.get("voice_vlan") else "",
+                    r.get("poe", ""), f"802.1X {r['dot1x']}" if r.get("dot1x") not in ("", "—", "Not detected") else ""]
+            out.append(("  ·  ".join(b for b in bits if b), FG, "row"))
+            out.append((f"last {r.get('last_seen', '')}  ·  first {r.get('first_seen', '')}", DIM, "dim"))
+        v.list.set_rows(out, "Nothing yet. Ports are logged automatically once CDP/LLDP names "
+                             "the switch port, or tap SAVE to log one with a label.")
+
+
+# ================================================================ main
+def parse_size():
+    if "--size" in sys.argv:
+        try:
+            w, h = sys.argv[sys.argv.index("--size") + 1].lower().split("x")
+            return int(w), int(h)
+        except (IndexError, ValueError):
+            pass
+    return None
+
+
+def maybe_elevate():
+    """Relaunch elevated (one UAC prompt) so renew / bounce / port finder / capture all work."""
+    if not IS_WIN or DEMO or "--no-elevate" in sys.argv or N.is_admin():
+        return
+    try:
+        import ctypes
+        exe = sys.executable
+        w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(w):
+            exe = w
+        params = subprocess.list2cmdline([os.path.abspath(__file__)] + sys.argv[1:] + ["--no-elevate"])
+        r = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, SCRIPT_DIR, 1)
+        if r > 32:
+            sys.exit(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main():
+    maybe_elevate()
+    if IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:  # noqa: BLE001
+            pass
+    if not psutil and not DEMO:
+        print("psutil is missing:  py -m pip install psutil scapy")
+        sys.exit(1)
+    root = tk.Tk()
+    root.title("PortCheck")
+    size = parse_size()
+    if WINDOWED:
+        size = size or (800, 480)
+        root.geometry(f"{size[0]}x{size[1]}")
+    else:
+        size = size or (root.winfo_screenwidth(), root.winfo_screenheight())
+        root.attributes("-fullscreen", True)
+    st = State()
+    settings = N.Settings(DATA_DIR)
+    portlog = N.PortLog(DATA_DIR)
+    oui = N.Oui(os.path.join(DATA_DIR, "manuf.txt"))
+    mdns = N.MdnsBrowser()
+    be = (DemoBackend if DEMO else Backend)(st, settings, portlog, oui, mdns)
+    be.start()
+    ui = UI(root, st, be, size)
+    root.protocol("WM_DELETE_WINDOW", ui.quit)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1239 @@
+"""
+pc_net - the networking engine behind PortCheck.
+
+Packet decoders / builders (CDP, LLDP, DTP, STP, EAPOL, ARP, DHCP, mDNS, IPv6 RA),
+ICMP ping + traceroute, iperf3 / HTTP speed tests, MAC vendor lookup, port log, settings.
+No GUI code in here, so it can be tested on any OS.
+"""
+
+import csv
+import ctypes
+import http.client
+import ipaddress
+import json
+import os
+import platform
+import random
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import threading
+import time
+import urllib.request
+
+IS_WIN = platform.system() == "Windows"
+NO_WINDOW = 0x08000000 if IS_WIN else 0
+
+
+# ====================================================================== helpers
+def run(cmd, timeout=15):
+    """Run a command (list, or a raw command-line string on Windows). Returns (code, stdout, stderr)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           creationflags=NO_WINDOW)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:  # noqa: BLE001
+        return -1, "", str(e)
+
+
+def powershell(script, timeout=15):
+    return run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-Command", script], timeout)
+
+
+def ps_json(script, timeout=15):
+    _, out, _ = powershell(script, timeout)
+    out = out.strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def psq(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def is_ipv4(s):
+    try:
+        socket.inet_aton(s)
+        return isinstance(s, str) and s.count(".") == 3
+    except (OSError, TypeError):
+        return False
+
+
+def first_v4(values):
+    for v in as_list(values):
+        if is_ipv4(v):
+            return v
+    return None
+
+
+def prefix_len(mask):
+    try:
+        return sum(bin(int(x)).count("1") for x in mask.split("."))
+    except (ValueError, AttributeError):
+        return None
+
+
+def norm_mac(m):
+    return (m or "").lower().replace("-", ":")
+
+
+def mac_bytes(m):
+    return bytes.fromhex(norm_mac(m).replace(":", ""))
+
+
+def mac_str(b):
+    return ":".join(f"{x:02x}" for x in b)
+
+
+def fmt_speed(mbps):
+    if not mbps:
+        return "—"
+    if mbps >= 1000:
+        return f"{mbps / 1000:g} Gbps"
+    return f"{mbps} Mbps"
+
+
+def fmt_rate(bps):
+    if bps is None:
+        return "—"
+    for unit, div in (("Gb/s", 1e9), ("Mb/s", 1e6), ("kb/s", 1e3)):
+        if bps >= div:
+            return f"{bps / div:.1f} {unit}"
+    return f"{bps:.0f} b/s"
+
+
+def fmt_mbps(bps):
+    return "—" if bps is None else f"{bps / 1e6:,.0f} Mbps"
+
+
+def txt(b):
+    return b.decode("utf-8", "replace").strip("\x00 \r\n\t")
+
+
+def u16(b, i):
+    return struct.unpack_from("!H", b, i)[0]
+
+
+def u32(b, i):
+    return struct.unpack_from("!I", b, i)[0]
+
+
+def checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def pad60(frame):
+    return frame + bytes(max(0, 60 - len(frame)))
+
+
+def is_admin():
+    if not IS_WIN:
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ====================================================================== constants
+CDP_DST = bytes.fromhex("01000ccccccc")
+PVST_DST = bytes.fromhex("01000ccccccd")
+STP_DST = bytes.fromhex("0180c2000000")
+PAE_DST = bytes.fromhex("0180c2000003")
+LLDP_DST = bytes.fromhex("0180c200000e")
+BCAST = b"\xff" * 6
+SNAP_CDP = bytes.fromhex("aaaa0300000c2000")
+DHCP_MAGIC = b"\x63\x82\x53\x63"
+
+# Everything the sniffer cares about. "vlan" must stay last (it shifts later offsets).
+BPF = ("ether dst 01:00:0c:cc:cc:cc or ether dst 01:00:0c:cc:cc:cd or ether dst 01:80:c2:00:00:00"
+       " or ether proto 0x88cc or ether proto 0x888e or arp"
+       " or (udp and (port 67 or port 68 or port 5353))"
+       " or (icmp6 and ip6[40] == 134) or vlan")
+
+MAU = {10: "10BASE-T HD", 11: "10BASE-T FD", 15: "100BASE-TX HD", 16: "100BASE-TX FD",
+       29: "1000BASE-T HD", 30: "1000BASE-T FD"}
+EAP_TYPES = {1: "Identity", 4: "MD5", 13: "EAP-TLS", 21: "TTLS", 25: "PEAP", 43: "FAST"}
+DHCP_MSG = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE", 5: "ACK", 6: "NAK",
+            7: "RELEASE", 8: "INFORM"}
+
+
+# ====================================================================== frame classifier
+def classify(raw):
+    """Decode one Ethernet frame into a list of (kind, info) events."""
+    ev = []
+    if len(raw) < 14:
+        return ev
+    dst, src = raw[0:6], raw[6:12]
+    srcs = mac_str(src)
+    et, off, vlan = u16(raw, 12), 14, None
+    if et in (0x8100, 0x88A8) and len(raw) >= 18:
+        vlan = u16(raw, 14) & 0x0FFF
+        et, off = u16(raw, 16), 18
+        ev.append(("VLAN", {"vlan": vlan, "src": srcs}))
+    p = raw[off:]
+
+    def add(kind, info):
+        if info is not None:
+            info["src"] = srcs
+            info["dst"] = mac_str(dst)
+            info["vlan_tag"] = vlan
+            ev.append((kind, info))
+
+    if et == 0x88CC:
+        add("LLDP", parse_lldp(p))
+    elif et == 0x888E:
+        add("EAPOL", parse_eapol(p))
+    elif et == 0x0806:
+        add("ARP", parse_arp(p))
+    elif et == 0x0800:
+        for k, i in parse_ipv4(p):
+            add(k, i)
+    elif et == 0x86DD:
+        for k, i in parse_ipv6(p):
+            add(k, i)
+    elif et <= 1500:
+        if p[:3] == b"\xaa\xaa\x03" and p[3:6] == b"\x00\x00\x0c" and len(p) >= 8:
+            pid, body = u16(p, 6), p[8:]
+            if pid == 0x2000:
+                add("CDP", parse_cdp(body))
+            elif pid == 0x2004:
+                add("DTP", parse_dtp(body))
+            elif pid == 0x010B:
+                add("STP", parse_bpdu(body, pvst=True))
+        elif p[:3] == b"\x42\x42\x03":
+            add("STP", parse_bpdu(p[3:]))
+    return ev
+
+
+# ---------------------------------------------------------------------- CDP
+def _cdp_addrs(v):
+    out = []
+    if len(v) < 4:
+        return out
+    n, j = u32(v, 0), 4
+    for _ in range(min(n, 16)):
+        if j + 2 > len(v):
+            break
+        ptype, plen = v[j], v[j + 1]
+        j += 2
+        proto = v[j:j + plen]
+        j += plen
+        if j + 2 > len(v):
+            break
+        alen = u16(v, j)
+        j += 2
+        addr = v[j:j + alen]
+        j += alen
+        if ptype == 1 and proto == b"\xcc" and alen == 4:
+            out.append(socket.inet_ntoa(addr))
+    return out
+
+
+def parse_cdp(p):
+    d = {}
+    i = 4  # version, ttl, checksum
+    while i + 4 <= len(p):
+        t, ln = struct.unpack_from("!HH", p, i)
+        if ln < 4:
+            break
+        v = p[i + 4:i + ln]
+        if t == 0x0001:
+            d["name"] = txt(v)
+        elif t == 0x0002:
+            ips = _cdp_addrs(v)
+            if ips:
+                d["addr"] = ips[0]
+        elif t == 0x0003:
+            d["port"] = txt(v)
+        elif t == 0x0005 and v:
+            d["software"] = txt(v).splitlines()[0]
+        elif t == 0x0006:
+            d["platform"] = txt(v)
+        elif t == 0x0009:
+            d["vtp"] = txt(v)
+        elif t == 0x000A and len(v) >= 2:
+            d["vlan"] = u16(v, 0)
+        elif t == 0x000B and v:
+            d["duplex"] = "full" if v[0] else "half"
+        elif t == 0x000E and len(v) >= 3:
+            d["voice_vlan"] = u16(v, 1)
+        elif t == 0x0010 and len(v) >= 2:
+            d["poe"] = f"{u16(v, 0) / 1000:.1f} W"
+        elif t == 0x0016:
+            ips = _cdp_addrs(v)
+            if ips:
+                d["mgmt_ip"] = ips[0]
+        i += ln
+    if "mgmt_ip" not in d and "addr" in d:
+        d["mgmt_ip"] = d["addr"]
+    return d
+
+
+def build_cdp(mac, device_id, port_id, ip=None, platform_name="PortCheck",
+              software="PortCheck switch-port tester"):
+    def tlv(t, v):
+        return struct.pack("!HH", t, len(v) + 4) + v
+
+    def body(sw):
+        b = tlv(1, device_id.encode()[:200])
+        if ip:
+            b += tlv(2, struct.pack("!I", 1) + bytes([1, 1, 0xCC]) + struct.pack("!H", 4)
+                     + socket.inet_aton(ip))
+        b += tlv(3, port_id.encode()[:100])
+        b += tlv(4, struct.pack("!I", 0x10))          # capabilities: host
+        b += tlv(5, sw.encode())
+        b += tlv(6, platform_name.encode())
+        return b
+
+    b = body(software)
+    if (4 + len(b)) % 2:                              # keep the length even (Cisco odd-byte quirk)
+        b = body(software + " ")
+    hdr = bytes([2, 180, 0, 0])
+    ck = checksum(hdr + b)
+    cdp = bytes([2, 180]) + struct.pack("!H", ck) + b
+    payload = SNAP_CDP + cdp
+    return pad60(CDP_DST + mac_bytes(mac) + struct.pack("!H", len(payload)) + payload)
+
+
+# ---------------------------------------------------------------------- LLDP
+def _lldp_id(v):
+    sub, val = v[0], v[1:]
+    if sub in (3, 4) and len(val) == 6:
+        return sub, mac_str(val)
+    if sub == 5 and len(val) >= 5 and val[0] == 1:
+        return sub, socket.inet_ntoa(val[1:5])
+    return sub, txt(val)
+
+
+def parse_lldp(p):
+    d = {}
+    i = 0
+    while i + 2 <= len(p):
+        h = u16(p, i)
+        t, ln = h >> 9, h & 0x1FF
+        v = p[i + 2:i + 2 + ln]
+        i += 2 + ln
+        if t == 0:
+            break
+        if t == 1 and v:
+            d["chassis"] = _lldp_id(v)[1]
+        elif t == 2 and v:
+            sub, val = _lldp_id(v)
+            d["port"] = val
+            d["port_is_mac"] = sub == 3
+        elif t == 4:
+            d["port_desc"] = txt(v)
+        elif t == 5:
+            d["name"] = txt(v)
+        elif t == 6 and v:
+            d["platform"] = txt(v).splitlines()[0]
+        elif t == 8 and len(v) >= 6:
+            if v[1] == 1 and v[0] == 5:
+                d["mgmt_ip"] = socket.inet_ntoa(v[2:6])
+        elif t == 127 and len(v) >= 4:
+            oui, st, b = v[:3], v[3], v[4:]
+            if oui == b"\x00\x80\xc2" and st == 1 and len(b) >= 2:
+                d["vlan"] = u16(b, 0)
+            elif oui == b"\x00\x80\xc2" and st == 3 and len(b) >= 3:
+                d.setdefault("vlan_names", {})[u16(b, 0)] = txt(b[3:3 + b[2]])
+            elif oui == b"\x00\x12\x0f" and st == 1 and len(b) >= 5:
+                d["autoneg"] = "Auto" if b[0] & 0x02 else "Forced"
+                mau = u16(b, 3)
+                d["mau"] = MAU.get(mau, f"MAU {mau}")
+            elif oui == b"\x00\x12\xbb" and st == 2 and len(b) >= 4:
+                if b[0] == 1:
+                    d["voice_vlan"] = (int.from_bytes(b[1:4], "big") >> 9) & 0xFFF
+            elif oui == b"\x00\x12\xbb" and st == 4 and len(b) >= 3:
+                d["poe"] = f"{u16(b, 1) / 10:.1f} W"
+            elif oui == b"\x00\x12\x0f" and st == 2 and "poe" not in d:
+                d["poe"] = "Yes"
+    return d
+
+
+def build_lldp(mac, port_name, sysname, sysdesc="PortCheck switch-port tester", ip=None):
+    def tl(t, v):
+        return struct.pack("!H", (t << 9) | len(v)) + v
+
+    mb = mac_bytes(mac)
+    p = tl(1, b"\x04" + mb)
+    p += tl(2, b"\x05" + port_name.encode()[:250])
+    p += tl(3, struct.pack("!H", 120))
+    p += tl(4, port_name.encode()[:250])
+    p += tl(5, sysname.encode()[:250])
+    p += tl(6, sysdesc.encode()[:250])
+    p += tl(7, struct.pack("!HH", 0x0080, 0x0080))   # station only
+    if ip:
+        p += tl(8, bytes([5, 1]) + socket.inet_aton(ip) + bytes([2]) + struct.pack("!I", 0) + b"\x00")
+    p += tl(0, b"")
+    return pad60(LLDP_DST + mb + b"\x88\xcc" + p)
+
+
+def merge_neighbors(nb):
+    """CDP wins where both have a value; LLDP fills the gaps."""
+    lldp = dict(nb.get("LLDP", ({}, 0))[0])
+    cdp = nb.get("CDP", ({}, 0))[0]
+    if lldp.get("port_is_mac") and lldp.get("port_desc"):
+        lldp["port"] = lldp["port_desc"]
+    names = lldp.get("vlan_names", {})
+    if "vlan" in lldp and lldp["vlan"] in names:
+        lldp["vlan_name"] = names[lldp["vlan"]]
+    out = dict(lldp)
+    out.update({k: v for k, v in cdp.items() if v not in (None, "")})
+    return out
+
+
+# ---------------------------------------------------------------------- DTP / STP / EAPOL
+def parse_dtp(b):
+    if not b:
+        return None
+    d, i = {}, 1
+    while i + 4 <= len(b):
+        t, ln = u16(b, i), u16(b, i + 2)
+        if ln < 4:
+            break
+        v = b[i + 4:i + ln]
+        if t == 1:
+            d["domain"] = txt(v)
+        elif t == 2 and v:
+            st = v[0]
+            d["admin"] = {1: "on", 2: "off", 3: "desirable", 4: "auto"}.get(st & 0x07, f"0x{st:02x}")
+            d["oper"] = "trunk" if st & 0x80 else "access"
+        elif t == 4 and len(v) >= 6:
+            d["neighbor"] = mac_str(v[:6])
+        i += ln
+    return d
+
+
+def parse_bpdu(b, pvst=False):
+    if len(b) < 4 or u16(b, 0) != 0:
+        return None
+    ver, typ = b[2], b[3]
+    d = {"proto": {0: "STP", 2: "RSTP", 3: "MSTP"}.get(ver, f"v{ver}"), "tcn": typ == 0x80}
+    if pvst:
+        d["proto"] = "Rapid-PVST" if ver >= 2 else "PVST+"
+    if typ == 0x80 or len(b) < 35:
+        return d
+    flags, rp, bp = b[4], u16(b, 5), u16(b, 17)
+    d.update(tc=bool(flags & 1), root_prio=rp & 0xF000, root_mac=mac_str(b[7:13]),
+             cost=u32(b, 13), bridge_prio=bp & 0xF000, bridge_mac=mac_str(b[19:25]),
+             vlan=bp & 0x0FFF, port_id=u16(b, 25), hello=u16(b, 31) / 256)
+    if ver >= 2:
+        d["role"] = {0: "Unknown", 1: "Alt/Backup", 2: "Root", 3: "Designated"}[(flags >> 2) & 3]
+    return d
+
+
+def parse_eapol(p):
+    if len(p) < 4:
+        return None
+    d = {"ptype": p[1]}
+    if p[1] == 0 and len(p) >= 8:
+        code = p[4]
+        d["code"] = {1: "Request", 2: "Response", 3: "Success", 4: "Failure"}.get(code, str(code))
+        if code in (1, 2) and len(p) >= 9:
+            d["eap_type"] = EAP_TYPES.get(p[8], str(p[8]))
+    elif p[1] == 1:
+        d["code"] = "Start"
+    return d
+
+
+def build_eapol_start(mac):
+    return pad60(PAE_DST + mac_bytes(mac) + b"\x88\x8e" + bytes([1, 1, 0, 0]))
+
+
+# ---------------------------------------------------------------------- ARP
+def parse_arp(p):
+    if len(p) < 28 or u16(p, 0) != 1 or u16(p, 2) != 0x0800:
+        return None
+    return {"op": u16(p, 6), "sha": mac_str(p[8:14]), "spa": socket.inet_ntoa(p[14:18]),
+            "tha": mac_str(p[18:24]), "tpa": socket.inet_ntoa(p[24:28])}
+
+
+def build_arp_request(mac, sender_ip, target_ip):
+    """sender_ip=None builds an RFC 5227 probe (sender 0.0.0.0) for duplicate-address checks."""
+    mb = mac_bytes(mac)
+    spa = socket.inet_aton(sender_ip) if sender_ip else bytes(4)
+    arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mb + spa + bytes(6) + socket.inet_aton(target_ip)
+    return pad60(BCAST + mb + b"\x08\x06" + arp)
+
+
+# ---------------------------------------------------------------------- IPv4 / IPv6 / UDP
+def parse_ipv4(p):
+    if len(p) < 20 or p[0] >> 4 != 4:
+        return []
+    ihl = (p[0] & 0x0F) * 4
+    if p[9] != 17 or len(p) < ihl + 8:
+        return []
+    return parse_udp(p[ihl:], socket.inet_ntoa(p[12:16]), socket.inet_ntoa(p[16:20]))
+
+
+def parse_ipv6(p):
+    if len(p) < 40:
+        return []
+    nh = p[6]
+    src = socket.inet_ntop(socket.AF_INET6, p[8:24])
+    dst = socket.inet_ntop(socket.AF_INET6, p[24:40])
+    body = p[40:]
+    if nh == 58 and body and body[0] == 134:
+        return [("RA", parse_ra(body, src))]
+    if nh == 17 and len(body) >= 8:
+        return parse_udp(body, src, dst)
+    return []
+
+
+def parse_udp(u, src, dst):
+    sport, dport, ln = struct.unpack_from("!HHH", u, 0)
+    data = u[8:ln] if ln >= 8 else u[8:]
+    out = []
+    if sport in (67, 68) and dport in (67, 68):
+        d = parse_bootp(data)
+        if d:
+            d["ip_src"] = src
+            out.append(("DHCP", d))
+    elif sport == 5353 or dport == 5353:
+        try:
+            m = parse_dns(data)
+        except Exception:  # noqa: BLE001
+            m = None
+        if m and m["qr"]:
+            m["ip_src"], m["ip_dst"] = src, dst
+            out.append(("MDNS", m))
+    return out
+
+
+def ipv4_udp_frame(src_mac, dst_mac, src_ip, dst_ip, sport, dport, payload):
+    udp = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
+    total = 20 + len(udp)
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, random.randint(0, 0xFFFF), 0, 64, 17, 0,
+                      socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    hdr = hdr[:10] + struct.pack("!H", checksum(hdr)) + hdr[12:]
+    return pad60(dst_mac + mac_bytes(src_mac) + b"\x08\x00" + hdr + udp)
+
+
+def parse_ra(b, src):
+    d = {"router": src, "m": bool(b[5] & 0x80), "o": bool(b[5] & 0x40), "prefixes": []}
+    if len(b) >= 8:
+        d["lifetime"] = u16(b, 6)
+    i = 16
+    while i + 2 <= len(b):
+        t, ln = b[i], b[i + 1] * 8
+        if ln == 0:
+            break
+        o = b[i:i + ln]
+        if t == 3 and len(o) >= 32:
+            d["prefixes"].append(f"{socket.inet_ntop(socket.AF_INET6, o[16:32])}/{o[2]}")
+        elif t == 1 and len(o) >= 8:
+            d["router_mac"] = mac_str(o[2:8])
+        elif t == 5 and len(o) >= 8:
+            d["mtu"] = u32(o, 4)
+        i += ln
+    return d
+
+
+# ---------------------------------------------------------------------- DHCP
+def _ips(v):
+    return [socket.inet_ntoa(v[i:i + 4]) for i in range(0, len(v) - 3, 4)]
+
+
+def parse_bootp(b):
+    if len(b) < 240 or b[236:240] != DHCP_MAGIC:
+        return None
+    opts, i = {}, 240
+    while i < len(b):
+        c = b[i]
+        if c == 255:
+            break
+        if c == 0:
+            i += 1
+            continue
+        if i + 1 >= len(b):
+            break
+        ln = b[i + 1]
+        opts[c] = b[i + 2:i + 2 + ln]
+        i += 2 + ln
+    d = {"op": b[0], "xid": u32(b, 4), "yiaddr": socket.inet_ntoa(b[16:20]),
+         "siaddr": socket.inet_ntoa(b[20:24]), "chaddr": mac_str(b[28:34]),
+         "msg": DHCP_MSG.get((opts.get(53) or b"\x00")[0], "?")}
+    if len(opts.get(54, b"")) == 4:
+        d["server"] = socket.inet_ntoa(opts[54])
+    if len(opts.get(1, b"")) == 4:
+        d["mask"] = socket.inet_ntoa(opts[1])
+    if 3 in opts:
+        d["routers"] = _ips(opts[3])
+    if 6 in opts:
+        d["dns"] = _ips(opts[6])
+    if 15 in opts:
+        d["domain"] = txt(opts[15])
+    if len(opts.get(51, b"")) == 4:
+        d["lease"] = u32(opts[51], 0)
+    if 66 in opts:
+        d["tftp_name"] = txt(opts[66])
+    if 150 in opts:
+        d["tftp_ips"] = _ips(opts[150])
+    if 43 in opts:
+        d["opt43"] = opts[43].hex()
+    if 42 in opts:
+        d["ntp"] = _ips(opts[42])
+    sname = txt(b[44:108])
+    if sname:
+        d["sname"] = sname
+    return d
+
+
+def build_dhcp_discover(mac, xid):
+    mb = mac_bytes(mac)
+    bootp = struct.pack("!BBBBIHH", 1, 1, 6, 0, xid, 0, 0x8000) + bytes(16) + mb + bytes(10)
+    bootp += bytes(64) + bytes(128) + DHCP_MAGIC
+    prl = [1, 3, 6, 15, 42, 43, 51, 54, 66, 150]
+    bootp += bytes([53, 1, 1]) + bytes([61, 7, 1]) + mb + bytes([55, len(prl)]) + bytes(prl) + b"\xff"
+    return ipv4_udp_frame(mac, BCAST, "0.0.0.0", "255.255.255.255", 68, 67, bootp)
+
+
+# ---------------------------------------------------------------------- DNS / mDNS
+def read_name(b, i):
+    """Return (labels, next_index), following compression pointers."""
+    labels, end, hops = [], None, 0
+    while True:
+        if i >= len(b):
+            raise ValueError("name runs past end")
+        ln = b[i]
+        if ln == 0:
+            i += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if i + 1 >= len(b):
+                raise ValueError("bad pointer")
+            if end is None:
+                end = i + 2
+            i = ((ln & 0x3F) << 8) | b[i + 1]
+            hops += 1
+            if hops > 30:
+                raise ValueError("pointer loop")
+            continue
+        labels.append(b[i + 1:i + 1 + ln].decode("utf-8", "replace"))
+        i += 1 + ln
+    return labels, (end if end is not None else i)
+
+
+def parse_dns(b):
+    qid, flags, qd, an, ns, ar = struct.unpack_from("!6H", b, 0)
+    i = 12
+    for _ in range(qd):
+        _, i = read_name(b, i)
+        i += 4
+    recs = []
+    for _ in range(an + ns + ar):
+        labels, i = read_name(b, i)
+        typ, _cls, ttl, rdl = struct.unpack_from("!HHIH", b, i)
+        i += 10
+        start, rdata = i, b[i:i + rdl]
+        i += rdl
+        r = {"labels": labels, "name": ".".join(labels), "type": typ, "ttl": ttl}
+        if typ == 12:
+            r["ptr_labels"] = read_name(b, start)[0]
+            r["ptr"] = ".".join(r["ptr_labels"])
+        elif typ == 33 and rdl >= 6:
+            r["port"] = u16(rdata, 4)
+            r["target"] = ".".join(read_name(b, start + 6)[0])
+        elif typ == 1 and rdl == 4:
+            r["a"] = socket.inet_ntoa(rdata)
+        elif typ == 28 and rdl == 16:
+            r["aaaa"] = socket.inet_ntop(socket.AF_INET6, rdata)
+        elif typ == 16:
+            out, j = [], 0
+            while j < len(rdata):
+                ln = rdata[j]
+                out.append(rdata[j + 1:j + 1 + ln].decode("utf-8", "replace"))
+                j += 1 + ln
+            r["txt"] = [t for t in out if t]
+        recs.append(r)
+    return {"id": qid, "qr": bool(flags & 0x8000), "records": recs}
+
+
+def encode_labels(labels):
+    out = b""
+    for part in labels:
+        e = part.encode()[:63]
+        out += bytes([len(e)]) + e
+    return out + b"\x00"
+
+
+def encode_name(name):
+    return encode_labels([p for p in name.rstrip(".").split(".") if p])
+
+
+def build_dns_query(questions, qid=None):
+    """questions: list of (encoded_name_bytes, qtype)."""
+    qid = qid if qid is not None else random.randint(1, 0xFFFF)
+    h = struct.pack("!6H", qid, 0, len(questions), 0, 0, 0)
+    return h + b"".join(n + struct.pack("!HH", t, 1) for n, t in questions)
+
+
+SERVICES = "_services._dns-sd._udp.local"
+FRIENDLY = {
+    "_airplay._tcp.local": "AirPlay", "_raop._tcp.local": "AirPlay audio",
+    "_googlecast._tcp.local": "Chromecast / Google", "_spotify-connect._tcp.local": "Spotify Connect",
+    "_ipp._tcp.local": "Printer (IPP)", "_ipps._tcp.local": "Printer (IPPS)",
+    "_printer._tcp.local": "Printer (LPD)", "_pdl-datastream._tcp.local": "Printer (raw 9100)",
+    "_uscan._tcp.local": "Scanner", "_scanner._tcp.local": "Scanner",
+    "_hap._tcp.local": "HomeKit", "_homekit._tcp.local": "HomeKit", "_matter._tcp.local": "Matter",
+    "_matterc._udp.local": "Matter (commissioning)", "_sonos._tcp.local": "Sonos",
+    "_smb._tcp.local": "SMB file share", "_afpovertcp._tcp.local": "AFP file share",
+    "_http._tcp.local": "Web UI", "_https._tcp.local": "Web UI (https)",
+    "_ssh._tcp.local": "SSH", "_sftp-ssh._tcp.local": "SFTP",
+    "_workstation._tcp.local": "Workstation", "_device-info._tcp.local": "Device info",
+    "_companion-link._tcp.local": "Apple device", "_airport._tcp.local": "AirPort",
+    "_sleep-proxy._udp.local": "Sleep proxy", "_mqtt._tcp.local": "MQTT",
+    "_amzn-wplay._tcp.local": "Amazon Fire/Echo", "_androidtvremote2._tcp.local": "Android TV",
+    "_rdlink._tcp.local": "Apple remote", "_touch-able._tcp.local": "Apple remote",
+    "_esphomelib._tcp.local": "ESPHome", "_hue._tcp.local": "Philips Hue",
+}
+COMMON_TYPES = sorted(FRIENDLY)
+
+
+class MdnsBrowser:
+    """Collects mDNS answers (active legacy-unicast queries + passive sniffing)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self.lock:
+            self.types = set()
+            self.inst = {}          # (instance_label, type) -> {"host", "port", "txt"}
+            self.hosts = {}         # hostname -> set(ips)
+            self.responders = set()
+            self.multicast_seen = 0
+            self.unicast_replies = 0
+            self.running = False
+            self.last_scan = None
+            self.error = None
+
+    def ingest(self, msg, src_ip, multicast):
+        with self.lock:
+            if src_ip:
+                self.responders.add(src_ip)
+            if multicast:
+                self.multicast_seen += 1
+            else:
+                self.unicast_replies += 1
+            for r in msg["records"]:
+                t = r["type"]
+                if t == 12:
+                    pl = r["ptr_labels"]
+                    if r["name"].lower() == SERVICES:
+                        self.types.add(".".join(pl).lower())
+                    elif len(pl) >= 4 and pl[-2].lower() in ("_tcp", "_udp"):
+                        stype = ".".join(pl[1:]).lower()
+                        self.types.add(stype)
+                        self.inst.setdefault((pl[0], stype), {})
+                elif t in (33, 16):
+                    lb = r["labels"]
+                    if len(lb) >= 4 and lb[-2].lower() in ("_tcp", "_udp"):
+                        key = (lb[0], ".".join(lb[1:]).lower())
+                        e = self.inst.setdefault(key, {})
+                        self.types.add(key[1])
+                        if t == 33:
+                            e["host"], e["port"] = r["target"].lower(), r["port"]
+                        else:
+                            e["txt"] = r.get("txt", [])
+                elif t in (1, 28):
+                    ip = r.get("a") or r.get("aaaa")
+                    if ip:
+                        self.hosts.setdefault(r["name"].lower(), set()).add(ip)
+
+    def _questions(self, first):
+        with self.lock:
+            if first:
+                qs = [(encode_name(SERVICES), 12)] + [(encode_name(t), 12) for t in COMMON_TYPES]
+            else:
+                qs = [(encode_name(t), 12) for t in self.types]
+                for (label, stype), e in self.inst.items():
+                    if "host" not in e:
+                        n = encode_labels([label] + stype.split("."))
+                        qs += [(n, 33), (n, 16)]
+                for e in self.inst.values():
+                    h = e.get("host")
+                    if h and h not in self.hosts:
+                        qs.append((encode_name(h), 1))
+            qs = [q for q in dict.fromkeys(qs) if q not in self._asked]
+            self._asked.update(qs)
+            return qs
+
+    def scan(self, src_ip, rounds=4, wait=1.5):
+        """Legacy unicast queries from an ephemeral port: replies come straight back to us."""
+        with self.lock:
+            self.running, self.error, self._asked = True, None, set()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((src_ip or "0.0.0.0", 0))
+            if src_ip:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(src_ip))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+            sock.settimeout(0.25)
+            for rnd in range(rounds):
+                qs = self._questions(rnd == 0)
+                if not qs and rnd > 0:
+                    break
+                for k in range(0, len(qs), 6):
+                    sock.sendto(build_dns_query(qs[k:k + 6]), ("224.0.0.251", 5353))
+                    time.sleep(0.02)
+                end = time.time() + wait
+                while time.time() < end:
+                    try:
+                        data, (ip, _port) = sock.recvfrom(9000)
+                    except socket.timeout:
+                        continue
+                    try:
+                        m = parse_dns(data)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if m["qr"]:
+                        self.ingest(m, ip, multicast=False)
+        except OSError as e:
+            with self.lock:
+                self.error = str(e)
+        finally:
+            sock.close()
+            with self.lock:
+                self.running = False
+                self.last_scan = time.time()
+
+    def snapshot(self):
+        with self.lock:
+            return {"types": set(self.types), "inst": {k: dict(v) for k, v in self.inst.items()},
+                    "hosts": {k: set(v) for k, v in self.hosts.items()},
+                    "responders": set(self.responders), "multicast_seen": self.multicast_seen,
+                    "unicast_replies": self.unicast_replies, "running": self.running,
+                    "last_scan": self.last_scan, "error": self.error}
+
+
+def mdns_rows(snap):
+    """[(text, kind)] grouped by service type. kind: 'hdr' or 'row'."""
+    by_type = {}
+    for (label, stype), e in snap["inst"].items():
+        by_type.setdefault(stype, []).append((label, e))
+    out = []
+    for stype in sorted(by_type, key=lambda t: FRIENDLY.get(t, t).lower()):
+        items = sorted(by_type[stype], key=lambda x: x[0].lower())
+        short = stype.replace(".local", "")
+        out.append((f"{FRIENDLY.get(stype, short)}   {short}   ×{len(items)}", "hdr"))
+        for label, e in items:
+            host = e.get("host", "")
+            ips = sorted(snap["hosts"].get(host, ()), key=lambda ip: (":" in ip, ip))
+            addr = ips[0] if ips else (host.replace(".local", "") or "?")
+            if e.get("port"):
+                addr += f":{e['port']}"
+            out.append((f"{label}  ·  {addr}", "row"))
+    empty = sorted(t for t in snap["types"] if t not in by_type and t.endswith(".local"))
+    if empty:
+        out.append(("Types advertised (no instances answered)", "hdr"))
+        out.append((", ".join(t.replace(".local", "") for t in empty), "row"))
+    return out
+
+
+# ====================================================================== ICMP (ping / traceroute)
+class _IPOPT(ctypes.Structure):
+    _fields_ = [("Ttl", ctypes.c_ubyte), ("Tos", ctypes.c_ubyte), ("Flags", ctypes.c_ubyte),
+                ("OptionsSize", ctypes.c_ubyte), ("OptionsData", ctypes.c_void_p)]
+
+
+_ipl = None
+
+
+def _ip2ul(ip):
+    return struct.unpack("<I", socket.inet_aton(ip))[0]
+
+
+def _ul2ip(v):
+    return socket.inet_ntoa(struct.pack("<I", v))
+
+
+def _win_echo(dst, src, ttl, timeout_ms, size):
+    global _ipl
+    if _ipl is None:
+        lib = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        lib.IcmpCreateFile.restype = ctypes.c_void_p
+        lib.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+        lib.IcmpSendEcho2Ex.argtypes = [ctypes.c_void_p] * 4 + [
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ushort, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+        lib.IcmpSendEcho2Ex.restype = ctypes.c_ulong
+        _ipl = lib
+    h = _ipl.IcmpCreateFile()
+    try:
+        data = ctypes.create_string_buffer((b"PortCheck-ping-" * 8)[:size], size)
+        reply = ctypes.create_string_buffer(256 + size)
+        opt = _IPOPT(ttl, 0, 0, 0, None)
+        t = time.perf_counter()
+        n = _ipl.IcmpSendEcho2Ex(h, None, None, None, _ip2ul(src) if src else 0, _ip2ul(dst),
+                                 data, size, ctypes.byref(opt), reply, len(reply), timeout_ms)
+        elapsed = (time.perf_counter() - t) * 1000
+        addr, status, rtt = struct.unpack_from("<III", reply.raw, 0)
+        if n == 0:
+            return ("timeout", None, None)
+        if status == 0:
+            return ("ok", _ul2ip(addr), float(rtt))
+        if status == 11013:
+            return ("ttl", _ul2ip(addr), float(rtt) if rtt else elapsed)
+        if status in (11002, 11003, 11004, 11005):
+            return ("unreach", _ul2ip(addr), None)
+        if status == 11010:
+            return ("timeout", None, None)
+        return ("error", None, None)
+    finally:
+        _ipl.IcmpCloseHandle(h)
+
+
+def _sub_echo(dst, src, ttl, timeout_ms):
+    if IS_WIN:
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), "-i", str(ttl)] + (["-S", src] if src else [])
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), "-t", str(ttl)]
+    _, out, _ = run(cmd + [dst], timeout=5)
+    m = re.search(r"time[=<]\s*([\d.]+)\s*ms", out, re.I)
+    if "ttl=" in out.lower() and m:
+        return ("ok", dst, float(m.group(1)))
+    return ("timeout", None, None)
+
+
+def icmp_echo(dst, src=None, ttl=128, timeout_ms=1000, size=32):
+    """Returns (status, responder_ip, rtt_ms). status: ok | ttl | timeout | unreach | error."""
+    if IS_WIN:
+        try:
+            return _win_echo(dst, src, ttl, timeout_ms, size)
+        except Exception:  # noqa: BLE001
+            pass
+    return _sub_echo(dst, src, ttl, timeout_ms)
+
+
+def ping_ms(dst, src=None, timeout_ms=1000):
+    st, _, rtt = icmp_echo(dst, src, timeout_ms=timeout_ms)
+    return rtt if st == "ok" else None
+
+
+# ====================================================================== other probes
+def dns_probe(server, src, name="www.google.com", timeout=2.0):
+    """Query a DNS server directly, sourced from the Ethernet IP. Returns ms or None."""
+    q = build_dns_query([(encode_name(name), 1)], qid=random.randint(1, 0xFFFF))
+    qid = u16(q, 0)
+    q = q[:2] + b"\x01\x00" + q[4:]          # recursion desired
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(timeout)
+        if src:
+            s.bind((src, 0))
+        t = time.perf_counter()
+        s.sendto(q, (server, 53))
+        while True:
+            data, _ = s.recvfrom(2048)
+            if len(data) >= 12 and u16(data, 0) == qid:
+                break
+        ms = (time.perf_counter() - t) * 1000
+        return ms if (data[3] & 0x0F) == 0 and u16(data, 6) > 0 else None
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def tcp_probe(host, port, src, timeout=2.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        if src:
+            s.bind((src, 0))
+        t = time.perf_counter()
+        s.connect((host, port))
+        return (time.perf_counter() - t) * 1000
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def scan_hosts(ip, mask, cap=1024):
+    """Hosts to ARP-scan. Subnets bigger than `cap` are limited to the /24 around us."""
+    net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+    limited = False
+    if net.num_addresses > cap + 2:
+        net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+        limited = True
+    return net, [str(h) for h in net.hosts() if str(h) != ip], limited
+
+
+# ====================================================================== speed tests
+def find_iperf(extra_dirs=()):
+    for d in extra_dirs:
+        for name in ("iperf3.exe", "iperf3"):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+    return shutil.which("iperf3")
+
+
+def run_iperf(exe, server, src=None, reverse=False, secs=5, port=5201):
+    """Returns (bits_per_second, retransmits, error)."""
+    cmd = [exe, "-c", server, "-p", str(port), "-t", str(secs), "-J"]
+    if src:
+        cmd += ["-B", src]
+    if reverse:
+        cmd.append("-R")
+    _, out, err = run(cmd, timeout=secs + 25)
+    try:
+        j = json.loads(out)
+    except ValueError:
+        return None, None, (err or out or "no output").strip()[:120]
+    if j.get("error"):
+        return None, None, j["error"][:120]
+    end = j.get("end", {})
+    bps = end.get("sum_received", {}).get("bits_per_second")
+    retr = end.get("sum_sent", {}).get("retransmits")
+    return bps, retr, None
+
+
+SPEED_HOST = "speed.cloudflare.com"
+
+
+def http_download(src=None, nbytes=25_000_000, timeout=30):
+    c = http.client.HTTPSConnection(SPEED_HOST, 443, timeout=timeout,
+                                    source_address=(src, 0) if src else None)
+    try:
+        c.connect()
+        c.request("GET", f"/__down?bytes={nbytes}")
+        r = c.getresponse()
+        got, t1 = 0, None
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            if t1 is None:
+                t1 = time.perf_counter()
+            got += len(chunk)
+        t2 = time.perf_counter()
+        return got * 8 / max(t2 - (t1 or t2 - 1), 1e-3)
+    finally:
+        c.close()
+
+
+def http_upload(src=None, nbytes=10_000_000, timeout=30):
+    c = http.client.HTTPSConnection(SPEED_HOST, 443, timeout=timeout,
+                                    source_address=(src, 0) if src else None)
+    try:
+        c.connect()
+        body = b"0" * nbytes
+        t0 = time.perf_counter()
+        c.request("POST", "/__up", body=body, headers={"Content-Type": "application/octet-stream"})
+        c.getresponse().read()
+        return nbytes * 8 / max(time.perf_counter() - t0, 1e-3)
+    finally:
+        c.close()
+
+
+# ====================================================================== MAC vendors
+def mac_kind(mac):
+    m = norm_mac(mac)
+    if len(m) != 17:
+        return None
+    if m.startswith("00:00:0c:07:ac:"):
+        return f"HSRPv1 group {int(m[-2:], 16)}"
+    if m.startswith("00:00:0c:9f:f"):
+        return f"HSRPv2 group {int(m[-5:].replace(':', ''), 16) & 0xFFF}"
+    if m.startswith("00:00:5e:00:01:"):
+        return f"VRRP VRID {int(m[-2:], 16)}"
+    if m.startswith("00:07:b4:00:"):
+        return "GLBP virtual MAC"
+    if int(m[1], 16) & 0x2:
+        return "Private / random MAC"
+    return None
+
+
+class Oui:
+    URL = "https://www.wireshark.org/download/automated/data/manuf"
+
+    def __init__(self, path):
+        self.path = path
+        self.map = {}
+        self.load()
+
+    def load(self):
+        m = {}
+        try:
+            with open(self.path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line or line[0] == "#":
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 2 and len(parts[0]) == 8:
+                        m[parts[0].lower()] = parts[1].strip()
+        except OSError:
+            pass
+        self.map = m
+
+    def available(self):
+        return bool(self.map)
+
+    def vendor(self, mac):
+        return self.map.get(norm_mac(mac)[:8], "")
+
+    def lookup(self, mac):
+        bits = [b for b in (self.vendor(mac), mac_kind(mac)) if b]
+        return " · ".join(bits)
+
+    def download(self):
+        req = urllib.request.Request(self.URL, headers={"User-Agent": "PortCheck"})
+        data = urllib.request.urlopen(req, timeout=30).read()
+        tmp = self.path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, self.path)
+        self.load()
+        return len(self.map)
+
+
+# ====================================================================== settings + port log
+class Settings:
+    DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
+                "iperf_port": 5201}
+
+    def __init__(self, folder):
+        self.path = os.path.join(folder, "settings.json")
+        self.data = dict(self.DEFAULTS)
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                self.data.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+
+    def get(self, k):
+        return self.data.get(k, self.DEFAULTS.get(k))
+
+    def set(self, k, v):
+        self.data[k] = v
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2)
+        except OSError:
+            pass
+
+
+LOG_FIELDS = ["last_seen", "label", "switch", "port", "vlan", "voice_vlan", "mgmt_ip", "model",
+              "poe", "speed", "duplex", "ip", "gateway", "gw_ms", "gw_mac", "dhcp_server",
+              "dhcp_servers", "dns", "internet", "time_to_ip", "dot1x", "stp", "dtp",
+              "tagged_vlans", "ipv6", "pc_mac", "adapter", "first_seen", "saves"]
+HIST_FIELDS = ["time", "source"] + [f for f in LOG_FIELDS
+                                    if f not in ("last_seen", "first_seen", "saves")]
+
+
+class PortLog:
+    """ports.csv = one row per switch+port (latest result). history.csv = every save."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.json_path = os.path.join(folder, "ports.json")
+        self.csv_path = os.path.join(folder, "ports.csv")
+        self.hist_path = os.path.join(folder, "history.csv")
+        self.lock = threading.Lock()
+        try:
+            with open(self.json_path, encoding="utf-8") as f:
+                self.ports = json.load(f)
+        except (OSError, ValueError):
+            self.ports = {}
+
+    @staticmethod
+    def key(rec):
+        if rec.get("switch") and rec.get("port"):
+            return f"{rec['switch']}|{rec['port']}".lower()
+        return None
+
+    def label_for(self, rec):
+        with self.lock:
+            return self.ports.get(self.key(rec) or "", {}).get("label", "")
+
+    def upsert(self, rec, manual=False):
+        """Returns (is_new_port, error_or_None)."""
+        with self.lock:
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            rec = {k: ("" if v is None else v) for k, v in rec.items()}
+            rec["last_seen"] = now
+            k, new, err = self.key(rec), False, None
+            if k:
+                old = self.ports.get(k, {})
+                new = not old
+                rec["first_seen"] = old.get("first_seen", now)
+                if not rec.get("label"):
+                    rec["label"] = old.get("label", "")
+                rec["saves"] = int(old.get("saves", 0) or 0) + (1 if manual else 0)
+                self.ports[k] = rec
+                err = self._write_json() or self._write_csv()
+            if manual or new:
+                err = self._append_hist(rec, "manual" if manual else "auto") or err
+            return new, err
+
+    def rows(self):
+        with self.lock:
+            return sorted(self.ports.values(), key=lambda r: r.get("last_seen", ""), reverse=True)
+
+    def _write_json(self):
+        try:
+            tmp = self.json_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.ports, f, indent=1)
+            os.replace(tmp, self.json_path)
+        except OSError as e:
+            return f"Couldn't save log: {e}"
+        return None
+
+    def _write_csv(self):
+        rows = sorted(self.ports.values(), key=lambda r: (str(r.get("switch", "")).lower(),
+                                                          _port_sort(r.get("port", ""))))
+        try:
+            tmp = self.csv_path + ".tmp"
+            with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(rows)
+            os.replace(tmp, self.csv_path)
+        except PermissionError:
+            return "ports.csv is open (Excel?) — will update next time"
+        except OSError as e:
+            return f"Couldn't write ports.csv: {e}"
+        return None
+
+    def _append_hist(self, rec, source):
+        try:
+            new_file = not os.path.exists(self.hist_path)
+            with open(self.hist_path, "a", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=HIST_FIELDS, extrasaction="ignore")
+                if new_file:
+                    w.writeheader()
+                w.writerow(dict(rec, time=rec.get("last_seen"), source=source))
+        except PermissionError:
+            return "history.csv is open (Excel?)"
+        except OSError as e:
+            return f"Couldn't write history.csv: {e}"
+        return None
+
+
+def _port_sort(port):
+    """Gi1/0/10 sorts after Gi1/0/9."""
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", str(port))]
