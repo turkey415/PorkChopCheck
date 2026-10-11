@@ -6,8 +6,7 @@ What's cooking next. Nothing here is built yet. Ideas, priorities and pull reque
 
 Built for a Counter-Strike tournament on a server in the room. The question these answer: a player says they lagged, so is it the seat, the network, the server, or their PC?
 
-### Reflector on the game server
-Run `porkchopcheck --reflector` on the server box as a service, so every tick test measures the real path a player's packets take. The seat check, match watch and fairness report all measure against it.
+Setup note, not a feature: run `porkchopcheck --reflector` on the game server box, so every tick test measures the real path a player's packets take. The seat check, match watch and fairness report all measure against it.
 
 ### Seat check
 One button per seat: link speed and duplex, downshift, errors, DHCP, gateway ping and a short tick test to the game server, then a pass or fail saved under the seat label. Certify every seat during setup, before the first match.
