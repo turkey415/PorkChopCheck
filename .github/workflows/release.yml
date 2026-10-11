@@ -45,6 +45,7 @@ jobs:
       - run: python tests/test_pc_net.py
       - run: python tests/test_linux.py
       - run: python tests/test_smart.py
+      - run: python tests/test_snmp.py
       - run: python tests/test_launcher.py
       - run: python tests/test_version.py
 
@@ -66,7 +67,7 @@ jobs:
           $v = $env:VERSION
           New-Item -ItemType Directory -Force out | Out-Null
           Compress-Archive -Path dist/PorkChopCheck.exe, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-exe.zip"
-          Compress-Archive -Path porkchopcheck.py, pc_net.py, pc_smart.py, PorkChopCheck.bat, requirements.txt, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-python.zip"
+          Compress-Archive -Path porkchopcheck.py, pc_net.py, pc_smart.py, pc_snmp.py, PorkChopCheck.bat, requirements.txt, README.md, LICENSE -DestinationPath "out/PorkChopCheck-$v-windows-python.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -82,7 +83,7 @@ jobs:
           python3 tools/stamp_version.py "$VERSION"
           d="PorkChopCheck-${VERSION}-linux"
           mkdir -p "out/$d"
-          cp porkchopcheck.py pc_net.py pc_smart.py install-linux.sh requirements.txt README.md LICENSE "out/$d/"
+          cp porkchopcheck.py pc_net.py pc_smart.py pc_snmp.py install-linux.sh requirements.txt README.md LICENSE "out/$d/"
           mkdir -p "out/$d/linux"
           cp linux/pcc-launch.c "out/$d/linux/"
           chmod +x "out/$d/install-linux.sh"

@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Wire report (flow control, EEE, flooding, loud senders, conflicts, rogue routers), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Wire report (flow control, EEE, flooding, loud senders, conflicts, rogue routers), Switches (every switch as an icon that turns red or yellow when a port has errors or link trouble, read over SNMP), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -177,6 +177,28 @@ Good to know:
 - If more than 5,000 frames a second arrive that are not addressed to this box, the report stops counting for 30 seconds and says so. That is what a mirror port or a severe flood looks like.
 - **Restart** clears the report and starts counting again from now.
 
+## Switches (SNMP)
+
+**Tools › Switches** shows every switch on the network as an icon with its name and IP address, and colours it by its worst port. Tap a switch to see its front panel, port by port.
+
+1. Tap **Community** and type the read-only SNMP community string set on your switches. Tap **v2c** to switch between SNMP v2c and v1.
+2. Tap **Scan**. It asks every address on the subnet, then follows CDP from each Cisco switch to the switches plugged into it, so switches on a separate management subnet are found too. **Add** takes one address typed by hand.
+3. Tap a switch for its ports, and a port for its details.
+
+| Colour | A port | A switch |
+|---|---|---|
+| **Green** | Linked and clean | Every port is clean |
+| **Yellow** | Worth a look: dropped packets, 70% busy or more, linked at 100 Mb on a gigabit port, a link that changed once, or errors that have stopped | A port is yellow and none is red |
+| **Red** | Trouble now: errors rising in the last minute, half duplex, linked at 10 Mb, a link that changed twice in ten minutes, or 90% busy or more | A port is red, or the switch stopped answering. A number appears when more than two ports are red |
+| **Grey** | Nothing plugged in (dark grey: shut down on the switch) | Not read yet |
+
+- **Only new errors count.** A switch keeps error totals for months, so a port is judged on what changes while the page is open, not on old history. The totals are still shown when you tap the port.
+- **Clear port / Clear all** wipes what the app has seen on one port, or on every port of the switch, and starts watching again from that moment. Use it after reseating a cable: if the port goes red again, the errors came back. The port's page then shows its counts since you tapped Clear. This happens in the app; a switch's own totals cannot be cleared over SNMP.
+- **Switches are read every 15 seconds, and only while this page is open.** Nothing is sent to the saved addresses at other times, or on other networks.
+- **It only reads.** Nothing on a switch is changed.
+- The community string is saved in `settings.json` in the data folder, as plain text. SNMP v1 and v2c send it unencrypted, so use a read-only community.
+- Built for Cisco Catalyst switches, and tried on a Catalyst 3850 and a 3750-X. Other makes that support the standard interface tables should show up, but have not been tried.
+
 ## Multicast browser
 
 **Tools › Multicast** shows what multicast is crossing the port, and helps explain why a stream is missing.
@@ -253,6 +275,7 @@ No hardware needed:
 python tests/test_pc_net.py   # every packet decoder/builder + the port log
 python tests/test_linux.py    # Linux parsers for ip / nmcli / ethtool / ping output
 python tests/test_smart.py    # smart-home protocols, AES, classification, device inventory
+python tests/test_snmp.py     # SNMP client against a pretend switch, port grading, front-panel layout
 python tests/test_launcher.py # Linux launcher: builds it and checks what it passes to Python
 python tests/test_version.py  # the version line and the release step that writes it
 ```

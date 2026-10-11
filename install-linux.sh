@@ -61,7 +61,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-for f in porkchopcheck.py pc_net.py pc_smart.py requirements.txt linux/pcc-launch.c; do
+for f in porkchopcheck.py pc_net.py pc_smart.py pc_snmp.py requirements.txt linux/pcc-launch.c; do
   [[ -f "$SRC_DIR/$f" ]] || { echo "Missing $f next to this script." >&2; exit 1; }
 done
 
@@ -85,6 +85,7 @@ echo "==> Installing PorkChopCheck to $PREFIX (owned by root)"
 sudo rm -rf "$PREFIX"
 sudo install -d -o root -g root -m 0755 "$PREFIX"
 sudo install -o root -g root -m 0644 "$SRC_DIR/porkchopcheck.py" "$SRC_DIR/pc_net.py" "$SRC_DIR/pc_smart.py" \
+  "$SRC_DIR/pc_snmp.py" \
   "$SRC_DIR/requirements.txt" "$PREFIX/"
 for f in README.md LICENSE; do
   [[ -f "$SRC_DIR/$f" ]] && sudo install -o root -g root -m 0644 "$SRC_DIR/$f" "$PREFIX/"
@@ -95,7 +96,7 @@ sudo python3 -m venv "$PREFIX/.venv"
 sudo "$PREFIX/.venv/bin/python3" -m pip install --quiet --upgrade pip
 # Wheels only: nothing downloaded gets to run its own build script as root.
 sudo "$PREFIX/.venv/bin/python3" -m pip install --quiet --only-binary :all: -r "$PREFIX/requirements.txt"
-sudo "$PREFIX/.venv/bin/python3" -m compileall -q "$PREFIX/porkchopcheck.py" "$PREFIX/pc_net.py" "$PREFIX/pc_smart.py"
+sudo "$PREFIX/.venv/bin/python3" -m compileall -q "$PREFIX/porkchopcheck.py" "$PREFIX/pc_net.py" "$PREFIX/pc_smart.py" "$PREFIX/pc_snmp.py"
 
 echo "==> Granting capture + link control to the launcher (and nothing else)"
 # Root owns it; only your group may run it.
