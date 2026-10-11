@@ -9,7 +9,7 @@ Pages:  PORT    link, speed/duplex, IP, gateway, DHCP, DNS, time-to-IP, internet
         SMART   every smart-home device on the network: brand, type, model, serial, IP, MAC
         STATS   MAC, adapter, errors, discards, throughput, link drops
         TOOLS   ping, traceroute, speed test (iperf3 / internet), ARP table, ARP scan,
-                mDNS browser, port finder, port log, re-run checks, settings
+                mDNS browser, switches (SNMP), port finder, port log, re-run checks, settings
         SAVE    log this port (with an optional label) to data/ports.csv
 
 Run:   Windows: double-click porkchopcheck.py (asks for admin once, opens fullscreen)
@@ -17,11 +17,13 @@ Run:   Windows: double-click porkchopcheck.py (asks for admin once, opens fullsc
        python porkchopcheck.py --windowed --size 800x480   |   --fullscreen
        python porkchopcheck.py --demo      (fake data, to preview the screens)
 Keys:  1-5 pages  S save  R renew  A next adapter  F11 fullscreen  Esc back  Q quit
-Needs: Python 3.10+, psutil, scapy (+ Npcap on Windows). pc_net.py must sit next to this file.
+Needs: Python 3.10+, psutil, scapy (+ Npcap on Windows). pc_net.py, pc_smart.py and pc_snmp.py
+       must sit next to this file.
 """
 
 import collections
 import copy
+import ipaddress
 import os
 import random
 import socket
@@ -126,8 +128,9 @@ except ImportError:
 try:
     import pc_net as N
     import pc_smart as S
+    import pc_snmp as SN
 except Exception as e:  # noqa: BLE001
-    _fatal("PorkChopCheck couldn't load pc_net.py / pc_smart.py. Keep them in the same folder as "
+    _fatal("PorkChopCheck couldn't load pc_net.py / pc_smart.py / pc_snmp.py. Keep them in the same folder as "
            "porkchopcheck.py.\n\n" + repr(e))
 
 IS_WIN = N.IS_WIN
@@ -174,6 +177,9 @@ BAD = "#f85149"
 HDR = "#79c0ff"
 
 PENDING = "pending"
+SW_COLORS = {SN.GOOD: OK, SN.WARN: WARN, SN.BAD: BAD, SN.DOWN: "#3d444d", SN.OFF: "#21262d"}
+SW_POLL_SECS = 15       # how often the Switches page re-reads each switch
+SW_SCAN_MAX = 64        # devices a scan will question before it gives up
 
 PING_TARGETS = [("gateway", "Gateway"), ("dns", "DNS server"), ("switch", "Switch mgmt"),
                 ("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google DNS")]
@@ -221,6 +227,18 @@ ConvertTo-Json -Compress -InputObject @(Get-NetNeighbor -InterfaceAlias __NAME__
 
 
 # ================================================================ shared state
+def new_switch(ip, name="", model=""):
+    return {"ip": ip, "name": name, "model": model, "ok": None, "msg": "", "fails": 0, "polled": None,
+            "ports": [], "sum": None}
+
+
+def switch_level(x):
+    """The colour of a switch's icon: red if it stopped answering or any port is red."""
+    if x["ok"] is False:
+        return SN.BAD
+    return x["sum"]["level"] if x["sum"] else None
+
+
 def new_ping():
     return {"running": False, "kind": "gateway", "label": "Gateway", "target": None,
             "samples": collections.deque(maxlen=7200),    # (time, rtt or None); 30 min at 4 a second
@@ -254,6 +272,7 @@ class State:
         self.capture = {"running": False, "secs": 30, "left": 0, "frames": 0, "bytes": 0,
                         "file": "", "msg": "", "ok": True, "files": []}
         self.smart = {"running": False, "stage": "", "devices": [], "ts": None, "counts": {}}
+        self.switches = {"running": False, "stage": "", "list": []}
         self.reset_adapter()
 
     def reset_adapter(self):
@@ -544,6 +563,12 @@ class Backend:
         self.nic_base = None            # the adapter's counters when the wire report started
         self.pubip_for = None           # (adapter, local IP) it was asked from
         self.devstore = S.DeviceStore(DATA_DIR)
+        self.swwatch = {}               # each switch's memory between SNMP readings
+        self.sw_kick = threading.Event()
+        self.sw_poll_lock = threading.Lock()
+        with st.lock:
+            st.switches["list"] = [new_switch(x["ip"], x.get("name", ""), x.get("model", ""))
+                                   for x in settings.get("switches") or [] if isinstance(x, dict) and x.get("ip")]
 
     # ---------------------------------------------------------- lifecycle
     def start(self):
@@ -1269,6 +1294,197 @@ class Backend:
         ev = threading.Event()
         self.stops[name] = ev
         return ev
+
+    # ---------------------------------------------------------- switches (SNMP)
+    def _sw_client(self, ip, **kw):
+        return SN.Client(ip, self.settings.get("snmp_community") or "public",
+                         self.settings.get("snmp_version"), **kw)
+
+    def _sw_stage(self, text):
+        with self.st.lock:
+            self.st.switches["stage"] = text
+
+    def _sw_merge(self, ip, info):
+        """Add a switch to the list, or refresh the one already there. True if it was new."""
+        with self.st.lock:
+            lst = self.st.switches["list"]
+            cur = next((x for x in lst if x["ip"] == ip), None)
+            new = cur is None
+            if new:
+                cur = new_switch(ip)
+                lst.append(cur)
+                lst.sort(key=lambda x: tuple(int(n) for n in x["ip"].split(".")))
+            cur["name"] = info.get("name") or cur["name"]
+            cur["model"] = SN.model_of(info) or cur["model"]
+        self._sw_save()
+        return new
+
+    def _sw_save(self):
+        with self.st.lock:
+            keep = [{"ip": x["ip"], "name": x["name"], "model": x["model"]} for x in self.st.switches["list"]]
+        self.settings.set("switches", keep)
+
+    def sw_scan_toggle(self):
+        with self.st.lock:
+            running = self.st.switches["running"]
+            ip, mask = self.st.ipv4, self.st.mask
+            mgmt = N.merge_neighbors(self.st.nb).get("mgmt_ip")
+        if running:
+            self.stops["switches_scan"].set()
+            return
+        if not ip or not mask or ip.startswith("169.254."):
+            self.st.say("Need an IP address to scan", 3)
+            return
+        ev = self._new_stop("switches_scan")
+        threading.Thread(target=self._sw_scan, args=(ev, ip, mask, mgmt), daemon=True).start()
+
+    def _sw_scan(self, ev, ip, mask, mgmt):
+        """Ask the whole subnet, then follow CDP from each Cisco switch to the ones beyond it."""
+        community, version = self.settings.get("snmp_community") or "public", self.settings.get("snmp_version")
+        with self.st.lock:
+            self.st.switches.update(running=True, stage="Starting…")
+        new = answered = 0
+        try:
+            net, hosts, _ = N.scan_hosts(ip, mask)
+            self._sw_stage(f"Asking {len(hosts)} addresses on {net}…")
+            queue = list(SN.sweep(hosts, community, version, stop=ev))
+            if mgmt and mgmt not in queue and SN.private_ip(mgmt):
+                queue.append(mgmt)                  # the switch this port is on, even on another subnet
+            tried, boots = set(), []
+            while queue and not ev.is_set() and len(tried) < SW_SCAN_MAX:
+                host = queue.pop(0)
+                if host in tried:
+                    continue
+                tried.add(host)
+                self._sw_stage(f"Checking {host}…")
+                try:
+                    with self._sw_client(host, timeout=1.0, retries=0) as c:   # most CDP neighbors are not switches
+                        info = SN.identify(c)
+                        answered += 1
+                        if not SN.is_switch(info):
+                            continue
+                        boot = time.monotonic() - (info["uptime"] or 0) / 100
+                        if any(n == info["name"] and abs(b - boot) < 5 for n, b in boots):
+                            continue                # the same switch answering on another of its addresses
+                        boots.append((info["name"], boot))
+                        new += self._sw_merge(host, info)
+                        if SN.is_cisco(info):
+                            queue += [n for n in SN.cdp_neighbors(c) if n not in tried]
+                except SN.SnmpError:
+                    continue
+            with self.st.lock:
+                total = len(self.st.switches["list"])
+            if ev.is_set():
+                self.st.say("Scan stopped", 3)
+            elif new:
+                self.st.say(f"Found {new} new switch{'es' if new != 1 else ''} ({total} listed)", 5)
+            elif total:
+                self.st.say("No new switches", 4)
+            else:
+                self.st.say("Nothing answered SNMP: check the community and version" if not answered
+                            else "Devices answered, but none is a switch", 6)
+        except Exception as e:  # noqa: BLE001
+            self.st.say(f"Scan error: {e}"[:70], 6)
+        finally:
+            with self.st.lock:
+                self.st.switches["running"] = False
+            self.sw_kick.set()
+
+    def sw_add(self, text):
+        try:
+            ip = str(ipaddress.IPv4Address(text.strip()))
+        except ValueError:
+            self.st.say("That is not an IP address", 4)
+            return
+        threading.Thread(target=self._sw_add, args=(ip,), daemon=True).start()
+
+    def _sw_add(self, ip):
+        self.st.say(f"Asking {ip}…", 3)
+        try:
+            with self._sw_client(ip) as c:
+                info = SN.identify(c)
+        except SN.SnmpError:
+            self.st.say(f"No SNMP answer from {ip}: check the address, community and version", 6)
+            return
+        new = self._sw_merge(ip, info)
+        self.st.say(f"{'Added' if new else 'Already listed:'} {info.get('name') or ip}", 4)
+        self.sw_kick.set()
+
+    def sw_remove(self, ip):
+        with self.st.lock:
+            lst = self.st.switches["list"]
+            lst[:] = [x for x in lst if x["ip"] != ip]
+        self.swwatch.pop(ip, None)
+        self._sw_save()
+
+    def sw_clear(self, ip, index=None, name=""):
+        """Forget the errors seen on one port, or on every port of a switch, and watch afresh."""
+        with self.sw_poll_lock:
+            watch = self.swwatch.get(ip)
+            if watch:
+                watch.clear(index)
+        self.st.say(f"Cleared {name or 'every port'}: watching for new errors from now", 4)
+        self.sw_kick.set()
+
+    def sw_set_community(self, v):
+        if v:
+            self.settings.set("snmp_community", v)
+            self.sw_kick.set()
+
+    def sw_next_version(self):
+        self.settings.set("snmp_version", 2 if self.settings.get("snmp_version") == 1 else 1)
+        self.sw_kick.set()
+
+    def sw_watch_start(self):
+        ev = self._new_stop("switches")
+        threading.Thread(target=self._sw_watch, args=(ev,), daemon=True).start()
+
+    def sw_watch_stop(self):
+        ev = self.stops.get("switches")
+        if ev:
+            ev.set()
+        self.sw_kick.set()
+
+    def _sw_watch(self, ev):
+        """Re-read every listed switch while the Switches page is open."""
+        while not ev.is_set():
+            with self.st.lock:
+                ips = [x["ip"] for x in self.st.switches["list"]]
+            workers = [threading.Thread(target=self._sw_poll, args=(ip,), daemon=True) for ip in ips]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join(30)
+            self.sw_kick.wait(SW_POLL_SECS)
+            self.sw_kick.clear()
+
+    def _sw_read(self, ip):
+        with self._sw_client(ip) as c:
+            got = c.get([SN.SYS_UPTIME, SN.SYS_NAME])
+            return SN.read_ports(c), got.get(SN.SYS_UPTIME), SN.text(got.get(SN.SYS_NAME))
+
+    def _sw_poll(self, ip):
+        ports, err = None, ""
+        try:
+            ports, uptime, name = self._sw_read(ip)
+        except SN.SnmpError as e:
+            err = str(e)
+        except Exception:  # noqa: BLE001
+            log_error(f"reading switch {ip}")
+            err = "Could not read this switch"
+        now = time.time()
+        with self.sw_poll_lock:
+            if ports is not None:
+                ports = self.swwatch.setdefault(ip, SN.SwitchWatch()).update(ports, uptime, now)
+            with self.st.lock:
+                x = next((x for x in self.st.switches["list"] if x["ip"] == ip), None)
+                if x is None:
+                    return
+                if ports is None:
+                    x.update(ok=False, msg=err, fails=x["fails"] + 1)
+                else:
+                    x.update(ok=True, msg="", fails=0, ports=ports, sum=SN.summarize(ports), polled=now,
+                             name=name or x["name"])
 
     # ---------------------------------------------------------- ping
     def ping_toggle(self):
@@ -2097,6 +2313,66 @@ class DemoBackend(Backend):
         threading.Thread(target=self.probe_loop, daemon=True).start()
         threading.Thread(target=self._demo_wire, daemon=True).start()
 
+    # Pretend switches for the Switches page: name, port prefix, access ports, uplinks, what is wrong.
+    DEMO_SWITCHES = {
+        "10.20.0.1": ("CORE-SW", "Gi", 48, 4, {"Gi0/3": "crc", "Gi0/9": "flap", "Gi0/20": "slow10",
+                                               "Gi0/31": "full", "Gi0/40": "drops"}),
+        "10.20.0.11": ("TABLE-A-SW", "Fa", 24, 2, {"Fa0/7": "crc", "Gi0/1": "busy", "Fa0/22": "shut"}),
+        "10.20.0.12": ("TABLE-B-SW", "Gi", 24, 4, {"Gi0/14": "slow100"}),
+        "10.20.0.13": ("TABLE-C-SW", "Fa", 24, 2, {}),
+    }
+
+    def _sw_scan(self, ev, ip, mask, mgmt):
+        with self.st.lock:
+            self.st.switches.update(running=True, stage="Asking 254 addresses on 10.20.30.0/24…")
+        time.sleep(0.8)
+        for host, spec in self.DEMO_SWITCHES.items():
+            self._sw_stage(f"Checking {host}…")
+            time.sleep(0.25)
+            self._sw_merge(host, {"name": spec[0], "descr": "Cisco IOS Software, C3560 Software"})
+        with self.st.lock:
+            self.st.switches["running"] = False
+        self.st.say(f"Found {len(self.DEMO_SWITCHES)} switches", 4)
+        self.sw_kick.set()
+
+    def _sw_add(self, ip):
+        self._sw_merge(ip, {"name": "SW-" + ip.rpartition(".")[2], "descr": "Cisco IOS Software, C3560 Software"})
+        self.sw_kick.set()
+
+    def _sw_read(self, ip):
+        name, kind, n, up, wrong = self.DEMO_SWITCHES.get(ip, ("SW-" + ip.rpartition(".")[2], "Fa", 24, 2, {}))
+        self.demo_sw_t0 = getattr(self, "demo_sw_t0", time.time())
+        t = time.time() - self.demo_sw_t0
+        speed = 1000 if kind == "Gi" else 100
+        names = [(f"{kind}0/{i}", speed) for i in range(1, n + 1)]
+        names += [(f"Gi0/{i + (n if kind == 'Gi' else 0)}", 1000) for i in range(1, up + 1)]
+        ports = []
+        for i, (pname, spd) in enumerate(names):
+            what = wrong.get(pname, "")
+            linked = i % 7 != 5 or bool(what)
+            c = dict(in_err=0, out_err=0, in_disc=0, out_disc=0, fcs=0, align=0, late=0, excess=0,
+                     in_oct=int(t * spd * 2500 * (1 + i % 5)), out_oct=int(t * spd * 900 * (1 + i % 3)))
+            p = dict(index=10001 + i, name=pname, descr=pname, alias=f"Seat {i + 1:02d}" if i < n else "Uplink",
+                     admin=what != "shut", oper=linked and what != "shut", speed=spd, duplex="full",
+                     last_change=4000, wide=True, c=c)
+            if what == "crc":                       # one cable keeps erroring, the other stops after a minute
+                c["fcs"] = c["in_err"] = int((t if pname.startswith("Gi") else min(t, 60)) * 2.4)
+            elif what == "drops":
+                c["out_disc"] = int(t * 31)
+            elif what in ("busy", "full"):
+                c["out_oct"] = int(t * spd * 125000 * (0.78 if what == "busy" else 0.96))
+            elif what == "slow10":
+                p["speed"] = 10
+                c["in_oct"] = c["out_oct"] = int(t * 40000)
+            elif what == "slow100":
+                p["speed"] = 100
+                c["in_oct"] = c["out_oct"] = int(t * 400000)
+            elif what == "flap":
+                p["oper"] = int(t // 40) % 3 != 1
+                p["last_change"] = 4000 + int(t // 40)
+            ports.append(p)
+        return ports, 8640000 + int(t * 100), name
+
     def wire_reset(self):
         self._demo_wire(once=True)
         self.st.say("Wire report restarted", 3)
@@ -2778,14 +3054,14 @@ class ListView(tk.Canvas):
 
 
 class ToolView(tk.Frame):
-    def __init__(self, master, ui, title, actions, chart=False):
+    def __init__(self, master, ui, title, actions, chart=False, back=None):
         super().__init__(master, bg=BG)
         self.ui = ui
         hdr = tk.Frame(self, bg=BG)
         hdr.pack(fill="x")
-        ui.button(hdr, "‹ Back", ui.show_tools, ui.sz["small"], bg=GREY, padx=ui.pad * 2).pack(side="left")
-        tk.Label(hdr, text=title, bg=BG, fg=FG, font=ui.font(ui.sz["sub"], "bold")).pack(
-            side="left", padx=ui.pad)
+        ui.button(hdr, "‹ Back", back or ui.show_tools, ui.sz["small"], bg=GREY, padx=ui.pad * 2).pack(side="left")
+        self.title = tk.Label(hdr, text=title, bg=BG, fg=FG, font=ui.font(ui.sz["sub"], "bold"))
+        self.title.pack(side="left", padx=ui.pad)
         self.act = []
         for text, cmd in reversed(actions):
             b = ui.button(hdr, text, cmd, ui.sz["small"], bg=BLUE, padx=ui.pad)
@@ -3010,7 +3286,18 @@ class UI:
                                                            ("30 s", self.be.capture_next_secs),
                                                            ("Folder", self.open_captures)]),
             "log": ToolView(self.body, self, "Port log", [("Open folder", self.open_data)]),
+            "switches": ToolView(self.body, self, "Switches", [("Scan", self.be.sw_scan_toggle),
+                                                              ("Add", self.sw_add_dialog),
+                                                              ("Community", self.sw_community_dialog),
+                                                              ("v2c", self.be.sw_next_version)], chart=0.5),
+            "swports": ToolView(self.body, self, "Switch", [("Clear all", self.sw_clear_open),
+                                                            ("Remove", self.sw_remove_open)], chart=0.42,
+                                back=lambda: self.show("switches")),
         }
+        self.sw_open = self.sw_port = self.sw_sig = self.swp_sig = None
+        self.sw_hits, self.swp_hits = [], []
+        self.tools["switches"].chart.bind("<ButtonRelease-1>", self._sw_tap)
+        self.tools["swports"].chart.bind("<ButtonRelease-1>", self._swp_tap)
         self.views.update(self.tools)
         self.build_settings()
 
@@ -3148,7 +3435,8 @@ class UI:
         self.views["TOOLS"] = page
         items = [("Ping", lambda: self.show("ping")), ("Tick test", lambda: self.show("tick")),
                  ("Traceroute", lambda: self.show("trace")), ("Speed test", lambda: self.show("speed")),
-                 ("Wire report", lambda: self.show("wire")), ("Multicast", self.open_mcast),
+                 ("Wire report", lambda: self.show("wire")), ("Switches", lambda: self.show("switches")),
+                 ("Multicast", self.open_mcast),
                  ("ARP table", self.open_arp), ("ARP scan", lambda: self.show("arpscan")),
                  ("mDNS browser", self.open_mdns), ("Capture", self.open_capture),
                  ("Port finder", lambda: self.show("blink")), ("Port log", lambda: self.show("log")),
@@ -3194,6 +3482,11 @@ class UI:
             return
         if self.cur == "mcast":
             self.be.mcast_stop()          # stop listening, and leave any group, when the view closes
+        sw = ("switches", "swports")      # switches are only read while one of their pages is open
+        if name in sw and self.cur not in sw:
+            self.be.sw_watch_start()
+        elif self.cur in sw and name not in sw:
+            self.be.sw_watch_stop()
         if self.cur:
             self.views[self.cur].pack_forget()
         self.views[name].pack(fill="both", expand=True)
@@ -3237,6 +3530,45 @@ class UI:
         Keyboard(self, "Multicast group to join", last, self.be.mcast_join,
                  "e.g. 239.1.2.3. This box joins the group like a receiver would, then shows "
                  "whether the stream arrives.")
+
+    def sw_add_dialog(self):
+        Keyboard(self, "Switch address", "", self.be.sw_add,
+                 "The switch's management IP, e.g. 10.2.1.2. It is asked with the community and SNMP "
+                 "version set on this page.")
+
+    def sw_community_dialog(self):
+        Keyboard(self, "SNMP community string", self.be.settings.get("snmp_community"),
+                 self.be.sw_set_community,
+                 "The read-only community set on your switches. Use Shift for capitals, or a real "
+                 "keyboard for other symbols. Saved in settings.json on this machine.")
+
+    def sw_clear_open(self):
+        """Clear the port that is picked, or the whole switch when none is."""
+        with self.st.lock:
+            x = next((x for x in self.st.switches["list"] if x["ip"] == self.sw_open), None)
+            name = next((p["name"] for p in x["ports"] if p["index"] == self.sw_port), "") if x else ""
+        if x:
+            self.be.sw_clear(self.sw_open, self.sw_port if name else None, name)
+
+    def sw_remove_open(self):
+        if self.sw_open:
+            self.be.sw_remove(self.sw_open)
+        self.show("switches")
+
+    def _sw_tap(self, e):
+        if self._moved(e) >= self.W * 0.04:
+            return
+        for x1, y1, x2, y2, ip in self.sw_hits:
+            if x1 <= e.x <= x2 and y1 <= e.y <= y2:
+                self.sw_open, self.sw_port = ip, None
+                self.show("swports")
+                return
+
+    def _swp_tap(self, e):
+        if self._moved(e) >= self.W * 0.04:
+            return
+        self.sw_port = next((idx for x1, y1, x2, y2, idx in self.swp_hits
+                             if x1 <= e.x <= x2 and y1 <= e.y <= y2), None)
 
     def open_capture(self):
         self.show("capture")
@@ -3916,6 +4248,218 @@ class UI:
             (f"Saved in {self.be.capture_dir()}. A capture stops by itself at 200 MB.", DIM, "dim"),
         ]
         v.list.set_rows(rows)
+
+    def render_switches(self, s, v, now):
+        sw, lst = s["switches"], s["switches"]["list"]
+        v1 = self.be.settings.get("snmp_version") == 1
+        v.set_action(0, "Stop" if sw["running"] else "Scan", RED if sw["running"] else BLUE)
+        v.set_action(3, "v1" if v1 else "v2c", GREY)
+        levels = [switch_level(x) for x in lst]
+        red, yellow = levels.count(SN.BAD), levels.count(SN.WARN)
+        if not lst:
+            head, col = "No switches yet", FG
+        elif red or yellow:
+            head = f"{len(lst)} switches · {red + yellow} need{'s' if red + yellow == 1 else ''} a look"
+            col = BAD if red else WARN
+        elif None in levels:
+            head, col = f"{len(lst)} switches · reading…", FG
+        else:
+            head, col = f"{len(lst)} switches · all clear", OK
+        if sw["running"]:
+            sub, sub_col = sw["stage"], WARN
+        else:
+            sub = (f"SNMP {'v1' if v1 else 'v2c'} · community {self.be.settings.get('snmp_community')} · "
+                   f"read every {SW_POLL_SECS} s while this page is open · tap a switch for its ports")
+            sub_col = DIM
+        v.set_summary(head, col, sub, sub_col)
+        self.draw_switches(v.chart, lst)
+        rows = []
+        for x in lst:
+            level = switch_level(x)
+            if level not in (SN.BAD, SN.WARN):
+                continue
+            rows.append((f"{x['name'] or x['ip']}   {x['ip']}", HDR, "hdr"))
+            if x["ok"] is False:
+                rows.append(("Not answering: " + (x["msg"] or "no reply"), BAD, "row"))
+            shown = [p for p in x["ports"] if p["level"] in (SN.BAD, SN.WARN)]
+            shown.sort(key=lambda p: -SN.RANK[p["level"]])
+            for p in shown[:6]:
+                rows.append((f"{p['name']}: {p['reasons'][0]}", SW_COLORS[p["level"]], "row"))
+            if len(shown) > 6:
+                rows.append((f"and {len(shown) - 6} more ports", DIM, "dim"))
+        if lst and not rows:
+            rows.append(("No port on any switch shows errors or link trouble.", OK, "row"))
+        if lst:
+            rows.append(("Green: every port clean. Yellow: something worth a look. Red: a port has errors or "
+                         f"link trouble now; a number appears when more than {SN.BADGE_OVER} ports are red.",
+                         DIM, "dim"))
+        v.list.set_rows(rows, "Tap Scan to look for switches on this network, or Add to type one's address.\n\n"
+                              "Scan asks every address on the subnet with the community above, then follows "
+                              "CDP from each Cisco switch to the ones plugged into it. Set Community and the "
+                              "SNMP version first if your switches don't use 'public' and v2c.")
+
+    def draw_switches(self, c, lst):
+        """The switches as a grid of icons, coloured by their worst port."""
+        w, h = c.winfo_width(), c.winfo_height()
+        sig = (w, h, tuple((x["ip"], x["name"], switch_level(x), x["sum"]["bad"] if x["sum"] else 0)
+                           for x in lst))
+        if sig == self.sw_sig or w < 20:
+            return
+        self.sw_sig = sig
+        c.delete("all")
+        self.sw_hits = []
+        n = len(lst)
+        if not n:
+            return
+        for cols in range(1, n + 1):                # the fewest columns whose rows still fit
+            tw = min(w / cols, w * 0.3)
+            th = tw * 0.62
+            if -(-n // cols) * th <= h:
+                break
+        else:
+            th = min(th, h)
+        x0, y0 = (w - tw * min(cols, n)) / 2, max(0, (h - -(-n // cols) * th) / 2)
+        f_name = self.font(max(10, int(th * 0.13)), "bold")
+        f_ip = self.mono(max(10, int(th * 0.12)))
+        for i, x in enumerate(lst):
+            tx, ty = x0 + (i % cols) * tw, y0 + (i // cols) * th
+            col = SW_COLORS.get(switch_level(x), DIM)
+            iw, ih = tw * 0.66, th * 0.36
+            ix, iy = tx + (tw - iw) / 2, ty + th * 0.12
+            lw = max(2, int(ih / 12))
+            c.create_rectangle(ix, iy, ix + iw, iy + ih, fill="#0d1117", outline=col, width=lw)
+            pitch = iw * 0.62 / 8                   # two rows of eight ports, then a pair of uplinks
+            dot = pitch * 0.7
+            for r in range(2):
+                for k in range(8):
+                    px, py = ix + iw * 0.06 + k * pitch, iy + ih / 2 + (r - 1) * pitch + (pitch - dot) / 2
+                    c.create_rectangle(px, py, px + dot, py + dot, fill=col, outline="")
+            for k in range(2):
+                px = ix + iw * 0.72 + k * iw * 0.12
+                c.create_rectangle(px, iy + ih * 0.3, px + iw * 0.08, iy + ih * 0.7, outline=col, width=lw)
+            bad = x["sum"]["bad"] if x["sum"] else 0
+            if bad > SN.BADGE_OVER:
+                r = ih * 0.3
+                c.create_oval(ix + iw - r, iy - r, ix + iw + r, iy + r, fill=BAD, outline=BG, width=2)
+                c.create_text(ix + iw, iy, text=str(bad), fill="white", font=self.font(max(9, int(r * 1.2)), "bold"))
+            name = x["name"] or "(no name)"
+            while len(name) > 4 and f_name.measure(name) > tw - self.pad:
+                name = name[:-2].rstrip("…") + "…"
+            c.create_text(tx + tw / 2, iy + ih + th * 0.07, anchor="n", text=name, fill=FG, font=f_name)
+            c.create_text(tx + tw / 2, iy + ih + th * 0.09 + f_name.metrics("linespace"), anchor="n",
+                          text=x["ip"], fill=DIM, font=f_ip)
+            self.sw_hits.append((tx, ty, tx + tw, ty + th, x["ip"]))
+
+    def render_swports(self, s, v, now):
+        x = next((x for x in s["switches"]["list"] if x["ip"] == self.sw_open), None)
+        if x is None:
+            self.show("switches")
+            return
+        title = x["name"] or x["ip"]
+        if v.title.cget("text") != title:
+            v.title.config(text=title)
+        sm = x["sum"]
+        info = " · ".join(b for b in (x["ip"], x["model"]) if b)
+        if x["ok"] is False:
+            v.set_summary("Not answering", BAD, f"{info} · {x['msg']}", BAD)
+        elif not sm:
+            v.set_summary("Reading the switch…", FG, info)
+        else:
+            head = f"{sm['up']} of {sm['total']} ports linked"
+            if sm["bad"] or sm["warn"]:
+                head += " · " + ", ".join(t for t in (f"{sm['bad']} red" if sm["bad"] else "",
+                                                      f"{sm['warn']} yellow" if sm["warn"] else "") if t)
+            else:
+                head += " · all clean"
+            v.set_summary(head, SW_COLORS[sm["level"]],
+                          f"{info} · read {max(0, int(now - x['polled']))} s ago · tap a port for its details")
+        ports = x["ports"]
+        self.draw_front(v.chart, ports)
+        sel = next((p for p in ports if p["index"] == self.sw_port), None)
+        v.set_action(0, "Clear port" if sel else "Clear all")
+        if sel:
+            v.list.set_rows(self.port_rows(sel))
+            return
+        rows = []
+        for p in sorted((p for p in ports if p["level"] in (SN.BAD, SN.WARN)), key=lambda p: -SN.RANK[p["level"]]):
+            name = p["name"] + (f" ({p['alias']})" if p["alias"] else "")
+            rows.append((f"{name}: {'; '.join(p['reasons'])}", SW_COLORS[p["level"]], "row"))
+        if ports and not rows:
+            rows.append(("Every linked port is clean.", OK, "row"))
+        if ports:
+            rows.append(("Green: linked and clean. Yellow: worth a look. Red: errors or link trouble now. "
+                         "Grey: nothing plugged in. Dark: shut down on the switch.", DIM, "dim"))
+            rows.append(("Errors only count from when this page started watching, so old history on the "
+                         "switch does not turn a port red. Clear all starts every port fresh.", DIM, "dim"))
+        v.list.set_rows(rows, "Waiting for the switch's first answer…")
+
+    def port_rows(self, p):
+        col = SW_COLORS[p["level"]] if p["level"] in (SN.GOOD, SN.WARN, SN.BAD) else DIM
+        rows = [(p["name"] + (f" · {p['alias']}" if p["alias"] else ""), HDR, "hdr")]
+        if not p["admin"]:
+            rows.append(("Shut down on the switch", DIM, "row"))
+        elif not p["oper"]:
+            rows.append(("No link", DIM, "row"))
+        else:
+            speed = f"{p['speed'] / 1000:g} Gb" if p["speed"] >= 1000 else f"{p['speed']} Mb"
+            rows.append((f"Linked at {speed}" + (f", {p['duplex']} duplex" if p["duplex"] else ""), FG, "row"))
+        rows += [(r, col, "row") for r in p["reasons"] if p["level"] in (SN.WARN, SN.BAD)]
+        if p["level"] == SN.GOOD:
+            rows.append(("No problems seen", OK, "row"))
+        if p["oper"] and p["out_mbps"] is not None:
+            rows.append((f"Traffic: {p['in_mbps']:.1f} Mb/s in, {p['out_mbps']:.1f} Mb/s out"
+                         + (f" ({p['busy']}% of the port's speed)" if p["busy"] is not None else ""), FG, "row"))
+        def totals(c):
+            c = {k: v or 0 for k, v in c.items()}
+            return (f"Receive errors {c['in_err']:,} (CRC {c['fcs'] + c['align']:,})   Send errors {c['out_err']:,}"
+                    f"   Dropped {c['in_disc'] + c['out_disc']:,}")
+        if p["since_clear"] is not None:
+            rows += [("Since you tapped Clear", DIM, "dim"), (totals(p["since_clear"]), FG, "row")]
+        rows += [("The switch's own totals, which only restart when the switch does", DIM, "dim"),
+                 (totals(p["c"]), FG, "row"),
+                 ("Clear port wipes what was seen here and watches again from now, so you can tell whether "
+                  "the errors come back. Tap an empty part of the switch to go back to the list.", DIM, "dim")]
+        return rows
+
+    def draw_front(self, c, ports):
+        """The front of the switch: odd ports on top, even below, coloured by what is wrong."""
+        w, h = c.winfo_width(), c.winfo_height()
+        sig = (w, h, self.sw_port, tuple((p["index"], p["level"]) for p in ports))
+        if sig == self.swp_sig or w < 20:
+            return
+        self.swp_sig = sig
+        c.delete("all")
+        self.swp_hits = []
+        rows = SN.layout(ports)
+        if not rows:
+            return
+
+        def units(row):                             # widths in port-sized cells, with a gap between blocks
+            return sum(max(len(b["top"]), len(b["bottom"])) for b in row) + len(row)
+        cell = min((w - 2 * self.pad) / max(units(r) for r in rows), (h - self.pad) / (len(rows) * 3.2), w * 0.07)
+        y0 = (h - len(rows) * cell * 3.2) / 2
+        font = self.font(max(8, int(cell * 0.4)), "bold")
+        for r, row in enumerate(rows):
+            cw = units(row) * cell
+            cx, cy = (w - cw) / 2, y0 + r * cell * 3.2 + cell * 0.6
+            c.create_rectangle(cx, cy, cx + cw, cy + cell * 2.5, fill="#0d1117", outline=GREY, width=2)
+            px = cx + cell * 0.5
+            for b in row:
+                c.create_text(px + cell * 0.07, cy - cell * 0.08, anchor="sw", text=b["label"], fill=DIM,
+                              font=self.font(max(9, int(cell * 0.36))))
+                for line, ports_in in enumerate((b["top"], b["bottom"])):
+                    for k, p in enumerate(ports_in):
+                        x1 = px + k * cell + cell * 0.07
+                        y1 = cy + cell * (0.25 + line if b["bottom"] else 0.75) + cell * 0.07
+                        s = cell * 0.86
+                        picked = p["index"] == self.sw_port
+                        c.create_rectangle(x1, y1, x1 + s, y1 + s, fill=SW_COLORS[p["level"]],
+                                           outline="white" if picked else "", width=3 if picked else 0)
+                        if cell >= 18:
+                            c.create_text(x1 + s / 2, y1 + s / 2, text=SN.short_name(p["name"]), font=font,
+                                          fill=BG if p["level"] in (SN.GOOD, SN.WARN, SN.BAD) else DIM)
+                        self.swp_hits.append((x1, y1, x1 + s, y1 + s, p["index"]))
+                px += (max(len(b["top"]), len(b["bottom"])) + 1) * cell
 
     def render_blink(self, s, v, now):
         b = s["blink"]

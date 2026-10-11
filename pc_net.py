@@ -1271,7 +1271,8 @@ class Oui:
 # ====================================================================== settings + port log
 class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
-                "iperf_port": 5201, "smart_services": False, "tick_server": "", "tick_claude": False}
+                "iperf_port": 5201, "smart_services": False, "tick_server": "", "tick_claude": False,
+                "snmp_community": "public", "snmp_version": 2, "switches": []}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")

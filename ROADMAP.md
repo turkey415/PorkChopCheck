@@ -23,8 +23,8 @@ Ask the server directly for its name, map, players and response time, and test t
 ### Player PC check
 Run from a USB stick on a player's machine: Wi-Fi active alongside Ethernet, VPN running, background downloads, network card power saving, firewall blocking game ports.
 
-### Switch readout over SNMP
-Read the table switches (Cisco Catalyst 3560 first) with a read-only login: which port every network card is on, plus uplink usage, error counters, port descriptions and VLANs. This is what turns an address into a seat for the match watch and the LAN game browser, and where congestion between the tables and the server shows up.
+### Switch readout: which seat is on which port
+The Switches page already reads every switch's ports (see Already shipped). Still to do: read each switch's address table to learn which port every network card is on, plus port descriptions and VLANs. This is what turns an address into a seat for the match watch and the LAN game browser.
 
 ### LAN game browser
 List every game server running on the LAN, including "listen" servers a player started from inside a game: game, server name, map, players, host address and the seat it is being played at. Finds them the way the games' own LAN tabs do (a broadcast query for Source and other Steam games, listening for the announcements Minecraft and others send out) and refreshes live. The seat comes from the seat sheet, by matching the host's network card to the switch port saved for that seat.
@@ -77,6 +77,7 @@ Not committed to, but worth thinking about:
 
 ## Already shipped
 
+- **Switches:** Tools › Switches finds switches over SNMP v1 or v2c (Cisco Catalyst first) and shows each as an icon that turns yellow or red when a port has errors, link trouble or is running full, with a front-panel view of every port.
 - **Wire report:** flow control and PAUSE counters, Energy Efficient Ethernet, speed downshift, flooding, loudest senders, IP conflicts, IPv6 routers, LACP/UDLD/VTP, ICMP redirects and MTU notices.
 - **Tick test:** UDP at 64 or 128 packets a second to a reflector (`porkchopcheck --reflector`), reporting loss bursts, jitter, late and out-of-order packets.
 - **Event timeline:** the Ping graph marks link, spanning-tree, gateway, broadcast, duplicate-IP and DHCP events and says what each did to latency.
