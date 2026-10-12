@@ -71,7 +71,16 @@ Tools about the computer PorkChopCheck is running on, not the port it is plugged
 - **All interfaces:** list every network connection on the machine, not only the Ethernet port being tested: Wi-Fi, VPN and other tunnels, bridges, virtual and loopback interfaces, each with its state, addresses, MAC address and speed.
 
 ### Public DNS ranking
-A list of the popular public DNS servers, sorted fastest first. Pinging starts when the page opens and the list keeps re-sorting as results come in, with the DNS servers this port was given shown alongside for comparison. Each row has the name, address, latest and average time, and loss. A second column could time a real name lookup, since a server can answer ping quickly and still resolve slowly.
+A list of the popular public DNS servers, sorted fastest first. Testing starts when the page opens and the list keeps re-sorting as results come in. The DNS servers this port was given are shown alongside for comparison.
+
+Each row shows:
+- name and address
+- latest and average ping time, and loss
+- time to resolve a name, asked of that server directly, and the answer it gave
+
+Two custom entries, set with the on-screen keyboard and saved:
+- **Custom name:** the name every server is asked to resolve, in place of the built-in test name. Seeing each server's answer side by side shows when one resolves a name differently from the rest, or not at all.
+- **Custom DNS server:** one more server address added to the list, such as an internal or ISP resolver, so it is ranked against the public ones.
 
 Starting list (addresses to be checked when this is built):
 
