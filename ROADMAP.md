@@ -64,6 +64,12 @@ Compare each SMART scan with the saved inventory and highlight devices that have
 ### Port report
 One tap makes a clean, printable page for the current port: switch, port, VLANs, PoE, speed and duplex, DHCP, 802.1X, test results, and your label. Good for tickets and handoff documentation.
 
+### This machine
+Tools about the computer PorkChopCheck is running on, not the port it is plugged into:
+- **Hosts file editor:** add, change or remove a hosts entry in a few taps, for when a name has to point somewhere right now. Needs admin rights to save, on Windows and Linux.
+- **Routes:** show this machine's routing table: each destination, the gateway it goes through, the interface and the metric, with the default route marked.
+- **All interfaces:** list every network connection on the machine, not only the Ethernet port being tested: Wi-Fi, VPN and other tunnels, bridges, virtual and loopback interfaces, each with its state, addresses, MAC address and speed.
+
 ### Quick checks
 Small tools that come up all the time:
 - **TCP port test:** can this port reach `host:port`? (e.g. a printer on 9100)
