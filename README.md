@@ -56,7 +56,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
 | **STATS** | MAC, adapter, errors, discards, throughput, link drops, plus Next adapter / Reset / Renew DHCP / Bounce |
-| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Wire report (flow control, EEE, flooding, loud senders, conflicts, rogue routers), Switches (every switch as an icon that turns red or yellow when a port has errors or link trouble, read over SNMP), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
+| **TOOLS** | Ping (loss, jitter, and a graph with port events marked on it), Tick test (game-rate UDP: loss bursts, jitter, late packets), Wire report (flow control, EEE, flooding, loud senders, conflicts, rogue routers), Switches (every switch as an icon that turns red or yellow when a port has errors or link trouble, read over SNMP), NIC settings (the network card's advanced settings, with the ones that hurt Counter-Strike in red or yellow), Traceroute, Speed test (iperf3 + internet), ARP table, ARP scan (flags duplicate IPs), mDNS browser, Port finder (blinks the switch port LED), Capture (records the port to a `.pcap`), Multicast (groups, IGMP querier, join test), Port log, Re-run checks, Settings |
 | **SAVE** | Logs this port with an optional label typed on the on-screen keyboard |
 
 The banner turns red or amber for: no link, duplicate IP, 802.1X with no access, no DHCP, gateway not replying, multiple DHCP servers, and no internet.
@@ -199,6 +199,24 @@ Good to know:
 - The community string is saved in `settings.json` in the data folder, as plain text. SNMP v1 and v2c send it unencrypted, so use a read-only community.
 - Built for Cisco Catalyst switches, and tried on a Catalyst 3850 and a 3750-X. Other makes that support the standard interface tables should show up, but have not been tried.
 
+## NIC settings
+
+**Tools › NIC settings** lists the advanced settings of the selected network card and marks the ones that matter for Counter-Strike.
+
+| Colour | Meaning | Settings |
+|---|---|---|
+| **Red** | Known to cause lag or lost packets. Fix these | Energy Efficient Ethernet or Green Ethernet on, Windows allowed to turn the card off, half duplex or 10 Mb, Wi-Fi connected at the same time |
+| **Yellow** | Worth changing. The effect is smaller, or players disagree | Interrupt moderation on, flow control on, Receive Side Scaling off, jumbo packets on, buffers at their smallest, a forced speed, linked at 100 Mb, a driver more than four years old |
+| **Green** | Set right | |
+| **Grey** | No effect on Counter-Strike, whatever the tweak guides say | Large send offload, checksum offloads and other TCP-only features (game traffic is UDP), wake-on-LAN |
+
+- Each red or yellow line says what to set and why. Settings the app does not recognise are listed without a grade.
+- **It only reads.** Nothing is changed. Change a setting in Device Manager › the adapter › Advanced, then tap **Refresh**.
+- **To see whether a change helped**, run the Tick test before and after.
+- **Advice ON / OFF** turns the colours and recommendations off, leaving a plain list.
+- The grades are a starting point drawn from common Counter-Strike tuning advice, not measurements from your PC.
+- On Windows the settings come from the adapter's Advanced tab and power management. On Linux they come from `ethtool`, which reports fewer of them.
+
 ## Multicast browser
 
 **Tools › Multicast** shows what multicast is crossing the port, and helps explain why a stream is missing.
@@ -276,6 +294,7 @@ python tests/test_pc_net.py   # every packet decoder/builder + the port log
 python tests/test_linux.py    # Linux parsers for ip / nmcli / ethtool / ping output
 python tests/test_smart.py    # smart-home protocols, AES, classification, device inventory
 python tests/test_snmp.py     # SNMP client against a pretend switch, port grading, front-panel layout
+python tests/test_nic.py      # NIC settings: naming, on/off states and grading, from saved Windows and ethtool answers
 python tests/test_launcher.py # Linux launcher: builds it and checks what it passes to Python
 python tests/test_version.py  # the version line and the release step that writes it
 ```
