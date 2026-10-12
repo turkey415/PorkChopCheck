@@ -75,6 +75,17 @@ def is_ipv4(s):
         return False
 
 
+def parse_host(text):
+    """An IPv4 address or a host name to ping, lower-cased, or None when it is neither."""
+    text = (text or "").strip().lower()
+    if is_ipv4(text):
+        return text
+    label = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    if re.fullmatch(rf"{label}(\.{label})*", text) and not text.replace(".", "").isdigit():
+        return text
+    return None
+
+
 def first_v4(values):
     for v in as_list(values):
         if is_ipv4(v):
@@ -1273,7 +1284,7 @@ class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
                 "iperf_port": 5201, "smart_services": False, "tick_server": "", "tick_claude": False,
                 "snmp_community": "public", "snmp_version": 2, "switches": [],
-                "nic_advice": True}
+                "nic_advice": True, "ping_custom": "", "trace_custom": "", "trace_live": True}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")

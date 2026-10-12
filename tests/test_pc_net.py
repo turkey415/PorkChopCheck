@@ -325,6 +325,13 @@ check("tick verdict: three lost in a row is bad even under 1% loss", N.tick_summ
 jittery = [(i / 64, 1.0 + (10.0 if i % 2 else 0)) for i in range(640)]
 check("tick verdict, Claude settings: jitter over half a tick is bad", N.tick_verdict(N.tick_summary(jittery, 64), 64, True) == ("Bad for Counter-Strike: jitter", "bad"))
 check("tick verdict: jitter that makes no reply late does not lower the grade", N.tick_verdict(N.tick_summary(jittery, 64), 64) == ("Excellent for Counter-Strike", "excellent"))
+check("host: an address is kept", N.parse_host(" 10.1.2.3 ") == "10.1.2.3")
+check("host: a name is lower-cased", N.parse_host("Server.LAN") == "server.lan")
+check("host: a short or out-of-range address is refused",
+      N.parse_host("10.1.2") is None and N.parse_host("10.1.2.999") is None)
+check("host: options, spaces and empty text are refused",
+      not any(N.parse_host(x) for x in ("-c5", "a b", "", None, "a..b", "x/y")))
+check("settings: traceroute keeps watching hops unless switched off", N.Settings(tempfile.mkdtemp()).get("trace_live") is True)
 check("settings: Claude's tick settings are off until switched on", N.Settings(tempfile.mkdtemp()).get("tick_claude") is False)
 check("tick verdict: nothing back at all", N.tick_verdict(N.tick_summary([(i / 64, None) for i in range(64)], 64), 64) == ("No replies", "bad"))
 check("tick verdict: nothing sent yet", N.tick_verdict(N.tick_summary([], 64), 64)[1] == "wait")
