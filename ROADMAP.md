@@ -70,6 +70,18 @@ Tools about the computer PorkChopCheck is running on, not the port it is plugged
 - **Routes:** show this machine's routing table: each destination, the gateway it goes through, the interface and the metric, with the default route marked.
 - **All interfaces:** list every network connection on the machine, not only the Ethernet port being tested: Wi-Fi, VPN and other tunnels, bridges, virtual and loopback interfaces, each with its state, addresses, MAC address and speed.
 
+### CGNAT and double NAT on the Internet tile
+A yellow word on the PORT page's Internet tile when the connection sits behind more address translation than the one router. Both break port forwarding and hosting a game server, so they are worth knowing before anyone tries.
+
+- **CGNAT:** the internet provider shares one public address between many customers. Found when this port's own address, the router's outside address or a hop just past the router is in the range set aside for it (`100.64.0.0/10`).
+- **DOUBLE NAT:** a second router is translating behind the first, such as a personal router plugged into the provider's own. Found when the router's outside address is a private one, or the first hops out pass through more than one private network.
+
+How it finds out, most reliable first:
+1. Ask the router for its outside address (UPnP, NAT-PMP or PCP) and compare it with the public IP the tile already shows. If they differ, something upstream is translating again; the kind of address says which.
+2. Trace the first few hops and look at the addresses after the gateway. This works when the router will not answer the question, but it is a hint, not proof: some providers use private addresses inside their own network.
+
+The tile says how sure it is: a plain word when the router confirmed it, and "likely" when it is read from the trace alone.
+
 ### Public DNS ranking
 A list of the popular public DNS servers, sorted fastest first. Testing starts when the page opens and the list keeps re-sorting as results come in. The DNS servers this port was given are shown alongside for comparison.
 
