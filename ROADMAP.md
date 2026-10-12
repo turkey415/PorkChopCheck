@@ -70,6 +70,26 @@ Tools about the computer PorkChopCheck is running on, not the port it is plugged
 - **Routes:** show this machine's routing table: each destination, the gateway it goes through, the interface and the metric, with the default route marked.
 - **All interfaces:** list every network connection on the machine, not only the Ethernet port being tested: Wi-Fi, VPN and other tunnels, bridges, virtual and loopback interfaces, each with its state, addresses, MAC address and speed.
 
+### Public DNS ranking
+A list of the popular public DNS servers, sorted fastest first. Pinging starts when the page opens and the list keeps re-sorting as results come in, with the DNS servers this port was given shown alongside for comparison. Each row has the name, address, latest and average time, and loss. A second column could time a real name lookup, since a server can answer ping quickly and still resolve slowly.
+
+Starting list (addresses to be checked when this is built):
+
+| Service | Address |
+|---|---|
+| Cloudflare | 1.1.1.1 |
+| Google | 8.8.8.8 |
+| Quad9 | 9.9.9.9 |
+| OpenDNS (Cisco) | 208.67.222.222 |
+| AdGuard | 94.140.14.14 |
+| CleanBrowsing | 185.228.168.9 |
+| Control D | 76.76.2.0 |
+| DNS.SB | 185.222.222.222 |
+| Level3 | 4.2.2.2 |
+| Comodo Secure | 8.26.56.26 |
+| UltraDNS (was Verisign) | 64.6.64.6 |
+| Yandex | 77.88.8.8 |
+
 ### Quick checks
 Small tools that come up all the time:
 - **TCP port test:** can this port reach `host:port`? (e.g. a printer on 9100)
