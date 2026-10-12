@@ -70,6 +70,47 @@ Tools about the computer PorkChopCheck is running on, not the port it is plugged
 - **Routes:** show this machine's routing table: each destination, the gateway it goes through, the interface and the metric, with the default route marked.
 - **All interfaces:** list every network connection on the machine, not only the Ethernet port being tested: Wi-Fi, VPN and other tunnels, bridges, virtual and loopback interfaces, each with its state, addresses, MAC address and speed.
 
+### CGNAT and double NAT on the Internet tile
+A yellow note on the PORT page's Internet tile when the connection sits behind more address translation than the one router. Both break port forwarding and hosting a game server, so they are worth knowing before anyone tries.
+
+- **`CGNAT`:** the internet provider shares one public address between many customers. Found when this port's own address, the router's outside address or a hop just past the router is in the range set aside for it (`100.64.0.0/10`).
+- **`Possible Double NAT Detected`:** a second router is translating behind the first, such as a personal router plugged into the provider's own. Found when the router's outside address is a private one, or the first hops out pass through more than one private network.
+
+How it finds out, most reliable first:
+1. Ask the router for its outside address (UPnP, NAT-PMP or PCP) and compare it with the public IP the tile already shows. If they differ, something upstream is translating again; the kind of address says which.
+2. Trace the first few hops and look at the addresses after the gateway. This works when the router will not answer the question, but it is a hint, not proof: some providers use private addresses inside their own network.
+
+The wording matches how sure the check can be. CGNAT has its own address range, so the tile says `CGNAT` outright, or `Possible CGNAT` when the only sign is a hop in the trace. Double NAT is always worded `Possible Double NAT Detected`, because a private address upstream is not proof of a second router.
+
+### Public DNS ranking
+A list of the popular public DNS servers, sorted fastest first. Testing starts when the page opens and the list keeps re-sorting as results come in. The DNS servers this port was given are shown alongside for comparison.
+
+Each row shows:
+- name and address
+- latest and average ping time, and loss
+- time to resolve a name, asked of that server directly, and the answer it gave
+
+Two custom entries, set with the on-screen keyboard and saved:
+- **Custom name:** the name every server is asked to resolve, in place of the built-in test name. Seeing each server's answer side by side shows when one resolves a name differently from the rest, or not at all.
+- **Custom DNS server:** one more server address added to the list, such as an internal or ISP resolver, so it is ranked against the public ones.
+
+Starting list (addresses to be checked when this is built):
+
+| Service | Address |
+|---|---|
+| Cloudflare | 1.1.1.1 |
+| Google | 8.8.8.8 |
+| Quad9 | 9.9.9.9 |
+| OpenDNS (Cisco) | 208.67.222.222 |
+| AdGuard | 94.140.14.14 |
+| CleanBrowsing | 185.228.168.9 |
+| Control D | 76.76.2.0 |
+| DNS.SB | 185.222.222.222 |
+| Level3 | 4.2.2.2 |
+| Comodo Secure | 8.26.56.26 |
+| UltraDNS (was Verisign) | 64.6.64.6 |
+| Yandex | 77.88.8.8 |
+
 ### Quick checks
 Small tools that come up all the time:
 - **TCP port test:** can this port reach `host:port`? (e.g. a printer on 9100)
