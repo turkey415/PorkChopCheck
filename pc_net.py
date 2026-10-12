@@ -1272,7 +1272,8 @@ class Oui:
 class Settings:
     DEFAULTS = {"announce": True, "autolog": True, "hostname": "", "iperf_server": "",
                 "iperf_port": 5201, "smart_services": False, "tick_server": "", "tick_claude": False,
-                "snmp_community": "public", "snmp_version": 2, "switches": []}
+                "snmp_community": "public", "snmp_version": 2, "switches": [],
+                "nic_advice": True}
 
     def __init__(self, folder):
         self.path = os.path.join(folder, "settings.json")

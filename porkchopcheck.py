@@ -17,8 +17,8 @@ Run:   Windows: double-click porkchopcheck.py (asks for admin once, opens fullsc
        python porkchopcheck.py --windowed --size 800x480   |   --fullscreen
        python porkchopcheck.py --demo      (fake data, to preview the screens)
 Keys:  1-5 pages  S save  R renew  A next adapter  F11 fullscreen  Esc back  Q quit
-Needs: Python 3.10+, psutil, scapy (+ Npcap on Windows). pc_net.py, pc_smart.py and pc_snmp.py
-       must sit next to this file.
+Needs: Python 3.10+, psutil, scapy (+ Npcap on Windows). pc_net.py, pc_smart.py, pc_snmp.py and
+       pc_nic.py must sit next to this file.
 """
 
 import collections
@@ -129,8 +129,9 @@ try:
     import pc_net as N
     import pc_smart as S
     import pc_snmp as SN
+    import pc_nic as NC
 except Exception as e:  # noqa: BLE001
-    _fatal("PorkChopCheck couldn't load pc_net.py / pc_smart.py / pc_snmp.py. Keep them in the same folder as "
+    _fatal("PorkChopCheck couldn't load pc_net.py / pc_smart.py / pc_snmp.py / pc_nic.py. Keep them in the same folder as "
            "porkchopcheck.py.\n\n" + repr(e))
 
 IS_WIN = N.IS_WIN
@@ -273,6 +274,7 @@ class State:
                         "file": "", "msg": "", "ok": True, "files": []}
         self.smart = {"running": False, "stage": "", "devices": [], "ts": None, "counts": {}}
         self.switches = {"running": False, "stage": "", "list": []}
+        self.adv = {"running": False, "name": None, "report": None, "ts": None}
         self.reset_adapter()
 
     def reset_adapter(self):
@@ -1671,6 +1673,26 @@ class Backend:
                     self.st.arp_table = {"running": False, "rows": rows, "ts": time.time()}
         threading.Thread(target=work, daemon=True).start()
 
+    def adv_refresh(self):
+        """Read the selected adapter's advanced settings."""
+        with self.st.lock:
+            name = self.st.sel
+            if self.st.adv["running"] or not name:
+                return
+            self.st.adv.update(running=True, name=name)
+
+        def work():
+            report = None
+            try:
+                report = self._adv_read(name)
+            finally:
+                with self.st.lock:
+                    self.st.adv = {"running": False, "name": name, "report": report, "ts": time.time()}
+        threading.Thread(target=work, daemon=True).start()
+
+    def _adv_read(self, name):
+        return NC.read(name)
+
     def arp_scan_toggle(self):
         with self.st.lock:
             sc = self.st.arp_scan
@@ -2471,6 +2493,32 @@ class DemoBackend(Backend):
         if random.random() < 0.004:
             return ("timeout", None, None)
         return ("ok", dst, random.uniform(0.4, 2.5))
+
+    def _adv_read(self, name):
+        """A Realtek card left on its factory settings, as Windows reports it."""
+        time.sleep(0.6)
+        P = lambda n, v, k, r, lo=None, hi=None: {"DisplayName": n, "DisplayValue": v, "RegistryKeyword": k,  # noqa: E731
+                                                  "RegistryValue": r, "Min": lo, "Max": hi}
+        return NC.windows_report({
+            "Description": "Realtek PCIe GbE Family Controller", "Provider": "Realtek", "Driver": "10.50.511.2021",
+            "DriverDate": "2021-05-11", "Speed": 1_000_000_000, "FullDuplex": True, "TurnOff": "Enabled",
+            "Others": [{"Name": "Wi-Fi", "Media": "Native 802.11"}],
+            "Props": [P("Energy-Efficient Ethernet", "Enabled", "*EEE", "1"),
+                      P("Green Ethernet", "Enabled", "EnableGreenEthernet", "1"),
+                      P("Interrupt Moderation", "Enabled", "*InterruptModeration", "1"),
+                      P("Flow Control", "Rx & Tx Enabled", "*FlowControl", "3"),
+                      P("Receive Side Scaling", "Enabled", "*RSS", "1"),
+                      P("Jumbo Frame", "Disabled", "*JumboPacket", "1514"),
+                      P("Speed & Duplex", "Auto Negotiation", "*SpeedDuplex", "0"),
+                      P("Receive Buffers", "512", "*ReceiveBuffers", "512", 64, 2048),
+                      P("Transmit Buffers", "128", "*TransmitBuffers", "128", 64, 2048),
+                      P("Large Send Offload v2 (IPv4)", "Enabled", "*LsoV2IPv4", "1"),
+                      P("TCP Checksum Offload (IPv4)", "Rx & Tx Enabled", "*TCPChecksumOffloadIPv4", "3"),
+                      P("UDP Checksum Offload (IPv4)", "Rx & Tx Enabled", "*UDPChecksumOffloadIPv4", "3"),
+                      P("Wake on Magic Packet", "Enabled", "*WakeOnMagicPacket", "1"),
+                      P("ARP Offload", "Enabled", "*PMARPOffload", "1"),
+                      P("Gigabit Lite", "Enabled", "GigaLite", "1"),
+                      P("Network Address", "Not Present", "NetworkAddress", "")]})
 
     def _arp_table(self, name):
         return [("10.20.30.1", "00:00:0c:07:ac:1e", "Reachable"),
@@ -3293,6 +3341,8 @@ class UI:
             "swports": ToolView(self.body, self, "Switch", [("Clear all", self.sw_clear_open),
                                                             ("Remove", self.sw_remove_open)], chart=0.42,
                                 back=lambda: self.show("switches")),
+            "adv": ToolView(self.body, self, "NIC settings", [("Refresh", self.be.adv_refresh),
+                                                              ("Advice ON", self.toggle("nic_advice"))]),
         }
         self.sw_open = self.sw_port = self.sw_sig = self.swp_sig = None
         self.sw_hits, self.swp_hits = [], []
@@ -3436,7 +3486,7 @@ class UI:
         items = [("Ping", lambda: self.show("ping")), ("Tick test", lambda: self.show("tick")),
                  ("Traceroute", lambda: self.show("trace")), ("Speed test", lambda: self.show("speed")),
                  ("Wire report", lambda: self.show("wire")), ("Switches", lambda: self.show("switches")),
-                 ("Multicast", self.open_mcast),
+                 ("NIC settings", self.open_adv), ("Multicast", self.open_mcast),
                  ("ARP table", self.open_arp), ("ARP scan", lambda: self.show("arpscan")),
                  ("mDNS browser", self.open_mdns), ("Capture", self.open_capture),
                  ("Port finder", lambda: self.show("blink")), ("Port log", lambda: self.show("log")),
@@ -3505,6 +3555,10 @@ class UI:
     def open_arp(self):
         self.show("arp")
         self.be.arp_refresh()
+
+    def open_adv(self):
+        self.be.adv_refresh()
+        self.show("adv")
 
     def open_mdns(self):
         self.show("mdns")
@@ -4150,6 +4204,34 @@ class UI:
         v.list.set_rows(rows, "Tap Scan to browse Bonjour / mDNS services")
 
     LEVEL_COLOR = {"ok": OK, "info": FG, "warn": WARN, "bad": BAD}
+
+    def render_adv(self, s, v, now):
+        a = s["adv"]
+        advice = self.be.settings.get("nic_advice")
+        v.set_action(1, "Advice ON" if advice else "Advice OFF", BLUE if advice else GREY)
+        if s["sel"] and a["name"] != s["sel"] and not a["running"]:
+            self.be.adv_refresh()                   # the adapter changed while the page was open
+        rep = a["report"] if a["name"] == s["sel"] else None
+        if not rep or not rep["items"]:
+            v.set_summary("Reading…" if a["running"] or not a["ts"] else "No settings read", FG,
+                          f"The advanced settings of {s['sel'] or 'the adapter'}")
+            v.list.set_rows([], "" if a["running"] else ("Install ethtool to read this card's settings." if IS_LINUX
+                                                         else "This adapter did not report any settings."))
+            return
+        head, level = NC.headline(rep) if advice else (f"{len(rep['items'])} settings", "info")
+        when = time.strftime("%H:%M:%S", time.localtime(a["ts"]))
+        v.set_summary(head, self.LEVEL_COLOR[level],
+                      f"{rep['adapter'] or a['name']} · read {when} · "
+                      + ("graded for Counter-Strike; nothing is changed" if advice else "advice is off"))
+        color = {"bad": BAD, "warn": WARN, "ok": OK, "note": DIM, "info": FG}
+        mark = {"bad": "✗ ", "warn": "• ", "ok": "✓ "}
+        rows, last = [], None
+        for sec, lv, text in NC.rows(rep, advice):
+            if sec != last:
+                rows.append((sec, HDR, "hdr"))
+                last = sec
+            rows.append((mark.get(lv, "") + text, color[lv], "row"))
+        v.list.set_rows(rows)
 
     def render_wire(self, s, v, now):
         w = s["wire"]

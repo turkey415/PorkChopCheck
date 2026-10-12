@@ -23,6 +23,12 @@ Ask the server directly for its name, map, players and response time, and test t
 ### Player PC check
 Run from a USB stick on a player's machine: Wi-Fi active alongside Ethernet, VPN running, background downloads, network card power saving, firewall blocking game ports.
 
+The NIC settings page is the first part of this (see Already shipped). Still to do:
+- Try it on Intel, Realtek and Killer cards on Windows and fill in the settings it does not recognise yet.
+- A before-and-after button: run the tick test, change a setting, run it again and show the difference.
+- Check the grades with real Counter-Strike players, along with the tick test grades.
+- The rest of the check: VPN, background downloads and the firewall.
+
 ### Switch readout: which seat is on which port
 The Switches page already reads every switch's ports (see Already shipped). Still to do: read each switch's address table to learn which port every network card is on, plus port descriptions and VLANs. This is what turns an address into a seat for the match watch and the LAN game browser.
 
@@ -77,6 +83,7 @@ Not committed to, but worth thinking about:
 
 ## Already shipped
 
+- **NIC settings:** Tools › NIC settings lists the network card's advanced settings and marks the ones that hurt Counter-Strike in red or yellow, with what to set and why. Settings that only affect TCP are shown as having no effect.
 - **Switches:** Tools › Switches finds switches over SNMP v1 or v2c (Cisco Catalyst first) and shows each as an icon that turns yellow or red when a port has errors, link trouble or is running full, with a front-panel view of every port.
 - **Wire report:** flow control and PAUSE counters, Energy Efficient Ethernet, speed downshift, flooding, loudest senders, IP conflicts, IPv6 routers, LACP/UDLD/VTP, ICMP redirects and MTU notices.
 - **Tick test:** UDP at 64 or 128 packets a second to a reflector (`porkchopcheck --reflector`), reporting loss bursts, jitter, late and out-of-order packets.

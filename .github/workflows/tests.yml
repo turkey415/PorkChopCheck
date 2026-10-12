@@ -21,6 +21,7 @@ jobs:
       - run: python tests/test_linux.py
       - run: python tests/test_smart.py
       - run: python tests/test_snmp.py
+      - run: python tests/test_nic.py
       - run: python tests/test_launcher.py
       - run: python tests/test_version.py
       - run: bash -n install-linux.sh
