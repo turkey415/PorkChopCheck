@@ -186,6 +186,12 @@ PING_TARGETS = [("gateway", "Gateway"), ("dns", "DNS server"), ("switch", "Switc
                 ("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google DNS")]
 TRACE_TARGETS = [("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google DNS"), ("gateway", "Gateway"),
                  ("dns", "DNS server")]
+CUSTOM = "host:"        # a ping or traceroute kind that is a destination the user typed
+
+
+def custom_kind(host):
+    """(kind, label) for a typed destination: a name is its own label, an address is 'Custom'."""
+    return CUSTOM + host, "Custom" if N.is_ipv4(host) else host
 
 # ---------------------------------------------------------------- PowerShell
 ADAPTERS_PS = r"""$ErrorActionPreference='SilentlyContinue'
@@ -257,7 +263,7 @@ class State:
         self.toast_until = 0.0
         self.ping = new_ping()
         self.trace = {"running": False, "kind": "1.1.1.1", "label": "Cloudflare", "target": None,
-                      "hops": []}
+                      "hops": [], "live": {}}     # live: hop number -> its running numbers, once watched
         self.speed = {"running": False, "mode": "", "down": None, "up": None, "lines": []}
         self.arp_table = {"running": False, "rows": [], "ts": None}
         self.arp_scan = {"running": False, "net": None, "range": None, "found": {}, "sent": 0,
@@ -555,6 +561,7 @@ class Backend:
         self.l2sock = None
         self.send_lock = threading.Lock()
         self.stops = {}
+        self.names = {}         # custom destination name -> (address, good until)
         self.last_sig = None
         self.last_log = 0.0
         self.oui_tried = False
@@ -1285,9 +1292,39 @@ class Backend:
                 tgt = N.merge_neighbors(self.st.nb).get("mgmt_ip")
             else:
                 tgt = kind
+        if kind.startswith(CUSTOM):
+            tgt = self.lookup(kind[len(CUSTOM):])
         if src and src.startswith("169.254."):
             src = None
         return tgt, src
+
+    def lookup(self, host):
+        """The address of a custom destination: itself, or what its name resolves to (kept a minute)."""
+        if N.is_ipv4(host):
+            return host
+        ip, until = self.names.get(host, (None, 0.0))
+        if time.time() >= until:
+            try:
+                ip = socket.gethostbyname(host)
+            except OSError:
+                ip = None
+            self.names[host] = (ip, time.time() + (60 if ip else 5))
+        return ip
+
+    def custom_target(self, text, key):
+        """Check and save a typed destination. Returns (kind, label), or None when it is no good."""
+        host = N.parse_host(text)
+        if not host:
+            self.st.say("Enter an address like 10.1.2.3 or a name like server.lan", 5)
+            return None
+        self.settings.set(key, host)
+        self.names.pop(host, None)
+        return custom_kind(host)
+
+    def targets(self, builtin, key):
+        """The built-in targets, then the saved custom one, for the Target button to step through."""
+        host = self.settings.get(key)
+        return builtin + ([custom_kind(host)] if host else [])
 
     def _new_stop(self, name):
         old = self.stops.get(name)
@@ -1499,13 +1536,22 @@ class Backend:
         threading.Thread(target=self._ping_loop, args=(ev,), daemon=True).start()
 
     def ping_next_target(self):
+        targets = self.targets(PING_TARGETS, "ping_custom")
+        with self.st.lock:
+            kinds = [k for k, _ in targets]
+            kind = self.st.ping["kind"]
+        self._ping_pick(*targets[(kinds.index(kind) + 1) % len(kinds) if kind in kinds else 0])
+
+    def ping_set_custom(self, text):
+        picked = self.custom_target(text, "ping_custom")
+        if picked:
+            self._ping_pick(*picked)
+
+    def _ping_pick(self, kind, label):
         with self.st.lock:
             p = self.st.ping
-            kinds = [k for k, _ in PING_TARGETS]
-            i = (kinds.index(p["kind"]) + 1) % len(kinds) if p["kind"] in kinds else 0
-            running = p["running"]
             fresh = new_ping()
-            fresh["kind"], fresh["label"], fresh["running"] = PING_TARGETS[i][0], PING_TARGETS[i][1], running
+            fresh["kind"], fresh["label"], fresh["running"] = kind, label, p["running"]
             fresh["span"] = p["span"]
             self.st.ping = fresh
 
@@ -1564,13 +1610,25 @@ class Backend:
 
     # ---------------------------------------------------------- traceroute
     def trace_next_target(self):
+        targets = self.targets(TRACE_TARGETS, "trace_custom")
         with self.st.lock:
             t = self.st.trace
             if t["running"]:
                 return
-            kinds = [k for k, _ in TRACE_TARGETS]
+            kinds = [k for k, _ in targets]
             i = (kinds.index(t["kind"]) + 1) % len(kinds) if t["kind"] in kinds else 0
-            t["kind"], t["label"], t["hops"], t["target"] = TRACE_TARGETS[i][0], TRACE_TARGETS[i][1], [], None
+            t.update(kind=targets[i][0], label=targets[i][1], hops=[], target=None, live={})
+
+    def trace_set_custom(self, text):
+        with self.st.lock:
+            running = self.st.trace["running"]
+        if running:
+            self.st.say("Stop the traceroute before changing where it goes", 4)
+            return
+        picked = self.custom_target(text, "trace_custom")
+        if picked:
+            with self.st.lock:
+                self.st.trace.update(kind=picked[0], label=picked[1], hops=[], target=None, live={})
 
     def trace_toggle(self):
         with self.st.lock:
@@ -1585,12 +1643,13 @@ class Backend:
         st = self.st
         with st.lock:
             kind = st.trace["kind"]
-            st.trace.update(running=True, hops=[])
+            st.trace.update(running=True, hops=[], live={})
         tgt, src = self.resolve(kind)
         try:
             if not tgt:
                 with st.lock:
-                    st.trace["hops"] = [(0, None, None, "no target yet")]
+                    st.trace["hops"] = [(0, None, None, "the name did not resolve" if kind.startswith(CUSTOM)
+                                         else "no target yet")]
                 return
             with st.lock:
                 st.trace["target"] = tgt
@@ -1602,9 +1661,45 @@ class Backend:
                     st.trace["hops"] = st.trace["hops"] + [(ttl, ip, rtt, status)]
                 if status in ("ok", "unreach"):
                     break
+            if not ev.is_set() and self.settings.get("trace_live"):
+                self._trace_watch(ev, tgt, src)
         finally:
             with st.lock:
                 st.trace["running"] = False
+
+    TRACE_KEEP = 40         # probes per hop kept for the little graph
+
+    def _trace_watch(self, ev, tgt, src):
+        """Like mtr: probe every hop of the finished trace once a second until stopped."""
+        st = self.st
+        with st.lock:
+            live = {ttl: {"ip": ip, "samples": [], "sent": 0, "recv": 0, "sum": 0.0, "max": None}
+                    for ttl, ip, _, _ in st.trace["hops"]}
+            st.trace["live"] = live
+
+        def probe(ttl):
+            status, ip, rtt = self.echo(tgt, src, ttl=ttl, timeout_ms=1000)
+            if ev.is_set():
+                return
+            rtt = rtt if status in ("ok", "ttl") else None
+            with st.lock:
+                h = live[ttl]
+                h["sent"] += 1
+                h["samples"] = (h["samples"] + [rtt])[-self.TRACE_KEEP:]
+                if rtt is not None:
+                    h["ip"] = ip or h["ip"]
+                    h["recv"] += 1
+                    h["sum"] += rtt
+                    h["max"] = rtt if h["max"] is None else max(h["max"], rtt)
+
+        while not ev.is_set():
+            t0 = time.time()
+            workers = [threading.Thread(target=probe, args=(ttl,), daemon=True) for ttl in live]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join(6)
+            ev.wait(max(0.0, 1.0 - (time.time() - t0)))
 
     # ---------------------------------------------------------- speed tests
     def speed_iperf(self):
@@ -3090,15 +3185,28 @@ class ListView(tk.Canvas):
         if not rows:
             self.create_text(pad, y, anchor="nw", text=self._empty, fill=DIM, font=fonts["row"],
                              width=w - 2 * pad)
-        for text, color, kind in rows:
+        for text, color, kind, *spark in rows:
             if kind == "hdr" and y > pad:
                 y += pad // 2
             item = self.create_text(pad, y, anchor="nw", text=text, fill=color,
                                     font=fonts.get(kind, fonts["row"]), width=w - 2 * pad)
             bb = self.bbox(item)
+            if spark and bb:
+                self.spark(bb[2] + 2 * pad, y, bb[3], *spark[0])
             y = (bb[3] if bb else y + ui.sz["row"]) + max(2, pad // 3)
         self.configure(scrollregion=(0, 0, w, max(y + pad, self.winfo_height())))
         self.yview_moveto(top)
+
+
+    SPARK = 0.28            # share of the row's width a little graph gets
+
+    def spark(self, x, top, bottom, values, cap, slots):
+        """A little bar graph starting at `x`: one bar per value against `cap`, a lost one red."""
+        bw = max(2, int(self.winfo_width() * self.SPARK) // slots)
+        for v in values:
+            h = bottom - top if v is None else max(1, round((bottom - top) * min(1.0, v / cap)))
+            self.create_rectangle(x, bottom - h, x + bw - 1, bottom, width=0, fill=BAD if v is None else OK)
+            x += bw
 
 
 class ToolView(tk.Frame):
@@ -3310,6 +3418,7 @@ class UI:
         self.build_tools_grid()
         self.tools = {
             "ping": ToolView(self.body, self, "Ping", [("Start", self.be.ping_toggle),
+                                                     ("Custom…", self.ping_custom_dialog),
                                                      ("Target ›", self.be.ping_next_target),
                                                      ("30 s", self.be.ping_next_span)], chart=0.24),
             "tick": ToolView(self.body, self, "Tick test", [("Start", self.be.tick_toggle),
@@ -3318,6 +3427,7 @@ class UI:
                                                            ("Server", self.tick_server_dialog),
                                                            ("Reflect", self.be.tick_reflect_toggle)], chart=0.24),
             "trace": ToolView(self.body, self, "Traceroute", [("Run", self.be.trace_toggle),
+                                                             ("Custom…", self.trace_custom_dialog),
                                                              ("Target ›", self.be.trace_next_target)]),
             "speed": ToolView(self.body, self, "Speed test", [("iperf3", self.be.speed_iperf),
                                                              ("Internet", self.be.speed_http)]),
@@ -3515,6 +3625,7 @@ class UI:
         self.set_btns = {}
         rows = [("announce", self.toggle("announce")), ("autolog", self.toggle("autolog")),
                 ("smartsvc", self.toggle("smart_services")), ("tickclaude", self.toggle("tick_claude")),
+                ("tracelive", self.toggle("trace_live")),
                 ("hostname", self.edit_hostname), ("iperf", self.edit_iperf),
                 ("oui", lambda: threading.Thread(target=self.be.update_oui, daemon=True).start()),
                 ("folder", self.open_data), ("exit", self.quit)]
@@ -3564,6 +3675,18 @@ class UI:
         self.show("mdns")
         if not self.be.mdns.snapshot()["last_scan"]:
             self.be.mdns_scan()
+
+    def ping_custom_dialog(self):
+        Keyboard(self, "Custom ping destination", self.be.settings.get("ping_custom"),
+                 self.be.ping_set_custom,
+                 "An address like 10.1.2.3 or a name like server.lan, e.g. the game server. It joins the "
+                 "Target button's list and is saved in settings.json on this machine.")
+
+    def trace_custom_dialog(self):
+        Keyboard(self, "Custom traceroute destination", self.be.settings.get("trace_custom"),
+                 self.be.trace_set_custom,
+                 "An address like 10.1.2.3 or a name like server.lan. It joins the Target button's list "
+                 "and is saved in settings.json on this machine.")
 
     def tick_server_dialog(self):
         Keyboard(self, "Reflector address for the tick test", self.be.settings.get("tick_server"),
@@ -3921,6 +4044,7 @@ class UI:
             "autolog": f"Auto-log every port to ports.csv:  {'ON' if g('autolog') else 'OFF'}",
             "smartsvc": f"Smart scan checks common services on every device:  {'ON' if g('smart_services') else 'OFF'}",
             "tickclaude": f"Claude recommended tick settings (stricter):  {'ON' if g('tick_claude') else 'OFF'}",
+            "tracelive": f"Traceroute keeps watching every hop when it finishes:  {'ON' if g('trace_live') else 'OFF'}",
             "hostname": f"Name sent to switch:  {self.be.hostname()}",
             "iperf": "iperf3 server:  " + ((g('iperf_server') + (f":{g('iperf_port')}" if g('iperf_port') != 5201 else ""))
                                            if g("iperf_server") else "(tap to set)"),
@@ -3951,7 +4075,7 @@ class UI:
         p = s["ping"]
         samples, span = list(p["samples"]), p["span"]
         v.set_action(0, "Stop" if p["running"] else "Start", RED if p["running"] else BLUE)
-        v.set_action(2, {30: "30 s", 300: "5 min", 1800: "30 min"}.get(span, f"{span} s"))
+        v.set_action(3, {30: "30 s", 300: "5 min", 1800: "30 min"}.get(span, f"{span} s"))
         tgt = p["target"] or "(no address yet)"
         if p["sent"]:
             loss = 100 * (p["sent"] - p["recv"]) / p["sent"]
@@ -4114,9 +4238,14 @@ class UI:
     def render_trace(self, s, v, now):
         t = s["trace"]
         v.set_action(0, "Stop" if t["running"] else "Run", RED if t["running"] else BLUE)
-        state = "running…" if t["running"] else ("done" if t["hops"] else "tap Run")
+        live = t["live"]
+        state = ("watching every hop, tap Stop to end" if live and t["running"] else
+                 "running…" if t["running"] else ("done" if t["hops"] else "tap Run"))
         v.set_summary(f"{t['label']}: {t['target'] or '—'}", FG,
                       f"{state} · up to 20 hops, sourced from the Ethernet port")
+        if live:
+            v.list.set_rows(self.trace_live_rows(t), "")
+            return
         rows = []
         for ttl, ip, rtt, status in t["hops"]:
             if ttl == 0:
@@ -4128,6 +4257,27 @@ class UI:
             label = f"{ttl:>2}  {ip or '*':<16} {fmt_ms(rtt) if ip else 'timeout'}{vendor}"
             rows.append((label, OK if status == "ok" else BAD if not ip else FG, "mono"))
         v.list.set_rows(rows, "")
+
+    def trace_live_rows(self, t):
+        """One row a hop with its numbers and a little graph, every graph on the same scale."""
+        live = t["live"]
+        cap = max([r for h in live.values() for r in h["samples"] if r is not None] + [5.0])
+        rows = [(f"{'':>2}  {'hop':<15} {'now':>7} {'avg':>7} {'loss':>5}     graphs go up to {fmt_ms(cap)}",
+                 HDR, "mono")]
+        last = max(live)
+        for ttl in sorted(live):
+            h = live[ttl]
+            lost = h["sent"] - h["recv"]
+            now_ms = h["samples"][-1] if h["samples"] else None
+            avg = fmt_ms(h["sum"] / h["recv"]) if h["recv"] else ""
+            loss = f"{100 * lost / h['sent']:.0f}%" if h["sent"] else ""
+            text = (f"{ttl:>2}  {h['ip'] or '*':<15} {fmt_ms(now_ms) or 'lost':>7} {avg:>7} {loss:>5}")
+            color = DIM if h["sent"] and not h["recv"] else WARN if lost else OK if ttl == last else FG
+            rows.append((text, color, "mono", (tuple(h["samples"]), cap, self.be.TRACE_KEEP)))
+        rows.append(("A hop that loses probes while the hops after it lose none is only a router that limits "
+                     "how often it answers, not a fault. Loss or delay that carries on to the last hop is real.",
+                     DIM, "dim"))
+        return rows
 
     def render_speed(self, s, v, now):
         sp = s["speed"]

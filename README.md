@@ -106,7 +106,17 @@ Good to know:
 
 Each event is listed below the graph with what ping did around it, such as `2 pings lost · peak 212 ms, normally 3 ms` or `no effect on ping`. That is the point of the page: a lag spike sits directly above whatever caused it, or above nothing, which tells you the cause is somewhere this port cannot see.
 
-The third button switches the graph between the last 30 seconds, 5 minutes and 30 minutes. The summary line shows loss, average, jitter, and the time 99% of pings came in under. Events are collected the whole time the app is open, whether or not ping is running.
+**Target ›** steps through the gateway, the DNS server, the switch and two internet addresses. **Custom…** opens the keyboard for any other destination, an address or a name, such as the game server; it is saved and joins the Target list. Traceroute has the same two buttons.
+
+The last button switches the graph between the last 30 seconds, 5 minutes and 30 minutes. The summary line shows loss, average, jitter, and the time 99% of pings came in under. Events are collected the whole time the app is open, whether or not ping is running.
+
+## Traceroute
+
+**Tools › Traceroute** lists the hops to the target. When the trace finishes it keeps going, the way `mtr` does: every hop is probed once a second, and each row shows the latest time, the average, the loss, and a small graph of the last 40 probes with lost ones in red. All the graphs share one scale, so a slow hop in the middle stands out. Tap **Stop** to end it; the numbers stay on screen.
+
+A hop that loses probes while the hops after it lose none is a router that limits how often it answers, not a fault. Loss or delay that carries on to the last hop is real.
+
+To get a plain one-pass trace, turn off **Settings › Traceroute keeps watching every hop when it finishes**. It is on by default.
 
 ## Tick test (game-rate UDP)
 
