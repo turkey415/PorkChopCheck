@@ -300,6 +300,8 @@ class State:
         self.link_up_at = None
         self.ip_wait_from = None
         self.time_to_ip = None
+        self.ip_kept = False            # the address was still there at link up, so nothing to time
+        self.up_gw = self.up_net = None     # seconds from link up until the gateway / internet answered
         self.gw_ms = self.dns_ms = self.net_ms = PENDING
         self.public_ip = None
         self.nb = {}
@@ -555,6 +557,7 @@ class Backend:
     def __init__(self, st, settings, portlog, oui, mdns):
         self.st, self.settings, self.portlog, self.oui, self.mdns = st, settings, portlog, oui, mdns
         self.kick = threading.Event()
+        self.health_kick = threading.Event()
         self.sniffer = None
         self.sniff_gen = 0
         self.sniff_iface = None         # what the sniffer is listening on; captures reuse it
@@ -685,7 +688,12 @@ class Backend:
                 if up:
                     came_up = True
                     st.link_up_at = st.ip_wait_from = now
-                    st.time_to_ip = None
+                    st.time_to_ip = st.up_gw = st.up_net = None
+                    # Windows keeps its address across a replug: there is no wait to time, so the
+                    # DHCP answer (if one is seen) and the gateway reply are timed instead.
+                    st.ip_kept = bool(ip) and not ip.startswith("169.254.")
+                    if st.ip_kept:
+                        st.ip_wait_from = None
                     st.add_event("link", f"Link up at {N.fmt_speed(speed)}" if speed else "Link up", "info", now)
                 elif not st.blink["running"]:
                     st.drops += 1
@@ -731,6 +739,35 @@ class Backend:
             self.kick.set()
         if came_up:
             self.restart_sniffer()
+            threading.Thread(target=self._bringup, args=(name, now), daemon=True).start()
+
+    BRINGUP_SECS = 180      # how long after link up the gateway and internet are waited for
+
+    def _bringup(self, name, t0):
+        """After link up, time how long the port takes to pass traffic: first the gateway
+        answering, then the internet. A port without portfast sits silent for 30 to 50 s."""
+        st = self.st
+        while time.time() - t0 < self.BRINGUP_SECS:
+            with st.lock:
+                if st.sel != name or st.link_up_at != t0 or not st.link:
+                    return
+                ip, gw, have_gw = st.ipv4, N.first_v4(st.d.get("Gateway")), st.up_gw is not None
+            if ip and gw and not ip.startswith("169.254."):
+                if not have_gw:
+                    ok = self.echo(gw, ip, timeout_ms=500)[0] == "ok"
+                else:
+                    ok = N.tcp_probe("1.1.1.1", 443, ip, timeout=1.0) is not None
+                if ok:
+                    with st.lock:
+                        if st.link_up_at != t0:
+                            return
+                        if not have_gw:
+                            st.up_gw = time.time() - t0
+                            continue
+                        st.up_net = time.time() - t0
+                    self.health_kick.set()
+                    return
+            time.sleep(0.5)
 
     # ---------------------------------------------------------- detail loop (PowerShell, ~3 s)
     def detail_loop(self):
@@ -790,7 +827,16 @@ class Backend:
                 self.health_tick()
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(4)
+            self.health_kick.wait(4)
+            self.health_kick.clear()
+
+    def net_recheck(self):
+        """Test the internet and ask for the public IP again, now (a tap on the Internet tile)."""
+        with self.st.lock:
+            self.st.net_ms = PENDING
+            self.st.public_ip = None
+        self.pubip_for = None
+        self.health_kick.set()
 
     def health_tick(self):
         st = self.st
@@ -1166,6 +1212,8 @@ class Backend:
             sc["offers"][srv] = d
         if d.get("chaddr") == my and d.get("msg") == "ACK":
             st.dhcp_ack = d
+            if st.ip_kept and st.time_to_ip is None and st.link_up_at:
+                st.time_to_ip = now - st.link_up_at
 
     # ---------------------------------------------------------- primitives (overridden in demo)
     def echo(self, dst, src, ttl=128, timeout_ms=1000):
@@ -2546,6 +2594,7 @@ class DemoBackend(Backend):
                     st.ipv4, st.mask = "10.20.30.147", "255.255.255.0"
                     if st.time_to_ip is None:
                         st.time_to_ip, st.ip_wait_from = 2.8, None
+                        st.up_gw, st.up_net = 3.4, 3.9
                     st.d = {"FullDuplex": True, "DhcpEnabled": True, "DhcpServer": "10.20.1.10",
                             "LeaseExpires": "Oct 10 4:52 PM", "Gateway": ["10.20.30.1"],
                             "Dns": ["10.20.1.10", "10.20.1.11"], "GwMac": "00-00-0C-07-AC-1E",
@@ -3139,6 +3188,10 @@ class Tile(tk.Frame):
         self.v.pack(fill="both", expand=True, padx=pad, pady=(0, pad // 2))
         self._last = None
 
+    def on_tap(self, cmd):
+        for w in (self, self.t, self.n, self.v):
+            w.bind("<ButtonRelease-1>", lambda e: cmd())
+
     def set(self, value, color=FG, note="", note_color=None):
         value = str(value) if value not in (None, "") else "—"
         if note_color is None:
@@ -3392,7 +3445,8 @@ class UI:
         self.body.pack(side="top", fill="both", expand=True, padx=self.pad, pady=(self.pad // 2, 0))
         self.views, self.tiles = {}, {}
         self.build_grid("PORT", ["Speed", "Duplex", "IP address", "Gateway",
-                                 "DHCP server", "DNS", "Time to IP", "Internet"])
+                                 "DHCP server", "DNS", "Time to online", "Internet"])
+        self.tile("PORT", "Internet").on_tap(self.be.net_recheck)
         self.build_grid("SWITCH", ["Switch", "Port", "Data VLAN", "Voice VLAN",
                                    "Mgmt IP", "Model", "PoE", "Negotiation"])
         self.sw_foot = tk.Label(self.views["SWITCH"], text="", bg=BG, fg=DIM, anchor="w",
@@ -3956,25 +4010,40 @@ class UI:
         dns_list = [x for x in N.as_list(d.get("Dns")) if N.is_ipv4(x)]
         T("DNS").set(", ".join(dns_list[:2]) if up and dns_list else "—", FG,
                      *self.probe_note(s["dns_ms"], up and dns_list))
-        if s["time_to_ip"] is not None and up:
-            tti = s["time_to_ip"]
-            T("Time to IP").set(f"{tti:.1f} s", OK if tti < 8 else WARN if tti < 35 else BAD,
-                                "portfast off?" if tti >= 25 else "since link up")
-        elif up and s["ip_wait_from"] and not good_ip(s):
-            T("Time to IP").set(f"{now - s['ip_wait_from']:.0f} s…", WARN, "waiting")
-        else:
-            T("Time to IP").set("—", FG, "plug in to time it" if not up else "")
+        T("Time to online").set(*self.online_tile(s, up, bool(gw), now))
         nm = s["net_ms"]
         if not good_ip(s):
             T("Internet").set("—")
         elif nm == PENDING:
             T("Internet").set("Testing…", DIM)
         elif nm is None:
-            T("Internet").set("No route out", WARN)
+            T("Internet").set("No route out", WARN, "tap to retry")
         elif s["public_ip"]:
             T("Internet").set(s["public_ip"], OK, "online · " + fmt_ms(nm))
         else:
-            T("Internet").set("Reachable", OK, fmt_ms(nm))
+            T("Internet").set("Reachable", OK, "no public IP yet · tap to retry")
+
+    @staticmethod
+    def online_tile(s, up, has_gw, now):
+        """What the Time to online tile shows: seconds from link up until the gateway answered,
+        with the time to an address and to the internet beside it."""
+        tti, tgw, tnet, t0 = s["time_to_ip"], s["up_gw"], s["up_net"], s["link_up_at"]
+        if not up:
+            return ("—", FG, "plug in to time it")
+        grade = lambda t: OK if t < 8 else WARN if t < 35 else BAD  # noqa: E731
+        ip_txt = f"IP {tti:.1f} s" if tti is not None else "IP kept" if s["ip_kept"] else ""
+        if tgw is not None:
+            parts = ["portfast off?" if tgw >= 25 else "", ip_txt,
+                     f"net {tnet:.1f} s" if tnet is not None else ""]
+            return (f"{tgw:.1f} s", grade(tgw), " · ".join(p for p in parts if p) or "to gateway")
+        if t0 and now - t0 < Backend.BRINGUP_SECS and (has_gw or not good_ip(s)):
+            waiting = "waiting for gateway" if good_ip(s) else "waiting for address"
+            return (f"{now - t0:.0f} s…", WARN, " · ".join(p for p in (ip_txt, waiting) if p))
+        if tti is not None:         # no gateway to time, or it never answered
+            return (f"{tti:.1f} s", grade(tti), "to an address" + ("" if has_gw else " · no gateway"))
+        if t0 and has_gw:
+            return ("—", BAD, "gateway never answered")
+        return ("—", FG, "")
 
     def render_switch(self, s, now):
         T = lambda t: self.tile("SWITCH", t)  # noqa: E731

@@ -51,7 +51,7 @@ Swipe left/right or tap the bottom bar to move between pages.
 
 | Page | What it shows |
 |---|---|
-| **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time-to-IP (flags portfast off), internet with your public IP |
+| **PORT** | Speed, duplex (checked against the switch), IP, gateway ping, DHCP server and lease, DNS, time to online (flags portfast off), internet with your public IP |
 | **SWITCH** | CDP/LLDP: switch, port, data and voice VLAN, mgmt IP, model, PoE, negotiation |
 | **L2** | 802.1X detection, spanning tree (mode, VLAN, root, topology changes), trunk/DTP, DHCP server count (rogue DHCP), phone options 150/66/43, gateway MAC and vendor (HSRP/VRRP), IPv6/RA, broadcast rate |
 | **SMART** | Every smart-home device on the network with a type icon, brand, model, serial number (when the device publishes one), IP and MAC. Search, smart-only/all-hosts toggle, tap a device for details and to label it |
@@ -91,6 +91,14 @@ Good to know:
 - Serial numbers only appear when a device publishes one on the local network. Each one shows where it came from.
 - Icons are generic device-type drawings, not brand logos.
 - Per-device throughput isn't shown. A normal switch port can't see other devices' traffic.
+
+## Time to online
+
+When the link comes up, the **Time to online** tile counts the seconds until the gateway answers a ping, which is the moment the switch port starts passing traffic. Beside it are the time to an address and the time until the internet answered. A port without portfast takes 30 to 50 seconds and is flagged `portfast off?`.
+
+Windows keeps its address when the cable is pulled and put back, so there is no wait for an address to time. The tile then says `IP kept`, or shows the time of the DHCP answer if one was seen, and the gateway time still tells you how long the port took. On a network with no gateway the tile shows the time to an address instead.
+
+Tap the **Internet** tile to test the internet and look up the public IP again straight away.
 
 ## Ping and the event timeline
 
