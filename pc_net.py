@@ -2637,6 +2637,38 @@ def linux_link(n):
     return up, max(speed, 0) if up else 0
 
 
+class _IFROW2(ctypes.Structure):
+    """MIB_IF_ROW2, as far as the link speeds (fixed-width types, so the layout holds anywhere)."""
+    _fields_ = [("Luid", ctypes.c_uint64), ("Index", ctypes.c_uint32), ("Guid", ctypes.c_ubyte * 16),
+                ("Alias", ctypes.c_uint16 * 257), ("Description", ctypes.c_uint16 * 257),
+                ("PhysLen", ctypes.c_uint32), ("Phys", ctypes.c_ubyte * 32), ("PermPhys", ctypes.c_ubyte * 32),
+                ("Mtu", ctypes.c_uint32), ("Type", ctypes.c_uint32), ("TunnelType", ctypes.c_uint32),
+                ("MediaType", ctypes.c_uint32), ("PhysicalMediumType", ctypes.c_uint32),
+                ("AccessType", ctypes.c_uint32), ("DirectionType", ctypes.c_uint32), ("Flags", ctypes.c_ubyte),
+                ("OperStatus", ctypes.c_uint32), ("AdminStatus", ctypes.c_uint32),
+                ("MediaConnectState", ctypes.c_uint32), ("NetworkGuid", ctypes.c_ubyte * 16),
+                ("ConnectionType", ctypes.c_uint32), ("TransmitLinkSpeed", ctypes.c_uint64),
+                ("ReceiveLinkSpeed", ctypes.c_uint64), ("Counters", ctypes.c_uint64 * 18)]
+
+
+def win_link_speed(n):
+    """Link speed in Mb/s from the 64-bit counter, or 0. psutil reads a 32-bit field that stops at
+    4294 Mb/s, so a 10 Gb link shows as 4.294 Gbps."""
+    try:
+        lib = ctypes.WinDLL("iphlpapi")
+        row = _IFROW2()
+        luid = ctypes.c_uint64()
+        if lib.ConvertInterfaceAliasToLuid(ctypes.c_wchar_p(n), ctypes.byref(luid)):
+            return 0
+        row.Luid = luid.value
+        if lib.GetIfEntry2(ctypes.byref(row)):
+            return 0
+        bps = row.ReceiveLinkSpeed or row.TransmitLinkSpeed
+        return bps // 1_000_000 if bps < 1 << 62 else 0     # all ones: no link
+    except Exception:
+        return 0
+
+
 def parse_nmcli(text):
     """Parse `nmcli -t -f GENERAL.CONNECTION,IP4.GATEWAY,IP4.DNS,IP4.DOMAIN,DHCP4 device show IF`."""
     d = {"dns": [], "domain": [], "dhcp": {}}

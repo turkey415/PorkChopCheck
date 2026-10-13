@@ -141,7 +141,7 @@ WINDOWED = ("--windowed" in sys.argv or (DEMO and not IS_WIN)
             or (IS_LINUX and "--fullscreen" not in sys.argv))
 ADMIN_HINT = "run ./install-linux.sh" if IS_LINUX else "needs admin"
 # The release workflow writes the real version here (tools/stamp_version.py).
-VERSION = "2.0.0-dev"
+VERSION = "2.1.0-dev"
 
 
 def pick_data_dir():
@@ -668,6 +668,8 @@ class Backend:
         speed = stats.speed if stats else 0
         if IS_LINUX:
             up, speed = N.linux_link(name)
+        elif IS_WIN and up:
+            speed = N.win_link_speed(name) or speed
         ip = mask = mac = None
         addrs = psutil.net_if_addrs()
         l3 = N.linux_l3_iface(name) if IS_LINUX else name      # bridged NIC: IP lives on br0

@@ -301,7 +301,7 @@ or, on GitHub, go to **Actions › Release › Run workflow** and type the versi
 
 GitHub Actions runs the tests, builds the Windows `.exe`, the Windows zip, and the Linux tarball, and publishes them as a release. A tag with a dash, like `v2.1.0-beta.1`, is published as a pre-release.
 
-The version is written into the app as part of the build, so you don't edit it by hand. The source always says `2.0.0-dev`; a released build shows its real version on the Settings page and from `porkchopcheck --version`.
+The version is written into the app as part of the build, so you don't edit it by hand. The source always says `2.1.0-dev`; a released build shows its real version on the Settings page and from `porkchopcheck --version`.
 
 ## Tests
 
