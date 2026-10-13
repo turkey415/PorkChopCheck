@@ -465,4 +465,8 @@ for bad in ("", "h=1.1.1.1\ncolo=DFW\n", "ip=<script>alert(1)</script>\n", "ip=9
 # Oui parsing
 p = os.path.join(tmp, "manuf"); open(p, "w").write("# c\n00:00:0C\tCisco\tCisco Systems, Inc\n00:1B:C5:00:00:00/36\tX\n")
 o = N.Oui(p); check("oui lookup", o.lookup("00:00:0c:07:ac:01") == "Cisco · HSRPv1 group 1", o.lookup("00:00:0c:07:ac:01"))
+# MIB_IF_ROW2 layout (Windows link speed above 4.29 Gb/s)
+check("ifrow2 layout", N.ctypes.sizeof(N._IFROW2) == 1352 and N._IFROW2.TransmitLinkSpeed.offset == 1192
+      and N._IFROW2.ReceiveLinkSpeed.offset == 1200, N.ctypes.sizeof(N._IFROW2))
+check("win link speed off Windows is 0", N.IS_WIN or N.win_link_speed("Ethernet") == 0)
 print(f"\nALL {ok} CHECKS PASSED")
