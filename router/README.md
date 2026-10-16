@@ -25,8 +25,9 @@ Plugging into a new jack starts over: everything learned from the last port is f
 
 ## Using it
 
-- **The router's screen:** tap for the next page (Summary, Switch, Port, Layer 2). **Hold for 1.5 s**
-  to hand the screen back to GL.iNet's own screen program.
+- **The router's screen:** tap for the next page (Summary, Switch, Port, Layer 2), or swipe: right to
+  left for the next page, left to right for the previous one. **Hold for 1.5 s** to hand the screen
+  back to GL.iNet's own screen program.
 - **The phone page:** join the router's Wi-Fi and open **http://192.168.8.1:8088**. Everything above,
   refreshed every 2 seconds, with **Re-check now**, and a **Screen: GL.iNet / PorkChopCheck** switch at
   the top. The choice is remembered across reboots. The tester keeps running with either screen.
