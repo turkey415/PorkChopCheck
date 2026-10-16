@@ -158,6 +158,7 @@ def post(path, body):
     except urllib.error.HTTPError as e: return e.code, None
 html = urllib.request.urlopen(base_url + "/").read().decode()
 check("page served", "PorkChopCheck" in html and "api/state" in html)
+check("hidden tabs really hide", "[hidden] { display: none !important; }" in html and 'id="tab-tools" hidden' in html)
 state = json.loads(urllib.request.urlopen(base_url + "/api/state").read())
 check("state served", state["switch"]["port"] == "GigabitEthernet1/0/14" and state["screen"] == "pcc")
 check("switch the screen to GL.iNet", post("/api/screen", {"mode": "gl"}) == (200, {"screen": "gl"}) and svc.config["screen"] == "gl")

@@ -141,10 +141,12 @@ PAGE = r"""<!doctype html>
 :root { --bg:#111110; --panel:#1b1b1a; --well:#141413; --line:rgba(255,255,255,.08); --text:#f0efec; --muted:#898781;
   --good:#3ddc5a; --warn:#fab219; --bad:#ff4d4d; --acc:#5aa9ff; }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }  /* main is a flex column, which would otherwise show hidden tabs */
 body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui, sans-serif; }
-header { display:flex; align-items:center; gap:10px; padding:12px 14px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; }
+header { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:12px 14px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; }
 header b { font-size:17px; }
 .spacer { flex:1; }
+.grp { display:flex; align-items:center; gap:8px; margin-left:auto; }
 .seg { display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
 .seg button { background:none; border:0; color:var(--muted); padding:6px 10px; font:inherit; font-size:13px; }
 .seg button.on { background:var(--acc); color:#fff; }
@@ -179,9 +181,9 @@ td, th { text-align:left; padding:4px 6px; border-top:1px solid var(--line); }
 th { color:var(--muted); font-weight:600; }
 .excellent, .good2 { color:var(--good); } .fair { color:var(--warn); } .badg { color:var(--bad); }
 </style></head><body>
-<header><b>🐷 PorkChopCheck</b><span class="spacer"></span>
-  <span class="sub">Screen</span>
-  <div class="seg" id="seg"><button data-m="gl">GL.iNet</button><button data-m="pcc">PorkChopCheck</button></div>
+<header><b>🐷 PorkChopCheck</b>
+  <span class="grp"><span class="sub">Screen</span>
+  <div class="seg" id="seg"><button data-m="gl">GL.iNet</button><button data-m="pcc">PorkChop</button></div></span>
 </header>
 <nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button></nav>
 <main id="tab-port">
@@ -215,7 +217,7 @@ th { color:var(--muted); font-weight:600; }
     <div class="line"><input id="ss" class="grow" placeholder="iperf3 server address"><input id="sp" style="width:90px" placeholder="5201"><button class="act" id="sgo">Run</button></div>
     <div id="sres" class="rows"></div></section>
   <section><h2>Port finder</h2><div class="line"><button class="key" id="bgo">Start</button><span class="sub" id="binfo"></span></div>
-    <p class="sub">Bounces the WAN link (down 1.5 s, up 3 s) so the switch port's LED flashes: walk the switch and look for it. The router's own internet drops while it runs.</p></section>
+    <p class="sub">Bounces the WAN link (down 1.5 s, then up for 2 s once it is back: a flash every 6 to 7 s) so the switch port's LED blinks. Walk the switch and look for it. The router's own internet drops while it runs.</p></section>
   <section><h2>Port log</h2>
     <div class="line"><input id="lab" class="grow" placeholder="label, e.g. Row C seat 7"><button class="act" id="lgo">Save</button><a class="sub" href="/ports.csv">Download CSV</a></div>
     <table id="log"></table></section>
