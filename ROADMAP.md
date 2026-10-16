@@ -35,6 +35,9 @@ The Switches page already reads every switch's ports (see Already shipped). Stil
 ### LAN game browser
 List every game server running on the LAN, including "listen" servers a player started from inside a game: game, server name, map, players, host address and the seat it is being played at. Finds them the way the games' own LAN tabs do (a broadcast query for Source and other Steam games, listening for the announcements Minecraft and others send out) and refreshes live. The seat comes from the seat sheet, by matching the host's network card to the switch port saved for that seat.
 
+### Pocket tester on a GL.iNet router (started)
+`router/`: the port checks on a GL.iNet travel router's WAN port, shown on its screen and a phone page (Slate 7 first). Built: verdict, switch (CDP/LLDP), port and DHCP checks, rogue DHCP, layer 2. Next: ping timeline, tick test and reflector, iperf3, port finder, port log, reporting to GXL. See [router/README.md](router/README.md).
+
 ## Planned
 
 ### Loop and storm alarm
