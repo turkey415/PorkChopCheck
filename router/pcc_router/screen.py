@@ -235,37 +235,64 @@ class Display:
 
 
 class Touch:
-    """Taps and long presses from the touchscreen (evdev: BTN_TOUCH down and up)."""
+    """Taps, swipes and long presses from the touchscreen.
+
+    The Slate 7's CST816 reports touches as multitouch tracking: ABS_MT_TRACKING_ID 0 when a finger
+    lands and -1 when it lifts, with ABS_X / ABS_Y positions in framebuffer pixels. It sends no
+    BTN_TOUCH, though that is understood too, for other screens. ABS_Y runs along the strip's long
+    side, opposite to the landscape x the pages are drawn in.
+    """
 
     EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit Linux
-    BTN_TOUCH = 0x14A
+    EV_KEY, EV_ABS = 1, 3
+    BTN_TOUCH, ABS_X, ABS_Y, ABS_MT_TRACKING_ID = 0x14A, 0x00, 0x01, 0x39
+    SWIPE = 50  # pixels along the strip that make a swipe rather than a tap
 
     def __init__(self, path="/dev/input/event0"):
         self.path = path
 
     def presses(self, stop):
-        """Yields "tap" or "hold" until stop() is true."""
+        """Yields "tap", "next", "prev" (swipes) or "hold" until stop() is true."""
         try:
             f = open(self.path, "rb", buffering=0)
         except OSError:
             return
         os.set_blocking(f.fileno(), False)
-        down_at = None
         with f:
-            while not stop():
-                data = f.read(self.EVENT.size * 16)
-                if not data:
-                    if down_at and time.monotonic() - down_at >= HOLD:
-                        down_at = None
-                        yield "hold"
-                    time.sleep(0.05)
-                    continue
-                for i in range(0, len(data) - self.EVENT.size + 1, self.EVENT.size):
-                    _, _, typ, code, value = self.EVENT.unpack_from(data, i)
-                    if typ == 1 and code == self.BTN_TOUCH:
-                        if value == 1:
-                            down_at = time.monotonic()
-                        elif value == 0 and down_at:
-                            held = time.monotonic() - down_at
-                            down_at = None
-                            yield "hold" if held >= HOLD else "tap"
+            yield from self.read(lambda: f.read(self.EVENT.size * 16), stop)
+
+    def read(self, chunk, stop, now=time.monotonic, idle=lambda: time.sleep(0.05)):
+        down_at = start_y = last_y = None
+        held = False
+        while not stop():
+            data = chunk()
+            # a held finger keeps sending events, so the hold is checked whether or not any came
+            if down_at is not None and not held and now() - down_at >= HOLD:
+                held = True
+                yield "hold"
+            if not data:
+                idle()
+                continue
+            for i in range(0, len(data) - self.EVENT.size + 1, self.EVENT.size):
+                _, _, typ, code, value = self.EVENT.unpack_from(data, i)
+                touching = None
+                if typ == self.EV_ABS and code == self.ABS_MT_TRACKING_ID:
+                    touching = value >= 0
+                elif typ == self.EV_KEY and code == self.BTN_TOUCH:
+                    touching = value == 1
+                elif typ == self.EV_ABS and code == self.ABS_Y:
+                    last_y = value
+                    if down_at is not None and start_y is None:
+                        start_y = value
+                if touching is True and down_at is None:
+                    down_at, start_y, held = now(), last_y, False
+                elif touching is False and down_at is not None:
+                    moved = (last_y or 0) - (start_y if start_y is not None else last_y or 0)
+                    if not held:
+                        if abs(moved) >= self.SWIPE:
+                            yield "next" if moved > 0 else "prev"  # finger moved left on the landscape page
+                        elif now() - down_at >= HOLD:
+                            yield "hold"
+                        else:
+                            yield "tap"
+                    down_at = start_y = None

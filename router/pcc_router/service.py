@@ -113,8 +113,8 @@ class Service:
                 time.sleep(1)
                 continue
             for press in touch.presses(lambda: self.stop.is_set() or self.config["screen"] != "pcc"):
-                if press == "tap":
-                    self.page = (self.page + 1) % len(PAGES)
+                if press in ("tap", "next", "prev"):
+                    self.page = (self.page + (-1 if press == "prev" else 1)) % len(PAGES)
                     self.screen_changed.set()  # redraw now
                 else:  # held: give the screen back to GL.iNet's program
                     self.set_screen("gl")

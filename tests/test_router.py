@@ -103,6 +103,32 @@ for p in range(len(screen.PAGES)):
 check("short port names", screen.short_port("GigabitEthernet1/0/14") == "Gi1/0/14" and screen.short_port("TenGigabitEthernet1/1/1") == "Te1/1/1")
 check("speed text", screen.speed_text({"up": True, "speed": 2500, "duplex": "full"}) == "2G" and screen.speed_text({"up": False}) == "no link")
 
+# ---------- touch: event sequences as the Slate 7's CST816 sends them ----------
+E = screen.Touch.EVENT
+def ev(code, value, typ=3):
+    return E.pack(0, 0, typ, code, value)
+def presses(batches):
+    """batches: [(seconds since start, bytes)]; returns what Touch.read yields."""
+    clock = {"t": 0.0}
+    queue = list(batches)
+    def chunk():
+        if queue and queue[0][0] <= clock["t"]:
+            return queue.pop(0)[1]
+        return b""
+    def idle():
+        clock["t"] += 0.05
+    return list(screen.Touch().read(chunk, lambda: not queue and clock["t"] > 10,
+                                    now=lambda: clock["t"], idle=idle))
+tap = [(0.0, ev(0, 25) + ev(1, 105) + ev(0x39, 0)), (0.05, ev(0x39, -1))]
+check("tap", presses(tap) == ["tap"])
+swipe = [(0.0, ev(0, 28) + ev(1, 211) + ev(0x39, 0))] + [(0.1 + i * 0.01, ev(1, 211 - i * 15) + ev(0x39, 0)) for i in range(11)] + [(0.3, ev(0x39, -1))]
+check("swipe towards the strip's start is the previous page", presses(swipe) == ["prev"])
+swipe_back = [(0.0, ev(1, 40) + ev(0x39, 0)), (0.1, ev(1, 200) + ev(0x39, 0)), (0.2, ev(0x39, -1))]
+check("swipe the other way is the next page", presses(swipe_back) == ["next"])
+hold = [(0.0, ev(1, 100) + ev(0x39, 0))] + [(0.01 * i, ev(0x39, 0)) for i in range(1, 250)] + [(2.6, ev(0x39, -1))]
+check("hold fires while still holding, and only once", presses(hold) == ["hold"])
+check("BTN_TOUCH screens work too", presses([(0.0, ev(0x14A, 1, typ=1)), (0.1, ev(0x14A, 0, typ=1))]) == ["tap"])
+
 # ---------- the backlight ----------
 with tempfile.TemporaryDirectory() as d:
     for name, value in (("max_brightness", "11"), ("brightness", "5"), ("bl_power", "1")):
