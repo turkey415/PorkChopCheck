@@ -97,6 +97,8 @@ class Service:
             last = 0
             while self.config["screen"] == "pcc" and not self.stop.is_set() and not self.screen_changed.is_set():
                 if time.monotonic() - last >= 1:
+                    if not self.display.lit():  # something blanked it: light it again
+                        self.display.light(True)
                     try:
                         self.display.show(self.tester.snapshot(), self.page)
                     except OSError:

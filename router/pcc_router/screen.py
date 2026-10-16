@@ -206,13 +206,32 @@ class Display:
             f.write(self.canvas.frame())
 
     def light(self, on=True):
+        """Backlight power and brightness, and the panel unblanked. GL.iNet's screen program blanks
+        the backlight (bl_power 1) when it stops, so brightness alone leaves the screen dark."""
+
+        def put(path, value):
+            try:
+                with open(path, "w") as f:
+                    f.write(value)
+            except OSError:
+                pass
+
         try:
             with open(os.path.join(self.backlight, "max_brightness")) as f:
                 top = f.read().strip()
-            with open(os.path.join(self.backlight, "brightness"), "w") as f:
-                f.write(top if on else "0")
         except OSError:
-            pass
+            top = "1"
+        put(os.path.join(self.backlight, "bl_power"), "0" if on else "4")
+        put(os.path.join(self.backlight, "brightness"), top if on else "0")
+        put(f"/sys/class/graphics/{os.path.basename(self.fb)}/blank", "0" if on else "1")
+
+    def lit(self):
+        """True when the backlight is powered (bl_power 0)."""
+        try:
+            with open(os.path.join(self.backlight, "bl_power")) as f:
+                return f.read().strip() == "0"
+        except OSError:
+            return True
 
 
 class Touch:

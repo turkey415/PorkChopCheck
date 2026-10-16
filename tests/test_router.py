@@ -103,6 +103,15 @@ for p in range(len(screen.PAGES)):
 check("short port names", screen.short_port("GigabitEthernet1/0/14") == "Gi1/0/14" and screen.short_port("TenGigabitEthernet1/1/1") == "Te1/1/1")
 check("speed text", screen.speed_text({"up": True, "speed": 2500, "duplex": "full"}) == "2G" and screen.speed_text({"up": False}) == "no link")
 
+# ---------- the backlight ----------
+with tempfile.TemporaryDirectory() as d:
+    for name, value in (("max_brightness", "11"), ("brightness", "5"), ("bl_power", "1")):
+        open(os.path.join(d, name), "w").write(value)
+    disp = screen.Display(fb=os.path.join(d, "fb0"), backlight=d)
+    check("a blanked backlight is not lit", not disp.lit())
+    disp.light(True)
+    check("lighting powers the backlight at full brightness", disp.lit() and open(os.path.join(d, "brightness")).read() == "11")
+
 # ---------- the phone page ----------
 class FakeService:
     def __init__(self):
