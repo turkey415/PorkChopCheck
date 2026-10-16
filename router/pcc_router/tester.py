@@ -28,6 +28,7 @@ class Tester:
         self.wan = {}  # address, gateway, dns from the router's own DHCP client
         self.checks = {}  # gateway / dns / internet results
         self.public_ip = None
+        self.blinking = False  # the port finder is bouncing the link on purpose: not a new port
         self.new_port(self.clock())
 
     # ---------- a new port: everything learned from the last one is forgotten ----------
@@ -52,6 +53,8 @@ class Tester:
 
     # ---------- inputs ----------
     def on_link(self, up, speed=None, duplex=None, ethtool_text=None):
+        if self.blinking:
+            return
         now = self.clock()
         with self.lock:
             was = self.link["up"]

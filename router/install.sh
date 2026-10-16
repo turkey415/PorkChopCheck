@@ -36,7 +36,7 @@ fi
 $SSH 'command -v python3 >/dev/null' || { echo "No python3 on the router." >&2; exit 1; }
 echo "Copying to $HOST..."
 tar -cf - pc_net.py -C router pcc_router/__init__.py pcc_router/font.py pcc_router/screen.py \
-	pcc_router/service.py pcc_router/tester.py pcc_router/web.py \
+	pcc_router/service.py pcc_router/tester.py pcc_router/tools.py pcc_router/web.py \
 	| $SSH 'rm -rf /usr/share/pcc-router && mkdir -p /usr/share/pcc-router /etc/pcc-router && tar -C /usr/share/pcc-router -xf -'
 $SSH 'cat > /etc/init.d/pcc-router && chmod 755 /etc/init.d/pcc-router' < router/pcc-router.init
 printf '%s\n' "$KEEP" | $SSH 'while read -r line; do grep -qxF "$line" /etc/sysupgrade.conf || echo "$line" >> /etc/sysupgrade.conf; done'

@@ -23,6 +23,17 @@ This folder is separate from the desktop app: the Windows and Linux downloads an
 
 Plugging into a new jack starts over: everything learned from the last port is forgotten.
 
+## Tools (the phone page's Tools tab)
+
+| Tool | What it does |
+|---|---|
+| **Ping** | Four pings a second to the gateway, the DNS server, the internet or any address, always running. A graph of the last 30 s, 5 min or 30 min with lost pings in red and every event marked on it, and under each event what ping did around it (`2 pings lost · peak 212 ms, normally 3 ms`, or `no effect on ping`). Loss, average, jitter, 99% under. The router's screen has a Ping page too. |
+| **Tick test** | Game-rate UDP (64 or 128 packets a second, 160 bytes) to a reflector, graded for Counter-Strike with the desktop's limits: loss, lost in a row, late replies, ping, jitter, the reflector's own delay taken out, and when each lost packet went missing. It sends a warm-up packet first so the first test packets are not lost to address lookup. |
+| **Reflector** | The far end of a tick test, on the router: put one router at the game server and test from another at a seat. Opens UDP 27777 on the WAN only while it is on. `porkchopcheck --reflector` on any PC does the same. |
+| **Speed test** | iperf3 up and down against a server you name (a GXL Event Server runs one on port 5202). The Slate 7 reaches full gigabit. |
+| **Port finder** | Blinks the switch port's LED: the WAN link down for 1.5 s, then up until it is really back (about 3 s on the Slate 7) and 2 s more. The tester keeps what it knew about the port meanwhile. The router's own internet drops while it runs. |
+| **Port log** | One row per switch + port, written whenever CDP/LLDP names it, and **Save** with a label (`Row C seat 7`) for history. Download as `ports.csv`. Kept in `/etc/pcc-router`, so it survives reboots. |
+
 ## Using it
 
 - **The router's screen:** tap for the next page (Summary, Switch, Port, Layer 2), or swipe: right to
@@ -60,6 +71,8 @@ again, so the screen is never left dark.
 - gateway, DNS and internet checks every 5 seconds, and the public address
 - the screen (`screen.py`: draws straight into `/dev/fb0` with bitmap fonts made by
   `tools/make_font.py` from Noto Sans Mono, SIL Open Font License) and its touch input
+- ping four times a second for the event timeline, and the port log (`tools.py`, which also has the
+  tick test, reflector, speed test and port finder the phone page starts)
 - the phone page (`web.py`)
 
 The logic is in `tester.py` with no I/O, so `tests/test_router.py` checks it on a PC with real-shaped
@@ -67,6 +80,5 @@ CDP, LLDP, DHCP and 802.1X frames, draws every screen page, and drives the phone
 
 ## Not yet
 
-From the desktop app's Tools page, still to come here: ping with the event timeline, the tick test
-(the router could also be the reflector at the game server), iperf3 speed test, port finder (blink the
-switch port's LED), a port log with labels, and reporting results to a GXL Event Server.
+Reporting results to a GXL Event Server, so a tested port shows in the Ops Console. From the desktop
+app, still to come: traceroute, the wire report, ARP scan, the mDNS browser and the multicast test.

@@ -1,8 +1,8 @@
 """The router's little screen: a 284 x 76 landscape strip (on the GL-BE3600, a 76 x 284 framebuffer
 turned a quarter turn, the way GL.iNet's own screen program draws it), RGB565, with touch.
 
-Pages: Summary, Switch, Port, Layer 2. Tap for the next page; hold for 1.5 s to hand the screen back
-to GL.iNet's screen program.
+Pages: Summary, Switch, Port, Layer 2, Ping. Tap or swipe for the next page; hold for 1.5 s to hand
+the screen back to GL.iNet's screen program.
 """
 
 import base64
@@ -81,7 +81,8 @@ class Canvas:
 
 
 # ---------- pages ----------
-PAGES = ["summary", "switch", "port", "l2"]
+PAGES = ["summary", "switch", "port", "l2", "ping"]
+PING_COLS = 270  # one column per pixel across the ping graph
 
 
 def short_port(name):
@@ -111,7 +112,10 @@ def draw(c, snap, page):
     c.rect(0, 0, 4, H, color)  # a stripe in the verdict's colour down the left edge
     name = PAGES[page % len(PAGES)]
     c.text(W - 2, 1, f"{page % len(PAGES) + 1}/{len(PAGES)}", "small", DIM, right=True)
-    {"summary": _summary, "switch": _switch, "port": _port, "l2": _l2}[name](c, snap, color)
+    {"summary": _summary, "switch": _switch, "port": _port, "l2": _l2, "ping": _ping}[name](c, snap, color)
+    if (snap.get("blink") or {}).get("running"):  # the port finder is on: say so on every page
+        c.rect(8, H - 14, W - 8, 14, ACC)
+        c.text(W // 2, H - 13, f"PORT FINDER ON · {snap['blink']['cycles']} flashes", "small", BG, center=True)
 
 
 def _summary(c, s, color):
@@ -192,6 +196,33 @@ def _l2(c, s, color):
         ("Trunk", (l2.get("dtp") or {}).get("oper", "-") + (f"  tags {l2['vlans_tagged']}" if l2["vlans_tagged"] else ""), None),
         ("Bcast/s", l2["broadcasts_per_s"], WARN if l2["broadcasts_per_s"] > 50 else None),
     ])
+
+
+def _ping(c, s, color):
+    p = s.get("ping") or {}
+    target = p.get("target") or "-"
+    c.text(8, 1, f"PING {target}", "small", ACC, max_w=W - 40)
+    cols = p.get("cols") or []
+    top_y, h = 16, 40
+    worst = max([col[0] or 0 for col in cols] + [5])
+    scale = 10 if worst <= 10 else 50 if worst <= 50 else 100 if worst <= 100 else int(worst // 100 + 1) * 100
+    for i, (rtt, lost, sent) in enumerate(cols):
+        x = 8 + i
+        if not sent:
+            continue
+        if lost:
+            c.rect(x, top_y, 1, h, BAD)
+        elif rtt is not None:
+            bh = max(1, int(rtt / scale * h))
+            c.rect(x, top_y + h - bh, 1, bh, GOOD if rtt < 20 else WARN if rtt < 100 else BAD)
+    c.text(W - 2, top_y, f"{scale}ms", "small", DIM, right=True)
+    if p.get("sent"):
+        loss = p["loss_pct"]
+        c.text(8, 59, f"loss {loss:g}%", "small", BAD if loss else GOOD)
+        c.text(100, 59, f"avg {p['avg']:.1f} ms" if p.get("avg") is not None else "avg -", "small", FG)
+        c.text(W - 4, 59, f"jit {p['jitter']:.1f}" if p.get("jitter") is not None else "", "small", DIM, right=True)
+    else:
+        c.text(8, 59, "waiting for replies", "small", DIM)
 
 
 # ---------- the device ----------

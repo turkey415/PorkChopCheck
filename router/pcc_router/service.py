@@ -8,7 +8,9 @@ Runs under procd (router/pcc-router.init). Threads:
 - checks: gateway, DNS and internet, and the public address
 - a DHCP DISCOVER of our own a few seconds after every link up, so a second server shows itself
 - the screen and its touch input, when the screen is ours
-- the phone page (web.py)
+- ping, four a second, to the chosen target, for the event timeline (tools.py)
+- the port log, filled in whenever CDP/LLDP names a port
+- the phone page (web.py), which also starts the tick test, reflector, speed test and port finder
 """
 
 import json
@@ -21,12 +23,13 @@ import time
 
 import pc_net as N
 
-from . import web
+from . import tools, web
 from .screen import PAGES, Display, Touch
 from .tester import Tester
 
 CONFIG = os.environ.get("PCC_CONFIG", "/etc/pcc-router/config.json")
-DEFAULTS = {"iface": "eth0", "wan": "wan", "screen": "pcc", "port": 8088}
+DEFAULTS = {"iface": "eth0", "wan": "wan", "screen": "pcc", "port": 8088,
+            "ping_target": "gateway", "tick_server": "", "iperf_server": "", "iperf_port": 5201}
 
 
 def run(cmd, timeout=10):
@@ -55,6 +58,14 @@ class Service:
         self.stop = threading.Event()
         self.screen_changed = threading.Event()
         self.recheck = threading.Event()
+        folder = os.path.dirname(self.config_path)
+        self.pinger = tools.Pinger(lambda: self.tester.wan.get("address"), self.ping_target)
+        self.tick = tools.Tick()
+        self.reflector = tools.ReflectorTool()
+        self.speed = tools.Speed()
+        self.blink = tools.Blink(self.iface, self.tester)
+        self.log = tools.PortLog(folder)
+        self._resolved = {}
 
     # ---------- config ----------
     def _load(self):
@@ -70,6 +81,35 @@ class Service:
         with open(tmp, "w") as f:
             json.dump(self.config, f, indent=1)
         os.replace(tmp, self.config_path)
+
+    # ---------- tools ----------
+    def ping_target(self):
+        """The address pinged now: the gateway, the first DNS server, the internet, or a name."""
+        want, wan = self.config.get("ping_target") or "gateway", self.tester.wan
+        if want == "gateway":
+            return wan.get("gateway")
+        if want == "dns":
+            return (wan.get("dns") or [None])[0]
+        if want == "internet":
+            return "1.1.1.1"
+        if want not in self._resolved:
+            try:
+                self._resolved = {want: socket.gethostbyname(want)}
+            except OSError:
+                return None
+        return self._resolved[want]
+
+    def set_option(self, key, value):
+        self.config[key] = value
+        self.save()
+
+    def log_loop(self):
+        while not self.stop.is_set():
+            try:
+                self.log.auto(self.tester.snapshot())
+            except OSError:
+                pass
+            self.stop.wait(3)
 
     # ---------- whose screen ----------
     def set_screen(self, mode):
@@ -100,7 +140,11 @@ class Service:
                     if not self.display.lit():  # something blanked it: light it again
                         self.display.light(True)
                     try:
-                        self.display.show(self.tester.snapshot(), self.page)
+                        snap = self.tester.snapshot()
+                        snap["blink"] = self.blink.state()
+                        if PAGES[self.page % len(PAGES)] == "ping":
+                            snap["ping"] = self.pinger.state(60, [], cols=270)
+                        self.display.show(snap, self.page)
                     except OSError:
                         pass
                     last = time.monotonic()
@@ -130,6 +174,10 @@ class Service:
             speed = int(read(f"{base}/speed", "0") or 0) if up else None
             duplex = read(f"{base}/duplex") if up else None
             state = (up, speed, duplex)
+            if self.tester.blinking:  # the port finder's own bounces: not news
+                last = state
+                time.sleep(0.5)
+                continue
             if state != last or (up and time.monotonic() - last_ethtool > 60):
                 text = run(["ethtool", self.iface]) if up else None
                 last_ethtool = time.monotonic()
@@ -217,9 +265,11 @@ class Service:
     # ---------- running ----------
     def start(self):
         self.apply_screen()
+        self.reflector.tidy()
         for target in (self.link_loop, self.listen_loop, self.wan_loop, self.checks_loop, self.screen_loop,
-                       self.touch_loop):  # fmt: skip
+                       self.touch_loop, self.log_loop):  # fmt: skip
             threading.Thread(target=target, daemon=True, name=target.__name__).start()
+        threading.Thread(target=self.pinger.run, args=(self.stop,), daemon=True, name="ping").start()
         web.serve(self, self.config["port"])  # blocks
 
 

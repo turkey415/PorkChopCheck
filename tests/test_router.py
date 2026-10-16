@@ -183,4 +183,87 @@ with tempfile.TemporaryDirectory() as d:
     except ValueError:
         check("bad mode refused", True)
 
+# ---------- tools ----------
+from pcc_router import tools as T
+import time
+req = T.echo_request(0x1234, 7)
+check("icmp checksum checks out", T.icmp_checksum(req) == 0)
+reply = bytes([0x45]) + bytes(19) + bytes([0, 0]) + req[2:4] + req[4:]
+check("echo reply read", T.parse_echo_reply(reply) == (0x1234, 7))
+check("echo request is not a reply", T.parse_echo_reply(bytes([0x45]) + bytes(19) + req) is None)
+
+pinger = T.Pinger(lambda: "10.2.1.108", lambda: "10.2.1.254")
+now = time.time()
+for i in range(40):  # 10 s of pings, two lost around a link event at -5 s
+    pinger._add(now - 10 + i * 0.25, None if i in (20, 21) else 1.0 + (i % 3))
+pinger.target = "10.2.1.254"
+st = pinger.state(30, [{"t": now - 5, "text": "Link down", "sev": "bad"}])
+check("ping summary", st["sent"] == 40 and st["lost"] == 2 and st["loss_pct"] == 5.0 and st["avg"] is not None and len(st["cols"]) == 120)
+check("event impact on the timeline", st["events"][0]["hit"] and "2 pings lost" in st["events"][0]["impact"], st["events"])
+
+ref = N.Reflector(0, "127.0.0.1"); ref.start()
+tick = T.Tick()
+tick.start("127.0.0.1", f"127.0.0.1:{ref.sock.getsockname()[1]}", rate=64, secs=1)
+time.sleep(2.3)
+ts = tick.state()
+check("tick test against a real reflector", not ts["running"] and ts["summary"]["n"] >= 40 and ts["summary"]["lost"] <= 2 and ts["grade"] in ("excellent", "good"), ts.get("headline"))
+check("tick ratings named", {r["key"] for r in ts["ratings"]} >= {"loss", "burst", "ping"})
+ref.stop()
+
+T.N.run_iperf = lambda exe, server, src, reverse, secs, port: ((812e6 if reverse else 640e6), 3, None)
+sp = T.Speed(); sp.start("10.2.1.108", "10.2.1.143", 5202, secs=1)
+for _ in range(50):
+    if not sp.state()["running"]: break
+    time.sleep(0.02)
+check("speed test both ways", sp.state()["up_mbps"] == 640.0 and sp.state()["down_mbps"] == 812.0 and sp.state()["server"] == "10.2.1.143:5202")
+
+cmds = []
+T.run = lambda cmd, timeout=10: cmds.append(cmd) or type("R", (), {"returncode": 1})()
+bt = Tester(clock=Clock()); bt.on_link(True, 1000, "full")
+bt.on_frame(N.build_cdp(SWITCH, "Texas-CORE", "GigabitEthernet1/0/14"))
+blink = T.Blink("eth0", bt)
+blink.set(True); time.sleep(0.2)
+check("port finder takes the link down and up", ["ip", "link", "set", "eth0", "down"] in cmds and bt.blinking)
+bt.on_link(False); bt.on_link(True, 1000, "full")
+check("the tester ignores the port finder's bounces", bt.snapshot()["switch"]["heard"] and bt.snapshot()["link"]["drops"] == 0)
+blink.set(False); time.sleep(1.7)
+check("port finder stops with the link up", not blink.state()["running"] and cmds[-1] == ["ip", "link", "set", "eth0", "up"])
+
+rt = T.ReflectorTool(0); cmds.clear()
+rt.ref = type("R", (), {"stop": lambda self: None, "count": 0, "peers": {}})()
+rt._firewall(True)
+check("reflector opens only its UDP port on the WAN", ["uci", "set", "firewall.pcc_reflector.dest_port=0"] in cmds and ["uci", "set", "firewall.pcc_reflector.src=wan"] in cmds)
+rt.set(False)
+check("and closes it again", ["uci", "-q", "delete", "firewall.pcc_reflector"] in cmds and rt.ref is None)
+
+with tempfile.TemporaryDirectory() as d:
+    log = T.PortLog(d)
+    log.auto(good.snapshot())
+    check("port logged when CDP names it", [r["port"] for r in log.list()] == ["GigabitEthernet1/0/14"])
+    saved = log.save(good.snapshot(), "Row C seat 7")
+    check("save with a label", saved["label"] == "Row C seat 7" and os.path.exists(os.path.join(d, "history.csv")))
+    log.last_key = None; log.auto(good.snapshot())
+    check("auto logging keeps the label", log.list()[0]["label"] == "Row C seat 7" and len(log.list()) == 1)
+    check("csv out", log.csv_text().splitlines()[0].startswith("time,switch,port") and "Row C seat 7" in log.csv_text())
+    check("log survives a restart", T.PortLog(d).list()[0]["label"] == "Row C seat 7")
+
+    class ToolService(FakeService):
+        def __init__(self):
+            super().__init__()
+            self.pinger, self.tick, self.speed, self.blink, self.log = pinger, T.Tick(), sp, blink, log
+            self.reflector = T.ReflectorTool(0)
+            self.config.update(ping_target="gateway", tick_server="", iperf_server="", iperf_port=5201)
+        def set_option(self, k, v): self.config[k] = v
+    tsvc = ToolService()
+    tsrv = web.ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(tsvc))
+    threading.Thread(target=tsrv.serve_forever, daemon=True).start()
+    base_url = f"http://127.0.0.1:{tsrv.server_address[1]}"
+    tj = json.loads(urllib.request.urlopen(base_url + "/api/tools?span=300").read())
+    check("tools state served", tj["ping"]["span"] == 300 and tj["log"][0]["label"] == "Row C seat 7" and tj["options"]["ping_target"] == "gateway")
+    check("ping target set", post("/api/ping", {"target": "dns"})[0] == 200 and tsvc.config["ping_target"] == "dns")
+    check("tick test needs a server", post("/api/tick", {"server": ""})[0] == 400)
+    check("port log save from the page", post("/api/log", {"label": "Stage left"})[1]["label"] == "Stage left")
+    check("csv download", "Stage left" in urllib.request.urlopen(base_url + "/ports.csv").read().decode())
+    tsrv.shutdown()
+
 print(f"\n{ok} checks passed")
