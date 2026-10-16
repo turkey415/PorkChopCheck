@@ -45,6 +45,12 @@ Your port log, device inventory and settings live in `~/Documents/PorkChopCheck/
 
 On Linux the app reads link and IP details from `/sys`, `ip`, and NetworkManager (`nmcli`). Linux drivers usually pass VLAN tags and LLDP frames through, so trunk and LLDP detection tend to work even better than on Windows.
 
+## On a GL.iNet router
+
+The same checks also run on a GL.iNet travel router (tried on the Slate 7, GL-BE3600): plug its WAN
+port into a jack and read the switch, VLAN, DHCP and link results on its screen or your phone. See
+[router/README.md](router/README.md).
+
 ## Pages
 
 Swipe left/right or tap the bottom bar to move between pages.
