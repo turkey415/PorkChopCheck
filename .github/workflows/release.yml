@@ -73,6 +73,7 @@ jobs:
         with:
           name: windows
           path: out/*
+          retention-days: 1
 
   linux:
     needs: test
@@ -93,6 +94,7 @@ jobs:
         with:
           name: linux
           path: out/*.tar.gz
+          retention-days: 1
 
   release:
     needs: [windows, linux]
