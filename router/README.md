@@ -34,11 +34,36 @@ Plugging into a new jack starts over: everything learned from the last port is f
 | **Port finder** | Blinks the switch port's LED: the WAN link down for 1.5 s, then up until it is really back (about 3 s on the Slate 7) and 2 s more. The tester keeps what it knew about the port meanwhile. The router's own internet drops while it runs. |
 | **Port log** | One row per switch + port, written whenever CDP/LLDP names it, and **Save** with a label (`Row C seat 7`) for history. Download as `ports.csv`. Kept in `/etc/pcc-router`, so it survives reboots. |
 
+## Router or Access point
+
+The router can switch between **Router** mode and **Access point** mode without a reset, and all its
+settings and this tester are kept. The change uses GL.iNet's own call, the one its Network Mode page
+makes. It takes a few seconds, and Wi-Fi drops briefly.
+
+- **Side switch:** **on = Access point, off = Router**. The installer sets the switch to do this. It
+  can be set back to another job in GL.iNet's admin page (the switch has one job at a time).
+- **The screen:** every page shows the mode in its top corner: grey `ROUTER`, blue `AP`, or amber
+  `> AP` while it changes. The **Mode** page (the last one) shows the mode, where the phone page
+  is, and where the switch is. **Hold it for 3 s** to change the mode. At 1.5 s it says "Keep
+  holding", and that hold doesn't hand the screen back on this page.
+- **The phone page:** the Network mode card at the top, with Router and Access point buttons.
+
+In **Access point** mode the WAN port joins the LAN, the router stops handing out addresses, and it
+takes an address from the network on WAN. **192.168.8.1 stops working**; the phone page moves to
+that new address (the Mode page and the Summary page show it). The tester keeps testing the port the
+WAN is plugged into, in both modes. AP mode needs a cable in WAN: without one it says "Plug a cable
+into WAN first" and stays a router.
+
+After a reboot the router keeps whatever mode it was in. GL.iNet replays the switch's position at
+boot, and that replay is ignored, so the mode never changes on its own. If the switch and the mode
+disagree (after a change from the screen or the phone page), the next flip of the switch sets the
+mode to its new position.
+
 ## Using it
 
-- **The router's screen:** tap for the next page (Summary, Switch, Port, Layer 2), or swipe: right to
-  left for the next page, left to right for the previous one. **Hold for 1.5 s** to hand the screen
-  back to GL.iNet's own screen program.
+- **The router's screen:** tap for the next page (Summary, Switch, Port, Layer 2, Ping, Mode), or
+  swipe: right to left for the next page, left to right for the previous one. **Hold for 1.5 s** to
+  hand the screen back to GL.iNet's own screen program (on the Mode page, hold 3 s to change mode).
 - **The phone page:** join the router's Wi-Fi and open **http://192.168.8.1:8088**. Everything above,
   refreshed every 2 seconds, with **Re-check now**, and a **Screen: GL.iNet / PorkChopCheck** switch at
   the top. The choice is remembered across reboots. The tester keeps running with either screen.
@@ -55,8 +80,10 @@ router/install.sh root@192.168.8.1              # install, or update to this cop
 router/install.sh root@192.168.8.1 --uninstall   # remove it and give the screen back
 ```
 
-It copies `pc_net.py` and `router/pcc_router/` to `/usr/share/pcc-router`, adds the service
-`/etc/init.d/pcc-router`, and lists those files in `/etc/sysupgrade.conf` so a firmware upgrade that
+It copies `pc_net.py`, `router/pcc_router/` and `router/netmode.lua` to `/usr/share/pcc-router`, adds
+the service `/etc/init.d/pcc-router`, installs `router/switch-netmode.sh` as
+`/etc/gl-switch.d/netmode.sh` and sets the side switch to it, and lists those files in
+`/etc/sysupgrade.conf` so a firmware upgrade that
 keeps settings keeps the tester. The settings file is `/etc/pcc-router/config.json` (`screen`:
 `pcc` or `gl`; `iface`, `wan`, `port`). Whenever the service stops it starts GL.iNet's screen program
 again, so the screen is never left dark.
@@ -74,6 +101,12 @@ again, so the screen is never left dark.
 - ping four times a second for the event timeline, and the port log (`tools.py`, which also has the
   tick test, reflector, speed test and port finder the phone page starts)
 - the phone page (`web.py`)
+- the network mode and the side switch, read every 2 s (`uci` glconfig and the switch's GPIO).
+  `netmode.lua` makes the change with `ubus call gl-session call` (module `netmode`, `set_mode`).
+  That runs inside GL.iNet's web server, because `set_mode` needs its nginx Lua tools. It is wrapped
+  in `flock` so two changes never overlap, and it writes its progress to `/tmp/pcc-netmode.json` for
+  the screen and the page. In AP mode the router's own address comes from `network.interface.lan`
+  instead of `wan`.
 
 The logic is in `tester.py` with no I/O, so `tests/test_router.py` checks it on a PC with real-shaped
 CDP, LLDP, DHCP and 802.1X frames, draws every screen page, and drives the phone page.

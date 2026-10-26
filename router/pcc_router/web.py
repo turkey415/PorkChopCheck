@@ -4,14 +4,18 @@ knows, refreshed every 2 seconds, and the switch between GL.iNet's screen and ou
 GET /            the page
 GET /api/state   everything, as JSON
 POST /api/screen {"mode": "pcc" | "gl"}
+POST /api/netmode {"mode": "router" | "ap"}  change the network mode (as GL.iNet's Network Mode page does)
+GET /api/wifi     the router's own Wi-Fi networks (names, never passwords) and the last save
+POST /api/wifi {"id", "ssid", "key", "admin"}  change a name and password; needs the admin password
 POST /api/recheck  run the DHCP probe and the checks again now
 GET /api/tools?span=30  ping (with the event timeline), tick test, reflector, speed test, port finder, port log
 POST /api/ping {"target"}, /api/tick {"action", "server", "rate", "secs"}, /api/reflector {"on"},
      /api/speed {"server", "port"}, /api/blink {"on"}, /api/log {"label"}
 GET /ports.csv     the port log
 
-GL.iNet's firewall keeps this port closed on the WAN side, so only the router's own Wi-Fi and LAN
-can reach it.
+In Router mode GL.iNet's firewall keeps this port closed on the WAN side, so only the router's own
+Wi-Fi and LAN reach it. In Access point mode there is no WAN side: the page is at the address the
+network gave the router, as the screen's Mode page shows.
 """
 
 import json
@@ -53,6 +57,12 @@ def make_handler(service):
                 except ValueError:
                     span = 30
                 return self._send(200, json.dumps(tools_state(service, max(10, min(span, 1800))), default=str))
+            if url.path == "/api/wifi":
+                try:
+                    nets, err = service.wifi.networks(), None
+                except ValueError as e:
+                    nets, err = [], str(e)
+                return self._send(200, json.dumps({"networks": nets, "error": err, "save": service.wifi.state}))
             if url.path == "/ports.csv":
                 data = service.log.csv_text().encode()
                 self.send_response(200)
@@ -64,7 +74,7 @@ def make_handler(service):
             if self.path in ("/", "/index.html"):
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif self.path == "/api/state":
-                snap = service.tester.snapshot()
+                snap = service.screen_snap()
                 snap["screen"] = service.config["screen"]
                 snap["page"] = service.page
                 self._send(200, json.dumps(snap, default=str))
@@ -83,6 +93,20 @@ def make_handler(service):
                 except ValueError:
                     return self._send(400, '{"error": "mode is pcc or gl"}')
                 return self._send(200, json.dumps({"screen": service.config["screen"]}))
+            if self.path == "/api/netmode":
+                try:
+                    service.set_netmode(body.get("mode"))
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, '{"ok": true}')
+            if self.path == "/api/wifi":
+                try:
+                    service.wifi.change(str(body.get("id") or ""), body.get("ssid"), str(body.get("key") or ""), str(body.get("admin") or ""))
+                except PermissionError as e:
+                    return self._send(403, json.dumps({"error": str(e)}))
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, '{"ok": true}')
             if self.path == "/api/recheck":
                 threading.Thread(target=service.dhcp_probe, daemon=True).start()
                 service.recheck.set()
@@ -188,12 +212,30 @@ th { color:var(--muted); font-weight:600; }
 <nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button></nav>
 <main id="tab-port">
   <div class="banner" id="banner">Loading…</div>
+  <section><h2>Network mode</h2>
+    <div class="line"><span class="big" id="nm" style="font-size:22px">…</span><span class="spacer"></span>
+      <div class="seg" id="nmseg"><button data-n="router">Router</button><button data-n="ap">Access point</button></div></div>
+    <div class="sub" id="nminfo"></div><div class="sub bad" id="nmerr"></div></section>
+  <section><h2>Wi-Fi</h2>
+    <div id="wf"><div class="sub">Loading…</div></div>
+    <form id="wform" hidden autocomplete="off">
+      <div class="sub" id="wfor" style="margin:8px 0 4px"></div>
+      <div class="line"><label class="k" for="wssid" style="width:130px">Wi-Fi name</label><input id="wssid" class="grow" maxlength="32" spellcheck="false"></div>
+      <div class="line"><label class="k" for="wkey" style="width:130px">New password</label><input id="wkey" class="grow" type="password" maxlength="63" placeholder="leave blank to keep it" autocomplete="new-password"></div>
+      <div class="line"><label class="k" style="width:130px"></label><label class="sub"><input type="checkbox" id="wshow"> show password</label></div>
+      <div class="line"><label class="k" for="wadm" style="width:130px">Admin password</label><input id="wadm" class="grow" type="password" placeholder="GL.iNet admin page password" autocomplete="current-password"></div>
+      <div class="line"><button class="act" type="submit" id="wsave">Save</button><button class="key" type="button" id="wcancel">Cancel</button></div>
+      <div class="sub bad" id="werr"></div>
+    </form>
+    <div class="sub" id="wmsg"></div>
+    <p class="sub">Changes go through GL.iNet's own Wi-Fi settings, so its admin page shows them too. Saving restarts Wi-Fi: phones on it drop and must join again with the new name or password. The admin password is needed because in Access point mode anyone on the network can open this page. Current passwords are never shown here.</p>
+  </section>
   <section><h2>Switch</h2><div id="sw"></div></section>
   <section><h2>Port</h2><div class="rows" id="port"></div></section>
   <section><h2>DHCP and layer 2</h2><div class="rows" id="l2"></div></section>
   <section><h2>Events</h2><div id="ev"></div></section>
   <div><button class="act" id="re">Re-check now</button> <span class="sub" id="age"></span></div>
-  <p class="sub">The router's WAN port is the one being tested. Tap or swipe the router's screen for the next page; hold it to hand the screen back to GL.iNet.</p>
+  <p class="sub">The router's WAN port is the one being tested. Tap or swipe the router's screen for the next page; hold it to hand the screen back to GL.iNet. On the screen's Mode page, hold 3 s to change the network mode. The side switch changes it too: on = Access point, off = Router.</p>
 </main>
 <main id="tab-tools" hidden>
   <section><h2>Ping</h2>
@@ -231,8 +273,69 @@ const chk = c => !c ? ['…', ''] : c.ok ? [(c.ms != null ? c.ms.toFixed(1) + ' 
 const ago = t => { const s = Math.round(Date.now() / 1000 - t); return s < 60 ? s + ' s ago' : Math.round(s / 60) + ' min ago'; };
 let screen = null;
 
+const MODES = {router: 'Router', ap: 'Access point'};
+let netmode = null;
+function renderMode(m) {
+  netmode = m;
+  const changing = m.state === 'changing';
+  $('nm').textContent = changing ? 'Changing to ' + (MODES[m.want] || m.want) + '…' : (MODES[m.mode] || m.mode || '?');
+  $('nm').className = 'big ' + (changing ? 'warn' : m.mode === 'ap' ? 'acc' : '');
+  document.querySelectorAll('#nmseg button').forEach(b => { b.classList.toggle('on', b.dataset.n === m.mode); b.disabled = changing; });
+  const sw = !m.switch_set ? 'The side switch is not set to change the mode.' : m.switch ? `Side switch: ${m.switch} (${m.switch === 'on' ? 'Access point' : 'Router'})${(m.switch === 'on') !== (m.mode === 'ap') && !changing ? ', the other way from the mode now: the next flip changes it' : ''}.` : '';
+  $('nminfo').textContent = (changing ? 'Wi-Fi drops for about a minute. In Access point mode this page moves to the address the network gives the router: the screen\'s Mode page shows it. ' : '') + sw;
+  $('nmerr').textContent = m.state === 'error' && m.error ? m.error : '';
+}
+document.querySelectorAll('#nmseg button').forEach(b => b.onclick = async () => {
+  if (!netmode || b.dataset.n === netmode.mode) return;
+  const ap = b.dataset.n === 'ap';
+  if (!confirm(ap ? 'Switch to Access point mode?\n\nThe WAN port joins the LAN, the router stops handing out addresses, and it takes an address from the network on WAN. 192.168.8.1 stops working: this page moves to that new address (shown on the router\'s screen). Wi-Fi drops for about a minute.'
+                  : 'Switch to Router mode?\n\nThe router hands out 192.168.8.x addresses again and this page goes back to http://192.168.8.1:8088. Wi-Fi drops for about a minute.')) return;
+  const r = await post('/api/netmode', {mode: b.dataset.n});
+  if (!r.ok) { $('nmerr').textContent = (await r.json().catch(() => ({}))).error || 'Could not start'; return; }
+  load();
+});
+
+let wnets = [], wedit = null;
+async function loadWifi() {
+  try {
+    const j = await (await fetch('/api/wifi')).json();
+    wnets = j.networks || [];
+    $('wf').innerHTML = j.error ? `<div class="sub bad">${esc(j.error)}</div>` : wnets.map(n => `<div class="line" style="justify-content:space-between;border-top:1px solid var(--line);padding-top:6px">
+      <span><span class="v" style="font-weight:700">${esc(n.ssid)}</span><br><span class="sub">${esc(n.label)} · ${n.on ? (n.hidden ? 'on, hidden' : 'on, visible') : 'off'}${n.secured ? '' : ' · open, no password'}</span></span>
+      <button class="key" type="button" data-w="${esc(n.id)}">Change</button></div>`).join('') || '<div class="sub">No networks found.</div>';
+    const sv = j.save || {};
+    $('wmsg').className = 'sub ' + (sv.state === 'error' ? 'bad' : sv.state === 'saving' ? 'warn' : 'good');
+    $('wmsg').textContent = sv.state === 'saving' ? `Saving ${sv.ssid}… Wi-Fi restarts now.` : sv.state === 'done' && Date.now() / 1000 - sv.t < 300 ? `Saved: ${sv.ssid}.` : sv.state === 'error' ? 'Not saved: ' + sv.error : '';
+  } catch (e) { $('wf').innerHTML = '<div class="sub">router not answering</div>'; }
+}
+$('wf').addEventListener('click', e => {
+  const b = e.target.closest('[data-w]'); if (!b) return;
+  wedit = wnets.find(n => n.id === b.dataset.w); if (!wedit) return;
+  $('wfor').textContent = 'Changing ' + wedit.label + (wedit.hidden ? ' (hidden network)' : '');
+  $('wssid').value = wedit.ssid || ''; $('wkey').value = ''; $('wadm').value = ''; $('werr').textContent = '';
+  $('wkey').disabled = !wedit.secured; $('wkey').placeholder = wedit.secured ? 'leave blank to keep it' : 'open network: set a password in GL.iNet first';
+  $('wform').hidden = false; $('wssid').focus();
+});
+$('wshow').onchange = () => { $('wkey').type = $('wshow').checked ? 'text' : 'password'; };
+$('wcancel').onclick = () => { $('wform').hidden = true; wedit = null; };
+$('wform').onsubmit = async e => {
+  e.preventDefault(); if (!wedit) return;
+  const ssid = $('wssid').value.trim(), key = $('wkey').value;
+  if (key && (key.length < 8 || key.length > 63)) { $('werr').textContent = 'The password must be 8 to 63 characters.'; return; }
+  if (!confirm(`Save "${ssid}"${key ? ' with the new password' : ''}?\n\nWi-Fi restarts. If this phone is on it, join "${ssid}" again${key ? ' with the new password' : ''}.`)) return;
+  $('wsave').disabled = true; $('werr').textContent = '';
+  try {
+    const r = await post('/api/wifi', {id: wedit.id, ssid, key, admin: $('wadm').value});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('werr').textContent = j.error || 'Not saved'; return; }
+    $('wform').hidden = true; wedit = null; $('wadm').value = ''; $('wkey').value = '';
+    loadWifi();
+  } finally { $('wsave').disabled = false; }
+};
+
 function render(s) {
   screen = s.screen;
+  if (s.netmode) renderMode(s.netmode);
   document.querySelectorAll('#seg button').forEach(b => b.classList.toggle('on', b.dataset.m === s.screen));
   const bad = s.findings.filter(f => f[0] !== 'good');
   $('banner').className = 'banner ' + s.verdict;
@@ -352,5 +455,6 @@ async function loadTools() {
   try { renderTools(await (await fetch('/api/tools?span=' + span)).json()); } catch (e) {}
 }
 load(); setInterval(() => tab === 'port' ? load() : loadTools(), 2000);
+loadWifi(); setInterval(() => { if (tab === 'port' && $('wform').hidden) loadWifi(); }, 10000);
 </script></body></html>
 """
