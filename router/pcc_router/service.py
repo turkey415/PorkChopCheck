@@ -12,6 +12,7 @@ Runs under procd (router/pcc-router.init). Threads:
 - the port log, filled in whenever CDP/LLDP names a port
 - the phone page (web.py), which also starts the tick test, reflector, speed test and port finder
 - the network mode (Router or Access point) and the side switch's position; netmode.lua changes it
+- Wi-Fi names and passwords from the phone page (wifi.py), through GL.iNet's own calls
 """
 
 import json
@@ -24,7 +25,7 @@ import time
 
 import pc_net as N
 
-from . import tools, web
+from . import tools, web, wifi
 from .screen import PAGES, Display, Touch
 from .tester import Tester
 
@@ -71,6 +72,7 @@ class Service:
         self.speed = tools.Speed()
         self.blink = tools.Blink(self.iface, self.tester)
         self.log = tools.PortLog(folder)
+        self.wifi = wifi.Wifi()
         self._resolved = {}
         self.netmode = {"mode": None, "switch": None, "switch_set": False, "state": None, "lan_ip": None}
         self.hold_hint = 0  # when a finger on the Mode page passed the first hold: "keep holding"

@@ -324,4 +324,71 @@ with tempfile.TemporaryDirectory() as d:
     check("csv download", "Stage left" in urllib.request.urlopen(base_url + "/ports.csv").read().decode())
     tsrv.shutdown()
 
+# ---------- Wi-Fi name and password ----------
+from pcc_router import wifi as WF
+class FakeCrypt:
+    @staticmethod
+    def crypt(pw, salt): return salt if pw == "right-pass" else "$1$x$nope"
+WF.crypt = FakeCrypt
+MLO = {"ifaces": [{"name": "mld0", "ssid": "GL-MLO", "key": "old-key-123", "hidden": False, "mlo_enable": True, "encryption": "sae-mixed", "mlo_band": ["2g", "5g"], "guest": False}]}
+CFG = [{"band": "2G", "device": "wifi0", "channel": "auto", "ifaces": [
+          {"name": "wifi2g", "ssid": "GL-2G", "key": "k2-123456", "enabled": True, "hidden": True, "encryption": "psk2", "guest": False},
+          {"name": "guest2g", "ssid": "GL-Guest", "enabled": False, "guest": True, "encryption": "psk2"},
+          {"name": "iot2g", "ssid": "GL-IoT", "enabled": False, "guest": False, "encryption": "psk2"}]}]
+calls = []
+def fake_gl(module, func, params=None, timeout=10):
+    calls.append((func, params))
+    return {"get_mlo_config": MLO, "get_config": CFG}.get(func, {})
+with tempfile.TemporaryDirectory() as d:
+    shadow = os.path.join(d, "shadow"); open(shadow, "w").write("root:$1$salt$hash:19000:0:99999:7:::\n")
+    clock = {"t": 0.0}
+    w = WF.Wifi(call=fake_gl, shadow=shadow, clock=lambda: clock["t"], sleep=lambda s: None)
+    nets = w.networks()
+    check("own networks listed, MLO first, no guest or IoT", [n["id"] for n in nets] == ["mld0", "wifi2g"] and nets[1]["hidden"])
+    check("passwords never listed", "key" not in json.dumps(nets) and "old-key" not in json.dumps(nets))
+    try:
+        w.change("mld0", "New Name", "", "wrong"); check("wrong admin password refused", False)
+    except PermissionError:
+        check("wrong admin password refused", True)
+    for bad in (("mld0", "", "", "right-pass"), ("mld0", "x" * 33, "", "right-pass"), ("mld0", "ok", "short", "right-pass"), ("nope", "ok", "", "right-pass")):
+        try:
+            w.change(*bad); check(f"bad input refused {bad[:3]}", False)
+        except ValueError:
+            check(f"bad input refused {bad[:3]}", True)
+    w.change("mld0", "Event-WiFi", "", "right-pass")
+    for _ in range(50):
+        if w.state["state"] != "saving": break
+        time.sleep(0.02)
+    sent = [p for f, p in calls if f == "set_mlo_config"][-1]
+    check("MLO rename keeps its password and bands", sent["ssid"] == "Event-WiFi" and sent["key"] == "old-key-123" and sent["mlo_band"] == ["2g", "5g"] and w.state["state"] == "done")
+    w.change("wifi2g", "Event-2G", "brand-new-pass", "right-pass")
+    for _ in range(50):
+        if w.state["state"] != "saving": break
+        time.sleep(0.02)
+    sent = [p for f, p in calls if f == "set_config"][-1]
+    check("2.4 GHz change sends the new password", sent["iface_name"] == "wifi2g" and sent["key"] == "brand-new-pass" and sent["device"] == "wifi0" and sent["hidden"] is True)
+    for _ in range(5):
+        try: w.change("mld0", "x", "", "wrong")
+        except PermissionError: pass
+    try:
+        w.change("mld0", "x", "", "right-pass"); check("locked after five wrong passwords", False)
+    except PermissionError as e:
+        check("locked after five wrong passwords", "Too many" in str(e))
+    clock["t"] = 400
+    w.change("mld0", "After-Lock", "", "right-pass")
+    check("unlocked after five minutes", True)
+    # the phone page
+    class WifiService(FakeService):
+        def __init__(self):
+            super().__init__(); self.wifi = WF.Wifi(call=fake_gl, shadow=shadow, sleep=lambda s: None)
+    wsvc = WifiService()
+    wsrv = web.ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(wsvc))
+    threading.Thread(target=wsrv.serve_forever, daemon=True).start()
+    base_url = f"http://127.0.0.1:{wsrv.server_address[1]}"
+    wj = json.loads(urllib.request.urlopen(base_url + "/api/wifi").read())
+    check("Wi-Fi list served without passwords", wj["networks"][0]["ssid"] == "GL-MLO" and "old-key" not in json.dumps(wj))
+    check("Wi-Fi save needs the admin password", post("/api/wifi", {"id": "mld0", "ssid": "A", "admin": "wrong"})[0] == 403)
+    check("Wi-Fi save from the page", post("/api/wifi", {"id": "wifi2g", "ssid": "Page-2G", "admin": "right-pass"})[0] == 200)
+    wsrv.shutdown()
+
 print(f"\n{ok} checks passed")
