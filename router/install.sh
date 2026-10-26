@@ -39,7 +39,7 @@ fi
 $SSH 'command -v python3 >/dev/null' || { echo "No python3 on the router." >&2; exit 1; }
 echo "Copying to $HOST..."
 tar -cf - pc_net.py -C router pcc_router/__init__.py pcc_router/font.py pcc_router/screen.py \
-	pcc_router/service.py pcc_router/tester.py pcc_router/tools.py pcc_router/web.py pcc_router/wifi.py netmode.lua \
+	pcc_router/service.py pcc_router/tester.py pcc_router/tools.py pcc_router/web.py pcc_router/wifi.py pcc_router/auth.py pcc_router/tls.py netmode.lua \
 	| $SSH 'rm -rf /usr/share/pcc-router && mkdir -p /usr/share/pcc-router /etc/pcc-router && tar -C /usr/share/pcc-router -xf -'
 $SSH 'cat > /etc/init.d/pcc-router && chmod 755 /etc/init.d/pcc-router' < router/pcc-router.init
 # the side switch: GL.iNet runs /etc/gl-switch.d/<func>.sh with on/off when it is flipped
@@ -50,4 +50,5 @@ $SSH 'mkdir -p /etc/gl-switch.d && cat > /etc/gl-switch.d/netmode.sh && chmod 75
 	fi' < router/switch-netmode.sh
 printf '%s\n' "$KEEP" | $SSH 'while read -r line; do grep -qxF "$line" /etc/sysupgrade.conf || echo "$line" >> /etc/sysupgrade.conf; done'
 $SSH '/etc/init.d/pcc-router enable && /etc/init.d/pcc-router restart'
-echo "Installed. Join the router's Wi-Fi and open http://192.168.8.1:8088"
+echo "Installed. Join the router's Wi-Fi and open https://192.168.8.1:8088 (or the address on the screen's Mode page)."
+echo "The first visit makes the admin account; it asks for the router's admin password."

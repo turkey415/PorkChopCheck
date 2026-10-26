@@ -5,26 +5,14 @@ GL.iNet's calls go through `ubus call gl-session call` (module "wifi"): get_conf
 the 2.4 and 5 GHz networks, get_mlo_config / set_mlo_config for the Wi-Fi 7 MLO network (one name
 across both bands). Guest and IoT networks are left alone.
 
-Passwords are never sent to the page. Saving needs the router's admin (root) password, checked
-against /etc/shadow: in Access point mode the phone page is open to the whole network on WAN.
+Passwords are never sent to the page. Only admins can save (the page's login, web.py).
 """
 
-import hmac
 import json
 import subprocess
 import threading
 import time
-import warnings
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", DeprecationWarning)
-    try:
-        import crypt  # Python 3.11 on the router still has it
-    except ImportError:  # pragma: no cover - newer Pythons (the tests fake it)
-        crypt = None
-
-SHADOW = "/etc/shadow"
-TRIES, LOCK_SECS = 5, 300  # wrong admin passwords before saving is locked for a while
 BANDS = {"2G": "2.4 GHz", "5G": "5 GHz", "6G": "6 GHz"}
 
 
@@ -57,9 +45,8 @@ def check_key(key):
 
 
 class Wifi:
-    def __init__(self, call=gl, shadow=SHADOW, clock=time.monotonic, sleep=time.sleep):
-        self.call, self.shadow, self.clock, self.sleep = call, shadow, clock, sleep
-        self.fails, self.locked_until = 0, 0
+    def __init__(self, call=gl):
+        self.call = call
         self.state = {"state": None}  # the last save: saving / done / error
         self.lock = threading.Lock()
 
@@ -94,32 +81,9 @@ class Wifi:
         out.sort(key=lambda n: (not n["on"], n["hidden"], n["kind"] != "mlo"))
         return out
 
-    # ---------- the admin password ----------
-    def check_admin(self, password):
-        now = self.clock()
-        if now < self.locked_until:
-            raise PermissionError(f"Too many wrong passwords: try again in {int(self.locked_until - now) // 60 + 1} min")
-        stored = ""
-        try:
-            with open(self.shadow) as f:
-                for line in f:
-                    if line.startswith("root:"):
-                        stored = line.split(":")[1]
-        except OSError:
-            pass
-        good = bool(stored) and crypt is not None and hmac.compare_digest(crypt.crypt(password or "", stored) or "", stored)
-        if not good:
-            self.fails += 1
-            if self.fails >= TRIES:
-                self.fails, self.locked_until = 0, now + LOCK_SECS
-            self.sleep(1)  # slow down guessing
-            raise PermissionError("Wrong admin password (the one for GL.iNet's admin page)")
-        self.fails = 0
-
     # ---------- saving ----------
-    def change(self, net_id, ssid, key, admin_password):
+    def change(self, net_id, ssid, key):
         """Checks everything, then saves in the background: Wi-Fi restarts, so the phone may drop."""
-        self.check_admin(admin_password)
         ssid = check_ssid(ssid)
         key = check_key(key) if key else None
         mlo, bands = self._raw()

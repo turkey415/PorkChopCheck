@@ -25,7 +25,7 @@ import time
 
 import pc_net as N
 
-from . import tools, web, wifi
+from . import auth, tls, tools, web, wifi
 from .screen import PAGES, Display, Touch
 from .tester import Tester
 
@@ -73,6 +73,8 @@ class Service:
         self.blink = tools.Blink(self.iface, self.tester)
         self.log = tools.PortLog(folder)
         self.wifi = wifi.Wifi()
+        self.auth = auth.Auth(folder)
+        self.tls = tls.TLS(folder, self.addresses)
         self._resolved = {}
         self.netmode = {"mode": None, "switch": None, "switch_set": False, "state": None, "lan_ip": None}
         self.hold_hint = 0  # when a finger on the Mode page passed the first hold: "keep holding"
@@ -120,6 +122,11 @@ class Service:
             except OSError:
                 pass
             self.stop.wait(3)
+
+    def addresses(self):
+        """The router's addresses now, for the certificate: its LAN address and the WAN / AP one."""
+        return [a for a in (self.netmode.get("lan_ip") if self.netmode.get("mode") != "ap" else None,
+                            self.tester.wan.get("address")) if a]  # fmt: skip
 
     # ---------- Router or Access point ----------
     def read_netmode(self):
@@ -351,6 +358,8 @@ class Service:
         self.apply_screen()
         self.reflector.tidy()
         self.netmode = self.read_netmode()
+        self.tls.ensure()  # HTTPS on the phone page's port; first start makes the certificate
+        threading.Thread(target=self.tls.cover_addresses, daemon=True, name="tls").start()
         for target in (self.link_loop, self.listen_loop, self.wan_loop, self.checks_loop, self.screen_loop,
                        self.touch_loop, self.log_loop, self.netmode_loop):  # fmt: skip
             threading.Thread(target=target, daemon=True, name=target.__name__).start()

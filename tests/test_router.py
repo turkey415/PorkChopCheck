@@ -161,10 +161,13 @@ with tempfile.TemporaryDirectory() as d:
     check("lighting powers the backlight at full brightness", disp.lit() and open(os.path.join(d, "brightness")).read() == "11")
 
 # ---------- the phone page ----------
+from pcc_router import auth as A
+AUTH_DIR = tempfile.mkdtemp()
 class FakeService:
     def __init__(self):
         self.tester, self.config, self.page = good, {"screen": "pcc"}, 0
         self.recheck = threading.Event(); self.probed = threading.Event()
+        self.auth = A.Auth(AUTH_DIR, owner_check=lambda pw: pw == "owner-pass")
     def set_screen(self, mode):
         if mode not in ("pcc", "gl"): raise ValueError(mode)
         self.config["screen"] = mode
@@ -175,18 +178,40 @@ class FakeService:
         if mode not in ("router", "ap"): raise ValueError("mode is router or ap")
         self.netmode_set = mode
 svc = FakeService()
-srv = web.ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(svc))
+srv = web.Server(("127.0.0.1", 0), web.make_handler(svc))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 base_url = f"http://127.0.0.1:{srv.server_address[1]}"
-def post(path, body):
-    req = urllib.request.Request(base_url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+COOKIE = {"v": ""}
+def call(path, body=None, cookie=None, ctype="application/json"):
+    """(status, decoded JSON or text, Set-Cookie value)"""
+    headers = {"Cookie": COOKIE["v"] if cookie is None else cookie}
+    if body is not None:
+        headers["Content-Type"] = ctype
+    req = urllib.request.Request(base_url + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
     try:
-        with urllib.request.urlopen(req) as r: return r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e: return e.code, None
-html = urllib.request.urlopen(base_url + "/").read().decode()
-check("page served", "PorkChopCheck" in html and "api/state" in html)
+        with urllib.request.urlopen(req) as r:
+            raw, code, sc = r.read(), r.status, r.headers.get("Set-Cookie")
+    except urllib.error.HTTPError as e:
+        raw, code, sc = e.read(), e.code, e.headers.get("Set-Cookie")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = raw.decode(errors="replace")
+    return code, data, sc
+def post(path, body): return call(path, body)[:2]
+def jar(set_cookie): return set_cookie.split(";")[0] if set_cookie else ""
+html = call("/", cookie="")[1]
+check("page served without a login (it shows the login itself)", "PorkChopCheck" in html and 'id="gate"' in html)
 check("hidden tabs really hide", "[hidden] { display: none !important; }" in html and 'id="tab-tools" hidden' in html)
-state = json.loads(urllib.request.urlopen(base_url + "/api/state").read())
+check("state needs a login", call("/api/state", cookie="")[0] == 401)
+check("first visit asks for setup", call("/api/auth/me", cookie="")[1] == {"user": None, "setup": True})
+check("setup needs the router's admin password", call("/api/auth/setup", {"name": "kt", "password": "longpass1", "owner": "wrong"}, cookie="")[0] == 400)
+code, _, sc = call("/api/auth/setup", {"name": "kt", "password": "longpass1", "owner": "owner-pass"}, cookie="")
+COOKIE["v"] = jar(sc)
+check("setup makes the admin and logs in", code == 200 and "HttpOnly" in sc and "SameSite=Strict" in sc and call("/api/auth/me")[1]["user"] == {"name": "kt", "role": "admin"})
+check("setup only once", call("/api/auth/setup", {"name": "x", "password": "longpass1", "owner": "owner-pass"}, cookie="")[0] == 400)
+check("a form post from another site is refused", call("/api/screen", {"mode": "gl"}, ctype="text/plain")[0] == 415)
+state = call("/api/state")[1]
 check("state served", state["switch"]["port"] == "GigabitEthernet1/0/14" and state["screen"] == "pcc")
 check("switch the screen to GL.iNet", post("/api/screen", {"mode": "gl"}) == (200, {"screen": "gl"}) and svc.config["screen"] == "gl")
 check("a bad screen mode is refused", post("/api/screen", {"mode": "nope"})[0] == 400)
@@ -194,7 +219,73 @@ check("network mode shown on the page", state["netmode"]["mode"] == "router" and
 check("change the network mode from the page", post("/api/netmode", {"mode": "ap"})[0] == 200 and svc.netmode_set == "ap")
 check("a bad network mode is refused", post("/api/netmode", {"mode": "bridge"})[0] == 400)
 check("re-check", post("/api/recheck", {})[0] == 200 and svc.recheck.is_set() and svc.probed.wait(2))
+check("add a viewer", post("/api/users", {"action": "add", "name": "crew", "password": "crewpass1", "role": "viewer"})[0] == 200)
+admin_cookie = COOKIE["v"]
+check("wrong password refused", call("/api/auth/login", {"name": "crew", "password": "nope"}, cookie="")[0] == 400)
+code, _, sc = call("/api/auth/login", {"name": "crew", "password": "crewpass1"}, cookie="")
+COOKIE["v"] = jar(sc)
+check("viewer logs in", code == 200 and call("/api/auth/me")[1]["user"]["role"] == "viewer")
+check("viewer can look and re-check", call("/api/state")[0] == 200 and post("/api/recheck", {})[0] == 200)
+check("viewer can't change things", post("/api/screen", {"mode": "pcc"})[0] == 403 and post("/api/netmode", {"mode": "router"})[0] == 403 and call("/api/users")[0] == 403)
+check("log out", call("/api/auth/logout", {})[0] == 200 and call("/api/state")[0] == 401)
+COOKIE["v"] = admin_cookie
+check("last admin can't be made a viewer", post("/api/users", {"action": "role", "name": "kt", "role": "viewer"})[0] == 400)
 srv.shutdown()
+
+# ---------- HTTPS: the certificate, and http and https on one port ----------
+import ssl
+from pcc_router import tls as TL
+with tempfile.TemporaryDirectory() as d:
+    t = TL.TLS(d, lambda: ["10.2.1.235"])
+    t.ensure()
+    info = t.info()
+    check("certificate made on first start", t.ctx is not None and "10.2.1.235" in info["names"] and "192.168.8.1" in info["names"] and info["self_signed"])
+    late = {"a": []}
+    t3 = TL.TLS(os.path.join(d, "late"), lambda: late["a"])
+    t3.ensure()
+    late["a"] = ["10.2.1.77"]  # DHCP answered after the first start
+    t3.cover_addresses(wait=3, step=1, sleep=lambda s: None)
+    check("a first-start certificate is remade to name the address DHCP gave", "10.2.1.77" in t3.info()["names"] and not t3.fresh)
+    t2 = TL.TLS(d, lambda: ["10.9.9.9"])
+    t2.load()
+    check("an address it doesn't cover is pointed out", t2.info()["missing"] == ["10.9.9.9"])
+    try:
+        t.generate("not a name!"); check("bad names refused", False)
+    except ValueError:
+        check("bad names refused", True)
+    other = TL.TLS(os.path.join(d, "other"), lambda: [])
+    other.generate("elsewhere")
+    cert_a, key_b = t.cert.read_text(), other.key.read_text()
+    try:
+        t.upload(cert_a, key_b); check("a key that doesn't match is refused", False)
+    except ValueError as e:
+        check("a key that doesn't match is refused", "match" in str(e))
+    try:
+        t.upload("hello", key_b); check("not PEM refused", False)
+    except ValueError:
+        check("not PEM refused", True)
+    t.upload(other.cert.read_text(), key_b)
+    check("your own certificate and key installed", t.info()["cn"] == "elsewhere")
+    class TlsService(FakeService):
+        def __init__(self):
+            super().__init__(); self.tls = t
+    ts = TlsService()
+    tsrv = web.Server(("127.0.0.1", 0), web.make_handler(ts), t)
+    threading.Thread(target=tsrv.serve_forever, daemon=True).start()
+    port = tsrv.server_address[1]
+    import http.client
+    hc = http.client.HTTPConnection("127.0.0.1", port, timeout=5); hc.request("GET", "/api/state", headers={"Host": f"router.lan:{port}"})
+    r = hc.getresponse()
+    check("plain http is sent to https on the same port", r.status == 308 and r.getheader("Location") == f"https://router.lan:{port}/api/state")
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    hs = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=ctx); hs.request("GET", "/api/auth/me")
+    r = hs.getresponse()
+    check("https works on the same port", r.status == 200 and "setup" in json.loads(r.read()))
+    hs = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=ctx)
+    hs.request("POST", "/api/auth/login", body=json.dumps({"name": "kt", "password": "longpass1"}), headers={"Content-Type": "application/json"})
+    r = hs.getresponse()
+    check("login over https sets a Secure cookie", r.status == 200 and "Secure" in (r.getheader("Set-Cookie") or ""))
+    tsrv.shutdown()
 
 # ---------- the service keeps the screen choice ----------
 from pcc_router import service as S
@@ -313,23 +404,20 @@ with tempfile.TemporaryDirectory() as d:
             self.config.update(ping_target="gateway", tick_server="", iperf_server="", iperf_port=5201)
         def set_option(self, k, v): self.config[k] = v
     tsvc = ToolService()
-    tsrv = web.ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(tsvc))
+    tsrv = web.Server(("127.0.0.1", 0), web.make_handler(tsvc))
+    COOKIE["v"] = admin_cookie
     threading.Thread(target=tsrv.serve_forever, daemon=True).start()
     base_url = f"http://127.0.0.1:{tsrv.server_address[1]}"
-    tj = json.loads(urllib.request.urlopen(base_url + "/api/tools?span=300").read())
+    tj = call("/api/tools?span=300")[1]
     check("tools state served", tj["ping"]["span"] == 300 and tj["log"][0]["label"] == "Row C seat 7" and tj["options"]["ping_target"] == "gateway")
     check("ping target set", post("/api/ping", {"target": "dns"})[0] == 200 and tsvc.config["ping_target"] == "dns")
     check("tick test needs a server", post("/api/tick", {"server": ""})[0] == 400)
     check("port log save from the page", post("/api/log", {"label": "Stage left"})[1]["label"] == "Stage left")
-    check("csv download", "Stage left" in urllib.request.urlopen(base_url + "/ports.csv").read().decode())
+    check("csv download", "Stage left" in call("/ports.csv")[1])
     tsrv.shutdown()
 
 # ---------- Wi-Fi name and password ----------
 from pcc_router import wifi as WF
-class FakeCrypt:
-    @staticmethod
-    def crypt(pw, salt): return salt if pw == "right-pass" else "$1$x$nope"
-WF.crypt = FakeCrypt
 MLO = {"ifaces": [{"name": "mld0", "ssid": "GL-MLO", "key": "old-key-123", "hidden": False, "mlo_enable": True, "encryption": "sae-mixed", "mlo_band": ["2g", "5g"], "guest": False}]}
 CFG = [{"band": "2G", "device": "wifi0", "channel": "auto", "ifaces": [
           {"name": "wifi2g", "ssid": "GL-2G", "key": "k2-123456", "enabled": True, "hidden": True, "encryption": "psk2", "guest": False},
@@ -339,56 +427,40 @@ calls = []
 def fake_gl(module, func, params=None, timeout=10):
     calls.append((func, params))
     return {"get_mlo_config": MLO, "get_config": CFG}.get(func, {})
-with tempfile.TemporaryDirectory() as d:
-    shadow = os.path.join(d, "shadow"); open(shadow, "w").write("root:$1$salt$hash:19000:0:99999:7:::\n")
-    clock = {"t": 0.0}
-    w = WF.Wifi(call=fake_gl, shadow=shadow, clock=lambda: clock["t"], sleep=lambda s: None)
+if True:
+    w = WF.Wifi(call=fake_gl)
     nets = w.networks()
     check("own networks listed, MLO first, no guest or IoT", [n["id"] for n in nets] == ["mld0", "wifi2g"] and nets[1]["hidden"])
     check("passwords never listed", "key" not in json.dumps(nets) and "old-key" not in json.dumps(nets))
-    try:
-        w.change("mld0", "New Name", "", "wrong"); check("wrong admin password refused", False)
-    except PermissionError:
-        check("wrong admin password refused", True)
-    for bad in (("mld0", "", "", "right-pass"), ("mld0", "x" * 33, "", "right-pass"), ("mld0", "ok", "short", "right-pass"), ("nope", "ok", "", "right-pass")):
+    for bad in (("mld0", "", ""), ("mld0", "x" * 33, ""), ("mld0", "ok", "short"), ("nope", "ok", "")):
         try:
-            w.change(*bad); check(f"bad input refused {bad[:3]}", False)
+            w.change(*bad); check(f"bad input refused {bad}", False)
         except ValueError:
-            check(f"bad input refused {bad[:3]}", True)
-    w.change("mld0", "Event-WiFi", "", "right-pass")
-    for _ in range(50):
-        if w.state["state"] != "saving": break
-        time.sleep(0.02)
+            check(f"bad input refused {bad}", True)
+    def settle():
+        for _ in range(100):
+            if w.state["state"] != "saving": return
+            time.sleep(0.02)
+    w.change("mld0", "Event-WiFi", ""); settle()
     sent = [p for f, p in calls if f == "set_mlo_config"][-1]
     check("MLO rename keeps its password and bands", sent["ssid"] == "Event-WiFi" and sent["key"] == "old-key-123" and sent["mlo_band"] == ["2g", "5g"] and w.state["state"] == "done")
-    w.change("wifi2g", "Event-2G", "brand-new-pass", "right-pass")
-    for _ in range(50):
-        if w.state["state"] != "saving": break
-        time.sleep(0.02)
+    w.change("wifi2g", "Event-2G", "brand-new-pass"); settle()
     sent = [p for f, p in calls if f == "set_config"][-1]
     check("2.4 GHz change sends the new password", sent["iface_name"] == "wifi2g" and sent["key"] == "brand-new-pass" and sent["device"] == "wifi0" and sent["hidden"] is True)
-    for _ in range(5):
-        try: w.change("mld0", "x", "", "wrong")
-        except PermissionError: pass
-    try:
-        w.change("mld0", "x", "", "right-pass"); check("locked after five wrong passwords", False)
-    except PermissionError as e:
-        check("locked after five wrong passwords", "Too many" in str(e))
-    clock["t"] = 400
-    w.change("mld0", "After-Lock", "", "right-pass")
-    check("unlocked after five minutes", True)
-    # the phone page
+    # the phone page: admins only
     class WifiService(FakeService):
         def __init__(self):
-            super().__init__(); self.wifi = WF.Wifi(call=fake_gl, shadow=shadow, sleep=lambda s: None)
+            super().__init__(); self.wifi = WF.Wifi(call=fake_gl)
     wsvc = WifiService()
-    wsrv = web.ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(wsvc))
+    wsrv = web.Server(("127.0.0.1", 0), web.make_handler(wsvc))
     threading.Thread(target=wsrv.serve_forever, daemon=True).start()
     base_url = f"http://127.0.0.1:{wsrv.server_address[1]}"
-    wj = json.loads(urllib.request.urlopen(base_url + "/api/wifi").read())
+    COOKIE["v"] = admin_cookie
+    wj = call("/api/wifi")[1]
     check("Wi-Fi list served without passwords", wj["networks"][0]["ssid"] == "GL-MLO" and "old-key" not in json.dumps(wj))
-    check("Wi-Fi save needs the admin password", post("/api/wifi", {"id": "mld0", "ssid": "A", "admin": "wrong"})[0] == 403)
-    check("Wi-Fi save from the page", post("/api/wifi", {"id": "wifi2g", "ssid": "Page-2G", "admin": "right-pass"})[0] == 200)
+    check("Wi-Fi save from the page", post("/api/wifi", {"id": "wifi2g", "ssid": "Page-2G"})[0] == 200)
+    COOKIE["v"] = jar(call("/api/auth/login", {"name": "crew", "password": "crewpass1"}, cookie="")[2])
+    check("viewers can't change Wi-Fi", post("/api/wifi", {"id": "wifi2g", "ssid": "Nope"})[0] == 403)
     wsrv.shutdown()
 
 print(f"\n{ok} checks passed")
