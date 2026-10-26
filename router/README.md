@@ -70,6 +70,42 @@ mode to its new position.
 
 GL.iNet's firewall keeps port 8088 closed on the WAN side: only the router's Wi-Fi and LAN reach it.
 
+## The Deck: Probe Deck's tools on the router
+
+**https://192.168.8.1:8088/deck** (or the **Deck ▸** tab on the phone page) opens Probe Deck's own
+pages on the router: the same look, sidebar and screens. They're built from a Probe Deck checkout by
+`router/tools/build_deck.py`, and the backends in `router/pcc_router/deck/` are Probe Deck's, copied
+unchanged. `deckhost.py` gives them what they expect from a probe (the tester's address, link and
+switch port).
+
+| Page | What it does |
+|---|---|
+| Traceroute | mtr-style: every hop probed once a second, loss and latency per hop |
+| Host scan | every address on the tested network, makers (IEEE's list, downloaded once), names, open ports, smart devices |
+| mDNS | the services devices announce (printers, casts, consoles…) |
+| Multicast | groups on the wire, IGMP queriers, join a group to test |
+| LAN cache | is the event's game cache (Steam, Epic…) answering and being used |
+| Internet speed | Cloudflare download and upload with latency under load (the phone page has the LAN iperf3 test) |
+| Wake | Wake-on-LAN for saved machines, groups, staggered wake-all |
+| System stats | the router's CPU, temperature, memory, flash, interfaces, busiest processes |
+| Tailscale | Probe Deck's Tailscale page with the live map, the armed switch, settings, connections and Headscale |
+
+The tools start the first time someone opens the Deck. Host scan and LAN cache run only when asked
+(set "every" to scan on a timer). Settings live in `/etc/pcc-router/deck/`.
+
+**Tailscale here is PorkChopCheck's own:** the service `pcc-tailscale` runs the router's tailscaled
+with its own state (`/etc/pcc-router/tailscale`), socket and port (41642), in userspace networking.
+GL.iNet's own Tailscale only runs in Router mode (its helper stops it in Access point mode), so this
+one works in both. Leave GL.iNet's Tailscale off, or the router shows up on the tailnet twice. Turn it
+on, log in and change everything from the Deck's Tailscale page.
+
+## Send to GXL
+
+In the phone page's **Tools › Port log**, rows saved with the seat as the label (A1, B12, S1-3…) can
+be sent to a GXL Event Server with **Send to GXL**. It takes GXL's address and the event's agent key;
+the key is kept in `/etc/pcc-router/config.json` and never shown on the page. GXL updates those
+seats' switch and port and lists labels it doesn't have.
+
 ## Login and HTTPS
 
 The phone page is **https://192.168.8.1:8088**. In Access point mode it's at the address on the

@@ -25,7 +25,7 @@ import time
 
 import pc_net as N
 
-from . import auth, tls, tools, web, wifi
+from . import auth, deckhost, gxl, tls, tools, web, wifi
 from .screen import PAGES, Display, Touch
 from .tester import Tester
 
@@ -75,6 +75,8 @@ class Service:
         self.wifi = wifi.Wifi()
         self.auth = auth.Auth(folder)
         self.tls = tls.TLS(folder, self.addresses)
+        self.deck = deckhost.Deck(self, folder)
+        self.gxl = gxl.Gxl(self)
         self._resolved = {}
         self.netmode = {"mode": None, "switch": None, "switch_set": False, "state": None, "lan_ip": None}
         self.hold_hint = 0  # when a finger on the Mode page passed the first hold: "keep holding"
@@ -90,7 +92,8 @@ class Service:
     def save(self):
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
         tmp = self.config_path + ".tmp"
-        with open(tmp, "w") as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # holds the GXL agent key
+        with os.fdopen(fd, "w") as f:
             json.dump(self.config, f, indent=1)
         os.replace(tmp, self.config_path)
 
@@ -163,6 +166,7 @@ class Service:
                     self.tester.event(f"Now in {MODE_NAMES.get(self.netmode['mode'], self.netmode['mode'])} mode")
                     self.tester.wan = {}
                 self.recheck.set()
+                self.deck.on_mode_change()
             self.stop.wait(2)
 
     def set_netmode(self, want):

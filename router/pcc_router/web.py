@@ -13,10 +13,17 @@ POST /api/auth/login {"name", "password"}, /api/auth/setup {"name", "password", 
 Logged in:
 GET /api/state, /api/tools?span=30, /api/wifi, /api/tls, /cert.pem, /ports.csv
 POST /api/recheck, /api/auth/password {"current", "new"}   (viewers too)
+The Deck (Probe Deck's pages on the router, deckhost.py):
+GET /deck, /deck/web/<page>.js, /vendor/us-map.json   (the page checks the login itself)
+GET /api/deck/state, /api/x/<tool>[/<sub>[/<arg>]], /api/tailscale
+POST /api/x/<tool>/<action> (admins, or what that tool lets viewers do), /api/wol/<action>, /api/settings,
+     /api/tailscale (admins)
+
 Admins only:
 POST /api/screen {"mode": "pcc" | "gl"}, /api/netmode {"mode": "router" | "ap"},
      /api/wifi {"id", "ssid", "key", "hidden"} (any of them; left out = unchanged), /api/ping, /api/tick, /api/reflector, /api/speed, /api/blink, /api/log,
      /api/tls/generate {"names", "days"}, /api/tls/upload {"cert", "key"},
+GET /api/gxl; POST /api/gxl/settings {"url", "key"}, /api/gxl/send   (Send to GXL: the port log's labelled rows)
 GET /api/users; POST /api/users {"action": "add" | "role" | "password" | "delete", "name", "role", "password"}
 
 In Router mode GL.iNet's firewall keeps this port closed on the WAN side, so only the router's own
@@ -25,11 +32,14 @@ on WAN, which is why it has a login.
 """
 
 import json
+import re
 import socket
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+APP_RE = re.compile(r"/api/x/([a-z]+)(?:/([a-z_]+))?(?:/([^/]+))?$")
 
 OPEN_GET = ("/", "/index.html", "/api/auth/me")
 OPEN_POST = ("/api/auth/login", "/api/auth/setup", "/api/auth/logout")
@@ -95,6 +105,13 @@ def make_handler(service):
             url = urlparse(self.path)
             if url.path in ("/", "/index.html"):
                 return self._send(200, PAGE, "text/html; charset=utf-8")
+            deck = getattr(service, "deck", None)
+            if deck and (url.path in ("/deck", "/deck/") or url.path.startswith("/deck/web/") or url.path == "/vendor/us-map.json"):
+                rel = "index.html" if url.path in ("/deck", "/deck/") else url.path[len("/deck/"):] if url.path.startswith("/deck/") else url.path[1:]
+                data, kind = deck.file(rel)
+                if data is None:
+                    return self._json(404, {"error": "not found"})
+                return self._send(200, data, kind)
             user = self._user()
             if url.path == "/api/auth/me":
                 return self._json(200, {"user": user, "setup": service.auth.needs_setup()})
@@ -124,8 +141,25 @@ def make_handler(service):
                 if user["role"] != "admin":
                     return self._json(403, {"error": "Admins only"})
                 return self._json(200, {"users": service.auth.listing(), "me": user["name"]})
+            if url.path == "/api/gxl" and getattr(service, "gxl", None):
+                return self._json(200, service.gxl.state())
             if url.path == "/ports.csv":
                 return self._send(200, service.log.csv_text().encode(), "text/csv", [("Content-Disposition", 'attachment; filename="ports.csv"')])
+            if deck and url.path == "/api/deck/state":
+                return self._json(200, deck.state(user))
+            if deck and url.path == "/api/tailscale":
+                return self._json(200, deck.tailscale().snapshot(self.client_address[0]))
+            m = APP_RE.match(url.path)
+            if deck and m:
+                try:
+                    out = deck.app_get(m.group(1), m.group(2), m.group(3), {k: v[0] for k, v in parse_qs(url.query).items()}, user)
+                except LookupError:
+                    return self._json(404, {"error": "not found"})
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                if hasattr(out, "body"):  # a download (appbase.Reply)
+                    return self._send(out.code, out.body if isinstance(out.body, bytes) else str(out.body).encode(), out.ctype, out.headers)
+                return self._json(200, out)
             if url.path == "/api/state":
                 snap = service.screen_snap()
                 snap["screen"] = service.config["screen"]
@@ -155,7 +189,7 @@ def make_handler(service):
                 user = self._user()
                 if not user:
                     return self._json(401, {"error": "log in first", "login": True})
-                if self.path not in VIEWER_POST and user["role"] != "admin":
+                if self.path not in VIEWER_POST and user["role"] != "admin" and not self.path.startswith("/api/x/"):
                     return self._json(403, {"error": "Admins only: you're logged in as a viewer"})
                 return self._post(body, user)
             except PermissionError as e:
@@ -202,6 +236,31 @@ def make_handler(service):
             if self.path == "/api/tls/upload":
                 service.tls.upload(body.get("cert"), body.get("key"))
                 return self._json(200, service.tls.info() or {})
+            deck = getattr(service, "deck", None)
+            m = APP_RE.match(self.path)
+            if deck and m and m.group(2):
+                try:
+                    return self._json(200, deck.app_post(m.group(1), m.group(2), body, user) or {})
+                except LookupError:
+                    return self._json(404, {"error": "not found"})
+            if deck and self.path.startswith("/api/wol/"):
+                try:
+                    return self._json(200, deck.wol(self.path[len("/api/wol/"):], body) or {})
+                except LookupError:
+                    return self._json(404, {"error": "not found"})
+            if deck and self.path == "/api/settings":
+                return self._json(200, deck.settings(body))
+            if deck and self.path == "/api/tailscale":
+                ts = deck.tailscale()
+                if body.get("action") == "cert":
+                    service.tls.generate(ts.cert_names(service.tls))
+                else:
+                    ts.action(body)
+                return self._json(200, {"ok": True})
+            if self.path == "/api/gxl/settings":
+                return self._json(200, service.gxl.settings(body))
+            if self.path == "/api/gxl/send":
+                return self._json(200, service.gxl.send())
             if self.path == "/api/users":
                 au, act, name = service.auth, body.get("action"), str(body.get("name") or "")
                 if act == "add":
@@ -365,7 +424,7 @@ textarea { width:100%; min-height:90px; background:var(--well); color:var(--text
   <div class="seg admin-only" id="seg"><button data-m="gl">GL.iNet</button><button data-m="pcc">PorkChop</button></div>
   <span class="who"><span id="me"></span><span class="role" id="myrole"></span><a id="logout">Log out</a></span></span>
 </header>
-<nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button><button data-t="settings">Settings</button></nav>
+<nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button><button data-t="settings">Settings</button><button data-deck onclick="location.href='/deck'" title="Traceroute, host scan, mDNS, multicast, LAN cache, internet speed, Wake, system stats, Tailscale">Deck ▸</button></nav>
 <main id="tab-port">
   <div class="banner" id="banner">Loading…</div>
   <section><h2>Network mode</h2>
@@ -417,7 +476,12 @@ textarea { width:100%; min-height:90px; background:var(--well); color:var(--text
     <p class="sub">Bounces the WAN link (down 1.5 s, then up for 2 s once it is back: a flash every 6 to 7 s) so the switch port's LED blinks. Walk the switch and look for it. The router's own internet drops while it runs.</p></section>
   <section><h2>Port log</h2>
     <div class="line"><input id="lab" class="grow" placeholder="label, e.g. Row C seat 7"><button class="act" id="lgo">Save</button><a class="sub" href="/ports.csv">Download CSV</a></div>
-    <table id="log"></table></section>
+    <table id="log"></table>
+    <h2 style="margin-top:14px">Send to GXL</h2>
+    <div class="sub">Rows saved with the seat as the label (A1, B12, S1-3…) go to the GXL Event Server, which updates those seats' switch and port.</div>
+    <div class="line admin-only"><input id="gxurl" class="grow" placeholder="GXL address, e.g. http://10.2.1.143:8000" spellcheck="false"><input id="gxkey" type="password" style="width:160px" placeholder="agent key" autocomplete="off"><button class="key" id="gxsave">Save</button></div>
+    <div class="line"><button class="act admin-only" id="gxsend">Send to GXL</button><span class="sub" id="gxmsg"></span></div>
+  </section>
 </main>
 <main id="tab-settings" hidden>
   <section><h2>HTTPS certificate</h2>
@@ -665,11 +729,11 @@ const post = (url, body) => fetch(url, {method: 'POST', headers: {'Content-Type'
 document.querySelectorAll('#seg button').forEach(b => b.onclick = async () => { if (b.dataset.m !== screen) { await post('/api/screen', {mode: b.dataset.m}); load(); } });
 $('re').onclick = async () => { $('re').disabled = true; await post('/api/recheck'); setTimeout(() => { $('re').disabled = false; load(); }, 4500); };
 let tab = 'port', span = 30, tools = null, typing = false;
-document.querySelectorAll('nav.tabs button').forEach(b => b.onclick = () => {
+document.querySelectorAll('nav.tabs button[data-t]').forEach(b => b.onclick = () => {
   tab = b.dataset.t;
-  document.querySelectorAll('nav.tabs button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('nav.tabs button[data-t]').forEach(x => x.classList.toggle('on', x === b));
   $('tab-port').hidden = tab !== 'port'; $('tab-tools').hidden = tab !== 'tools'; $('tab-settings').hidden = tab !== 'settings';
-  if (tab === 'tools') loadTools();
+  if (tab === 'tools') { loadTools(); loadGxl(); }
   if (tab === 'settings') loadSettings();
 });
 document.querySelectorAll('#spans button').forEach(b => b.onclick = () => {
@@ -739,6 +803,25 @@ function renderTools(t) {
   $('binfo').textContent = b.running ? `blinking · ${b.cycles} flashes` : '';
   $('log').innerHTML = '<tr><th>When</th><th>Switch / port</th><th>VLAN</th><th>Label</th><th></th></tr>' + t.log.slice(0, 30).map(x => `<tr><td class="sub">${esc(x.time.slice(5, 16))}</td><td>${esc(x.switch.split('.')[0])} ${esc(x.port)}</td><td>${esc(x.vlan)}</td><td>${esc(x.label)}</td><td class="${x.verdict === 'good' ? 'good' : x.verdict === 'warn' ? 'warn' : 'bad'}">●</td></tr>`).join('');
 }
+async function loadGxl() {
+  const g = await (await fetch('/api/gxl')).json().catch(() => null);
+  if (!g) return;
+  if (document.activeElement !== $('gxurl')) $('gxurl').value = g.url || '';
+  $('gxkey').placeholder = g.key_set ? 'key saved (type to change)' : 'agent key';
+  if (g.sent && !$('gxmsg').dataset.busy) $('gxmsg').textContent = `Last sent ${new Date(g.sent.t * 1000).toLocaleTimeString()}: ${g.sent.updated} of ${g.sent.count} seats updated` + (g.sent.unknown.length ? `; GXL doesn't have ${g.sent.unknown.join(', ')}` : '');
+}
+$('gxsave').onclick = async () => {
+  const r = await post('/api/gxl/settings', {url: $('gxurl').value, key: $('gxkey').value}), j = await r.json().catch(() => ({}));
+  $('gxmsg').className = 'sub ' + (r.ok ? 'ok' : 'bad'); $('gxmsg').textContent = r.ok ? 'Saved.' : (j.error || 'Not saved');
+  if (r.ok) { $('gxkey').value = ''; loadGxl(); }
+};
+$('gxsend').onclick = async () => {
+  $('gxmsg').dataset.busy = 1; $('gxmsg').className = 'sub'; $('gxmsg').textContent = 'Sending…';
+  const r = await post('/api/gxl/send', {}), j = await r.json().catch(() => ({}));
+  delete $('gxmsg').dataset.busy;
+  $('gxmsg').className = 'sub ' + (r.ok ? 'ok' : 'bad');
+  $('gxmsg').textContent = r.ok ? `Sent ${j.count}: GXL updated ${j.updated}` + (j.unknown.length ? `; it doesn't have ${j.unknown.join(', ')}` : '') : (j.error || 'Not sent');
+};
 async function loadTools() {
   if (tab !== 'tools') return;
   try { renderTools(await (await fetch('/api/tools?span=' + span)).json()); } catch (e) {}

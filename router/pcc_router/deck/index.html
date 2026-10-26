@@ -1,0 +1,1845 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PorkChopCheck Deck</title>
+<!-- Built by router/tools/build_deck.py from Probe Deck 54f3e90: its styles, pages and scripts, on the router. -->
+<style>
+/* Look and feel copied from iPerf Deck (turkey415/Perf-Deck). */
+:root {
+  color-scheme: dark;
+  --bg: #111110; --panel: #1b1b1a; --panel-2: #222221; --raised: #2b2b29;
+  --line: rgba(255, 255, 255, .08); --line-2: rgba(255, 255, 255, .14);
+  --grid: #2c2c2a; --axis: #3d3d3a;
+  --text: #f0efec; --text-2: #c3c2b7; --muted: #898781; --accent: #3987e5;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+  --amber: #ffb000; --well: #141413; --led-off: #2a2a28;
+  --r: 10px;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+button, input { font: inherit; color: inherit; }
+code, .mono { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+
+header.top { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 15px; letter-spacing: .01em; }
+.top .spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--text-2); font-size: 12.5px; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; display: inline-block; }
+.dot.on { background: var(--good); } .dot.warn { background: var(--warn); } .dot.err { background: var(--crit); }
+.dot.live { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+
+.layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 18px; padding: 18px 20px 40px; max-width: 1640px; margin: 0 auto; }
+aside, main { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+@media (max-width: 960px) { .layout { grid-template-columns: minmax(0, 1fr); padding: 14px 16px 32px; } main { order: -1; } }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; min-width: 0; }
+.card h2 { margin: 0 0 12px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; display: flex; align-items: center; gap: 8px; }
+.card h2 .spacer { flex: 1; }
+.sub { color: var(--muted); font-size: 12.5px; }
+
+.btn { border: 1px solid var(--line-2); background: var(--raised); border-radius: 7px; padding: 7px 12px; cursor: pointer; font-weight: 550; font-size: 13px; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.btn:hover { background: #343431; }
+.btn.primary { background: var(--accent); border-color: transparent; color: #fff; }
+.btn.primary:hover { background: #4b93ea; }
+.btn.danger { background: var(--crit); border-color: transparent; color: #fff; }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); padding: 4px 8px; font-weight: 500; }
+.btn.ghost:hover { background: var(--raised); color: var(--text); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn:focus-visible, input:focus-visible, .seg label:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+input[type=text], input[type=number], input[type=password] { width: 100%; background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px; padding: 7px 9px; min-width: 0; }
+input::placeholder { color: #6b6a65; }
+label.f { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-2); min-width: 0; }
+label.chk { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; color: var(--text-2); cursor: pointer; }
+label.chk input { margin: 3px 0 0; accent-color: var(--accent); }
+label.chk small { display: block; color: var(--muted); font-size: 11.5px; }
+.row { display: flex; gap: 10px; align-items: flex-end; }
+.row > * { flex: 1; }
+.form { display: flex; flex-direction: column; gap: 12px; }
+.seg { display: flex; background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px; padding: 2px; }
+.seg label { flex: 1; text-align: center; padding: 5px 6px; border-radius: 5px; cursor: pointer; font-size: 12.5px; color: var(--text-2); }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--raised); color: var(--text); font-weight: 550; }
+.msg { font-size: 12.5px; color: var(--text-2); display: flex; gap: 7px; align-items: flex-start; }
+.msg::before { content: "!"; flex: none; width: 16px; height: 16px; border-radius: 50%; background: var(--crit); color: #fff; font-weight: 700; font-size: 11px; display: grid; place-items: center; margin-top: 1px; }
+.ok-msg { font-size: 12.5px; color: var(--good); }
+
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px 20px; margin: 0; }
+.kv div { min-width: 0; }
+.kv dt { color: var(--muted); font-size: 12px; }
+.kv dd { margin: 1px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+aside .kv { grid-template-columns: 1fr 1fr; }
+.kv.on-kv { grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px 14px; margin-top: 6px; }
+.kv.on-kv dd { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 13px; }
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 550; font-size: 12px; }
+th:first-child, td:first-child { text-align: left; }
+td.l, th.l { text-align: left; }
+.tablewrap { overflow-x: auto; }
+tr.grp td { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; padding-top: 12px; border-bottom: 0; }
+.bad { color: #ff7b7b; } .meh { color: var(--warn); }
+
+/* instrument deck */
+.deck { display: flex; flex-direction: column; gap: 14px; background: linear-gradient(180deg, #1e1e1d, #191918); }
+.deck h2 { margin-bottom: 0; }
+.k, .un, .lamp { font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; text-transform: uppercase; letter-spacing: .14em; font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+.lamp { display: inline-flex; align-items: center; gap: 7px; color: var(--text-2); }
+.well { position: relative; background: var(--well); border: 1px solid rgba(255, 255, 255, .06); border-radius: 10px; padding: 14px; min-width: 0; box-shadow: inset 0 1px 0 rgba(0, 0, 0, .6), inset 0 0 26px rgba(0, 0, 0, .45); display: flex; flex-direction: column; gap: 9px; }
+.well::before, .well::after { content: ""; position: absolute; width: 9px; height: 9px; border: 1px solid #4a4a46; pointer-events: none; }
+.well::before { top: 6px; left: 6px; border-right: 0; border-bottom: 0; }
+.well::after { bottom: 6px; right: 6px; border-left: 0; border-top: 0; }
+.wells { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+.wells .wide { grid-column: span 2; }
+@media (max-width: 560px) { .wells .wide { grid-column: auto; } }
+.seg7 { display: block; height: 30px; width: auto; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--c, var(--amber)) 55%, transparent)); }
+.seg7 .on { fill: var(--c, var(--amber)); }
+.seg7 .off { fill: rgba(255, 255, 255, .05); }
+.off .seg7 { filter: none; } .off .seg7 .on { fill: #55544f; }
+.big-port { font: 600 28px/1.1 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; color: var(--amber); text-shadow: 0 0 8px color-mix(in srgb, var(--amber) 45%, transparent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.off .big-port { color: #55544f; text-shadow: none; }
+#lk-dup, #lk-flap2 { white-space: normal; line-height: 1.6; }
+.wsub { color: var(--text-2); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.speeds { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+.speeds .seg7 { height: 36px; }
+
+.chart { position: relative; width: 100%; height: 190px; }
+.chart canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-2); margin-bottom: 10px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 3px; flex: none; display: inline-block; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 18px; }
+.banner { background: var(--panel-2); border: 1px solid var(--line-2); border-radius: var(--r); padding: 10px 14px; }
+.peers { display: flex; flex-wrap: wrap; gap: 6px; margin-top: -4px; }
+.peers button { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text-2); cursor: pointer; }
+.peers button:hover { color: var(--text); border-color: var(--accent); }
+/* stations (from iPerf Deck) */
+.stlist { display: flex; flex-direction: column; gap: 8px; }
+.strow { display: grid; grid-template-columns: 12px minmax(120px, 1.7fr) 64px minmax(40px, 1fr) 110px 74px auto; gap: 12px; align-items: center; padding: 9px 12px; background: var(--well); border: 1px solid rgba(255, 255, 255, .06); border-radius: 8px; }
+.strow .who { min-width: 0; }
+.strow .who b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.strow .who .k { display: block; overflow: hidden; text-overflow: ellipsis; letter-spacing: .06em; text-transform: none; }
+.strow .num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.strow .num small { display: block; color: var(--muted); font-size: 11px; }
+.bar { display: flex; gap: 3px; min-width: 0; }
+.bar i { flex: 1; height: 12px; border-radius: 2px; background: var(--led-off); }
+.bar i.on { background: var(--accent); box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 70%, transparent); }
+.dirs { display: flex; gap: 4px; }
+.dirs button { font: 600 9.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; padding: 7px 9px; cursor: pointer;
+  color: var(--text-2); background: linear-gradient(#232322, #191918); border: 1px solid #3a3a37; border-radius: 4px; }
+.dirs button:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.dirs button:disabled { color: #55544f; cursor: not-allowed; }
+.sled { width: 10px; height: 10px; border-radius: 50%; background: #3a3a37; }
+.sled.ready { background: #3ddc5a; box-shadow: 0 0 7px #3ddc5a; }
+.sled.busy { background: #fab219; box-shadow: 0 0 7px #fab219; }
+.sled.testing { background: #ff4d4d; box-shadow: 0 0 8px #ff4d4d; animation: pulse .5s steps(2, jump-none) infinite; }
+.sweepbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.sweepbar .sub { flex: 1; min-width: 200px; }
+.empty { color: var(--muted); font-size: 13px; padding: 4px 2px; }
+@media (max-width: 760px) { .strow { grid-template-columns: 12px minmax(0, 1fr) auto; } .strow .bar, .strow .ping, .strow .state { display: none; } .dirs { grid-column: 1 / -1; } .dirs button { flex: 1; } }
+@media (prefers-reduced-motion: reduce) { .dot.live, .sled.testing { animation: none; } }
+
+/* ---------- tabs ---------- */
+.tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--line-2); border-radius: 8px; padding: 2px; flex-wrap: wrap; }
+.tabs a { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 6px; color: var(--text-2); text-decoration: none;
+  font: 600 10.5px ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; letter-spacing: .14em; text-transform: uppercase; }
+.tabs a:hover { color: var(--text); }
+.tabs a.on { background: var(--raised); color: var(--text); box-shadow: inset 0 -2px 0 var(--amber); }
+.tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.badge { min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px; background: var(--crit); color: #fff; font-size: 10px; letter-spacing: 0; display: inline-grid; place-items: center; box-shadow: 0 0 8px color-mix(in srgb, var(--crit) 70%, transparent); }
+.layout.r { grid-template-columns: minmax(0, 1fr) 330px; }
+.layout.one { grid-template-columns: minmax(0, 1fr); }
+/* System stats page */
+.st-bar { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--led-off); margin: 4px 0 12px; }
+.st-bar i { display: block; height: 100%; }
+.st-key { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-2); margin-bottom: 12px; }
+.st-key span { display: inline-flex; align-items: center; gap: 6px; }
+#v-stats .gx .gauge { grid-template-columns: 64px 1fr 110px; }
+#v-stats .gx .gauge + .gauge { margin-top: 8px; }
+#v-stats .gx .gauge .k { color: var(--text-2); font: 600 11px var(--mono); }
+#v-stats .note { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
+#v-stats h3 { margin: 16px 0 8px; font-size: 11.5px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+.btn.sm { padding: 4px 10px; font-size: 12px; text-transform: none; letter-spacing: 0; flex: none; }
+
+@media (max-width: 960px) { .layout.r { grid-template-columns: minmax(0, 1fr); } }
+select, textarea { font: inherit; color: inherit; width: 100%; background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px; padding: 7px 9px; min-width: 0; }
+textarea { font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; font-size: 12.5px; resize: vertical; }
+select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.key { font: 600 9.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; padding: 7px 10px; cursor: pointer; white-space: nowrap;
+  color: var(--text-2); background: linear-gradient(#232322, #191918); border: 1px solid #3a3a37; border-radius: 4px; }
+.key:hover:not(:disabled) { color: var(--text); border-color: var(--amber); }
+.key:disabled { color: #55544f; cursor: not-allowed; }
+.key.hot { color: #ffd6d6; border-color: #7a2b2b; background: linear-gradient(#3a1d1d, #251414); }
+.key.hot:hover:not(:disabled) { border-color: #ff4d4d; color: #fff; }
+.key.sel { color: var(--text); border-color: var(--amber); box-shadow: 0 0 6px color-mix(in srgb, var(--amber) 40%, transparent); }
+.keys { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: inline-block; font: 600 9.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px; border: 1px solid var(--line-2); color: var(--text-2); }
+.chip.ok { color: #7fe08f; border-color: #2f5f37; } .chip.bad { color: #ff9b9b; border-color: #7a2b2b; background: #2a1515; } .chip.warn { color: var(--warn); border-color: #6a5320; }
+.lamp.alarm { color: #ff9b9b; } .lamp.clear { color: #7fe08f; }
+.well.alarm { border-color: rgba(255, 77, 77, .45); box-shadow: inset 0 0 26px rgba(255, 40, 40, .12), 0 0 12px rgba(255, 60, 60, .15); }
+.well.alarm .seg7 { --c: #ff5a4d; }
+.evlist { display: flex; flex-direction: column; gap: 2px; max-height: 420px; overflow: auto; }
+.ev { display: grid; grid-template-columns: 76px 12px minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 6px 4px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.ev .k { letter-spacing: .06em; }
+.ev .dot { transform: translateY(1px); }
+.note { font-size: 12.5px; color: var(--text-2); background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--warn); border-radius: 7px; padding: 9px 12px; }
+.note.crit { border-left-color: var(--crit); }
+.note a { color: #8fb8ff; }
+a.btn { text-decoration: none; color: var(--text); text-transform: none; letter-spacing: 0; font-size: 13px; }
+
+/* ---------- console screen ---------- */
+.screen { --ph: #33ff66; position: relative; background: #0b0b0a; border-radius: 12px; padding: 12px 8px 12px 14px;
+  border: 1px solid rgba(255, 255, 255, .07); box-shadow: inset 0 0 50px rgba(0, 0, 0, .85), 0 0 0 4px #161615, 0 0 0 5px #2e2e2b; }
+.screen.amber { --ph: #ffb000; } .screen.white { --ph: #e9e7dd; }
+.screen::after { content: ""; position: absolute; inset: 0; border-radius: 12px; pointer-events: none; z-index: 2;
+  background: repeating-linear-gradient(0deg, rgba(0, 0, 0, .22) 0 1px, transparent 1px 3px), radial-gradient(ellipse at center, transparent 60%, rgba(0, 0, 0, .35)); }
+.screen:fullscreen { border-radius: 0; padding: 16px; }
+.screen:fullscreen .term { height: calc(100vh - 32px); }
+.term { height: max(380px, calc(100vh - 250px)); }
+.term .xterm-rows { text-shadow: 0 0 5px color-mix(in srgb, var(--ph) 55%, transparent); }
+.term .xterm-viewport { background: transparent !important; }
+.term .xterm-viewport::-webkit-scrollbar { width: 8px; } .term .xterm-viewport::-webkit-scrollbar-thumb { background: #2e2e2b; border-radius: 4px; }
+.lock { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; background: rgba(11, 11, 10, .93); border-radius: 12px; padding: 20px; }
+.lock form { display: flex; flex-direction: column; gap: 10px; width: min(320px, 100%); text-align: center; }
+.lock .big-port { font-size: 22px; letter-spacing: .12em; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.toolbar .spacer { flex: 1; }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: var(--r); padding: 18px; width: min(680px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0, 0, 0, .6); }
+dialog h3 { margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+.mrow { display: grid; grid-template-columns: 22px 12px minmax(110px, 1.4fr) minmax(60px, .6fr) 130px minmax(110px, 1fr) 70px auto; gap: 10px; align-items: center;
+  padding: 8px 12px; background: var(--well); border: 1px solid rgba(255, 255, 255, .06); border-radius: 8px; }
+.mrow b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+.mrow .k { overflow: hidden; text-overflow: ellipsis; letter-spacing: .06em; text-transform: none; }
+.mrow .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mrow .num small, .mrow .who small { display: block; color: var(--muted); font-size: 11px; }
+.mrow input[type=checkbox] { accent-color: var(--amber); width: 15px; height: 15px; margin: 0; }
+.sled.waking { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse .8s ease-in-out infinite; }
+.ro .mrow { grid-template-columns: 12px minmax(110px, 1.4fr) minmax(60px, .6fr) 130px minmax(110px, 1fr) 70px auto; }
+@media (max-width: 760px) { .mrow { grid-template-columns: 22px 12px minmax(0, 1fr) auto; } .mrow .grp, .mrow .macc, .mrow .ipc, .mrow .ping { display: none; } }
+@media (prefers-reduced-motion: reduce) { .sled.waking { animation: none; } }
+
+/* ---------- sidebar: rack modules ---------- */
+.shell { display: grid; grid-template-columns: 262px minmax(0, 1fr); align-items: start; }
+.content { min-width: 0; }
+.side { position: sticky; top: var(--hdr, 57px); height: calc(100vh - var(--hdr, 57px)); overflow-y: auto; scrollbar-width: thin; scrollbar-gutter: stable; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 10px; padding: 14px 12px 18px; background: linear-gradient(180deg, #1e1e1d, #171716); border-right: 1px solid var(--line); }
+.side .dot { width: 7px; height: 7px; background: var(--led-off); }
+.side .dot.on { background: var(--good); box-shadow: 0 0 6px var(--good); }
+.side .dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.side .dot.err { background: var(--crit); box-shadow: 0 0 6px var(--crit); }
+.jack { flex: none; gap: 5px; padding: 12px 14px; text-decoration: none; color: inherit; }
+.jack:hover { border-color: rgba(255, 176, 0, .3); }
+.jack .big-port { font-size: 26px; }
+.jack .lamps { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 2px; }
+.jack .lamp { font-size: 10px; letter-spacing: .12em; gap: 6px; }
+.jack .k.pd { letter-spacing: .06em; text-transform: none; font-size: 11px; }
+.mod { flex: none; background: var(--panel); border: 1px solid rgba(255, 255, 255, .07); border-radius: 9px; overflow: hidden; }
+.mod > button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 38px; padding: 8px 12px; border: 0; background: transparent; color: var(--text-2); cursor: pointer; text-align: left; }
+.mod > button:hover { color: var(--text); }
+.mod > button svg { flex: none; }
+.mod .mn { flex: 1; font: 600 11px ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; letter-spacing: .14em; text-transform: uppercase; }
+.mod .chev { width: 12px; text-align: center; color: var(--muted); font-size: 11px; transition: transform .15s; }
+.mod.closed .chev { transform: rotate(-90deg); }
+.mod.closed .items { display: none; }
+.mod.has-on > button { color: var(--amber); }
+.mod.closed.has-on > button { background: var(--raised); }
+.items { display: flex; flex-direction: column; gap: 2px; padding: 2px 6px 8px; }
+.items a { display: flex; align-items: center; gap: 10px; min-height: 32px; padding: 5px 10px; border: 1px solid transparent; border-radius: 6px; color: var(--text-2); text-decoration: none; font-size: 13px; }
+.items a:hover { color: var(--text); background: rgba(255, 255, 255, .03); }
+.items a.on { color: var(--amber); background: var(--well); border-color: rgba(255, 176, 0, .35); box-shadow: inset 0 0 14px rgba(0, 0, 0, .5); }
+.items a.alert .dot { background: var(--crit); box-shadow: 0 0 6px var(--crit); }
+.items .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.items .badge { font: 700 12px ui-monospace, Menlo, Consolas, monospace; color: #ff7b7b; background: none; box-shadow: none; min-width: 0; height: auto; padding: 0; }
+.items a:focus-visible, .mod > button:focus-visible, .jack:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.side .ver { margin-top: auto; padding: 4px 4px 0; }
+.navbtn, .scrim { display: none; }
+@media (max-width: 960px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .navbtn { display: inline-flex; padding: 6px; }
+  .side { position: fixed; top: 0; left: 0; bottom: 0; height: auto; width: min(290px, 86vw); z-index: 20; transform: translateX(-105%); transition: transform .2s; box-shadow: 8px 0 30px rgba(0, 0, 0, .5); }
+  body.navopen .side { transform: none; }
+  body.navopen .scrim { display: block; position: fixed; inset: 0; background: rgba(0, 0, 0, .5); z-index: 19; }
+}
+@media (prefers-reduced-motion: reduce) { .side, .mod .chev { transition: none; } }
+/* ---------- wireless controller AP list ---------- */
+.aplist { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
+.aplist div { background: var(--well); border: 1px solid rgba(255, 255, 255, .06); border-radius: 6px; padding: 6px 10px; display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; }
+.aplist b { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ---------- trace ---------- */
+.tracebar { display: flex; gap: 10px; }
+.tracebar input { font: 600 17px ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; padding: 11px 14px; letter-spacing: .04em; }
+.tracebar .btn { padding: 0 22px; font-size: 14px; }
+.tlog { font: 12.5px/1.6 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; color: #9ff0ae; background: #0b0b0a; border-radius: 8px; padding: 10px 14px;
+  max-height: 220px; overflow: auto; text-shadow: 0 0 5px rgba(61, 255, 122, .35); border: 1px solid rgba(255, 255, 255, .06); }
+.tlog .t { color: #3f7a4c; margin-right: 10px; }
+.tlog .err { color: #ff9b9b; text-shadow: 0 0 5px rgba(255, 90, 77, .4); }
+.path { display: flex; align-items: stretch; flex-wrap: wrap; gap: 0; row-gap: 14px; }
+.node { position: relative; background: var(--well); border: 1px solid rgba(255, 255, 255, .08); border-radius: 10px; padding: 12px 14px; min-width: 150px; max-width: 240px;
+  display: flex; flex-direction: column; gap: 3px; box-shadow: inset 0 0 22px rgba(0, 0, 0, .45); }
+.node::before, .node::after { content: ""; position: absolute; width: 8px; height: 8px; border: 1px solid #4a4a46; }
+.node::before { top: 5px; left: 5px; border-right: 0; border-bottom: 0; } .node::after { bottom: 5px; right: 5px; border-left: 0; border-top: 0; }
+.node b { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node .k { letter-spacing: .08em; }
+.node.probe { border-color: rgba(255, 176, 0, .45); } .node.probe .nk { color: var(--amber); }
+.node.swn .nk { color: #c9a6ff; } .node.swn { border-color: rgba(176, 124, 255, .35); }
+.node.ap .nk { color: #7fd6ff; } .node.ap { border-color: rgba(63, 195, 255, .4); }
+.node.host { border-color: rgba(61, 255, 122, .55); box-shadow: inset 0 0 22px rgba(0, 0, 0, .45), 0 0 14px rgba(61, 255, 122, .2); } .node.host .nk { color: #3dff7a; }
+.nk { font: 600 10px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .14em; text-transform: uppercase; }
+.link { flex: 1; min-width: 64px; max-width: 150px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 2px; padding: 0 4px; }
+.link .wire { width: 100%; height: 2px; background: var(--amber); box-shadow: 0 0 8px var(--amber); position: relative; }
+.link .wire::after { content: ""; position: absolute; right: -2px; top: -4px; border: 5px solid transparent; border-left-color: var(--amber); border-right: 0; }
+.link.air .wire { background: repeating-linear-gradient(90deg, #3fc3ff 0 6px, transparent 6px 11px); box-shadow: none; animation: air 1s linear infinite; background-size: 22px 2px; }
+.link.air .wire::after { border-left-color: #3fc3ff; }
+@keyframes air { to { background-position: 22px 0; } }
+.link .pl { font: 600 10.5px ui-monospace, Menlo, Consolas, monospace; color: var(--text-2); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; min-height: 13px; }
+@media (max-width: 760px) { .path { flex-direction: column; } .node { max-width: none; } .link { min-height: 46px; max-width: none; flex-direction: row; gap: 10px; }
+  .link .wire { width: 2px; height: 34px; } .link .wire::after { right: -4px; top: auto; bottom: -2px; border: 5px solid transparent; border-top-color: var(--amber); border-bottom: 0; }
+  .link.air .wire::after { border-top-color: #3fc3ff; } }
+.recent { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.recent button { font: 12px ui-monospace, Menlo, Consolas, monospace; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text-2); cursor: pointer; }
+.recent button:hover { color: var(--text); border-color: var(--amber); }
+.sigbars { display: inline-flex; gap: 2px; align-items: flex-end; height: 12px; margin-left: 6px; vertical-align: -1px; }
+.sigbars i { width: 3px; background: #34342f; } .sigbars i.on { background: #3fc3ff; box-shadow: 0 0 4px #3fc3ff; }
+@media (prefers-reduced-motion: reduce) { .link.air .wire { animation: none; } }
+
+/* ================= GXL-LANapp switches look (ported from GXL shared/deck.css, scoped to .gx) ================= */
+.gx { --good: #3ddc5a; --crit: #ff4d4d; --warn: #fab219; --led-off: #2a2a28; --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+.gx .k.bright { color: var(--text-2); }
+.gx .spacer { flex: 1; }
+.gx .cbadge { font: 650 10px var(--mono); letter-spacing: .1em; padding: 2px 8px; border-radius: 999px; background: var(--raised); color: var(--text-2); }
+.gx .key { font: 600 9.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; padding: 7px 9px; cursor: pointer; color: var(--text-2);
+  background: linear-gradient(#2a2a28, #1d1d1c); border: 1px solid #45453f; border-radius: 4px; box-shadow: 0 1px 0 rgba(0, 0, 0, .6); }
+.gx .key:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.gx .key.act { border-color: var(--amber); color: var(--text); box-shadow: 0 0 8px color-mix(in srgb, var(--amber) 35%, transparent); }
+.gx .key:disabled { color: #55544f; cursor: not-allowed; }
+.gx .sled.live { background: var(--crit); box-shadow: 0 0 8px var(--crit); animation: pulse .9s steps(2, jump-none) infinite; }
+.gx .sled.ready { background: var(--good); box-shadow: 0 0 7px var(--good); }
+.gx .sled.busy { background: var(--warn); box-shadow: 0 0 7px var(--warn); }
+.gx .sled.info { background: #5aa9ff; box-shadow: 0 0 7px #5aa9ff; }
+.gx .leds { flex: 1; display: flex; gap: 3px; min-width: 0; }
+.gx .leds i { flex: 1; height: 20px; border-radius: 2px; background: var(--led-off); transition: background .25s, box-shadow .25s; }
+.gx .leds i.on { background: var(--c, var(--accent)); box-shadow: 0 0 7px color-mix(in srgb, var(--c, var(--accent)) 70%, transparent); }
+.gx .leds.thin i { height: 12px; }
+.gx .seg7 { display: block; height: 30px; width: auto; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--c, var(--amber)) 55%, transparent)); }
+.gx .seg7 .on { fill: var(--c, var(--amber)); } .gx .seg7 .off { fill: rgba(255, 255, 255, .05); }
+.gx .off .seg7 { filter: none; } .gx .off .seg7 .on { fill: #55544f; }
+.gx .ports { display: flex; flex-wrap: wrap; gap: 4px; }
+.gx .pt { --tc: #33332f; width: 30px; padding: 4px 0 3px; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  background: #131312; border: 1px solid #2f2f2d; border-radius: 4px; cursor: default; height: auto; color: inherit; font: inherit; }
+.gx .pt i { width: 14px; height: 5px; border-radius: 2px; background: var(--tc); }
+.gx .pt span { font: 600 8.5px var(--mono); color: var(--muted); }
+.gx .pt.ok { --tc: var(--good); } .gx .pt.warn { --tc: var(--warn); } .gx .pt.crit { --tc: var(--crit); }
+.gx .pt.ok i, .gx .pt.warn i, .gx .pt.crit i { box-shadow: 0 0 7px var(--tc); }
+.gx .pt.ok span, .gx .pt.warn span, .gx .pt.crit span { color: var(--text-2); }
+.gx .pt.crit i { animation: pulse .7s steps(2, jump-none) infinite; }
+.gx .pt.uplink { border-color: #ff8a3d; box-shadow: inset 0 0 0 1px #ff8a3d; } .gx .pt.uplink span { color: #ff8a3d; }
+.gx .pt.uplink.known { border-color: #b07cff; box-shadow: inset 0 0 0 1px #b07cff; } .gx .pt.uplink.known span { color: #c9a6ff; }
+.gx .pt.me { outline: 2px solid var(--amber); outline-offset: 1px; }
+.gx .pt.click { cursor: pointer; } .gx .pt.click:hover { border-color: var(--accent); }
+.gx .envline { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
+.gx .chip { font: 600 10px var(--mono); letter-spacing: .06em; padding: 3px 7px; border-radius: 4px; background: #131312; border: 1px solid #2f2f2d; color: var(--text-2); white-space: nowrap; text-transform: none; }
+.gx .chip.ok { color: var(--good); border-color: color-mix(in srgb, var(--good) 35%, #2f2f2d); background: #131312; }
+.gx .chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, #2f2f2d); }
+.gx .chip.crit { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 60%, #2f2f2d); animation: pulse 1.4s ease-in-out infinite; }
+.gx .grip { cursor: grab; color: #6b6a65; font: 14px/1 var(--mono); padding: 0 4px; user-select: none; }
+.gx .grip:hover { color: var(--text-2); }
+.gx .dragging { opacity: .45; } .gx .droptarget { outline: 2px dashed var(--accent); outline-offset: 2px; }
+.gx .swhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 9px; }
+.gx .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 16px; margin: 0; }
+.gx .kv dt { color: var(--muted); font-size: 11.5px; } .gx .kv dd { margin: 1px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gx .issues { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.gx .issues li { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; color: var(--text-2); }
+.gx .srow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.gx .swgrid { display: flex; flex-direction: column; gap: 14px; }
+.gx .swbody { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 18px; align-items: start; }
+.gx .swmain { min-width: 0; }
+@media (max-width: 760px) { .gx .swbody { grid-template-columns: minmax(0, 1fr); } }
+.gx .swcard { transition: border-color .2s; }
+.gx .swcard.warn { border-color: color-mix(in srgb, var(--warn) 45%, #2f2f2d); } .gx .swcard.crit { border-color: color-mix(in srgb, var(--crit) 55%, #2f2f2d); }
+.gx .swname { cursor: pointer; } .gx .swname:hover { color: var(--accent); }
+.gx .gauges { display: grid; gap: 5px; }
+.gx .gauge { display: grid; grid-template-columns: 38px 1fr 52px; gap: 8px; align-items: center; }
+.gx .gauge .gv { font: 600 11px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.gx .swnums { display: grid; grid-template-columns: auto auto; justify-content: start; gap: 8px 18px; margin: 10px 0 8px; }
+.gx .swnums > div:first-child { grid-column: 1 / -1; } .gx .swnums > div { display: flex; align-items: center; gap: 6px; }
+.gx .faceplate { display: flex; flex-wrap: wrap; gap: 18px; padding: 14px; background: linear-gradient(#1c1c1a, #151514); border: 1px solid #34342f; border-radius: 8px; margin-bottom: 10px; overflow-x: auto; }
+.gx .fgroup { display: flex; flex-direction: column; gap: 5px; } .gx .frow { display: flex; gap: 5px; }
+.gx .pt.big { width: 50px; padding: 5px 0 0; gap: 3px; position: relative; overflow: hidden; cursor: pointer; }
+.gx .pt.big i { width: 26px; height: 6px; }
+.gx .pt.big .pn { font: 700 11px var(--mono); color: var(--text-2); }
+.gx .pt.big .ps { font: 600 8.5px var(--mono); color: var(--muted); min-height: 10px; }
+.gx .pt.big .ps.seat { color: var(--amber); padding-bottom: 5px; }
+.gx .pt.big .load { align-self: flex-start; height: 3px; background: #5aa9ff; box-shadow: 0 0 5px #5aa9ff; }
+.gx .pt.big:hover { border-color: #55544f; } .gx .pt.big.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, #131312); }
+.gx .envtable { display: grid; gap: 6px; margin: 10px 0 0; }
+.gx .envtable div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px dashed #2a2a27; padding-bottom: 4px; }
+.gx .envtable dt { color: var(--muted); font-size: 12px; } .gx .envtable dd { margin: 0; font: 600 12px var(--mono); text-align: right; }
+.gx .dtag { display: inline-block; font: 700 10px var(--mono); letter-spacing: .14em; color: #fff; background: var(--crit); padding: 2px 6px; border-radius: 3px; margin-right: 8px;
+  box-shadow: 0 0 9px color-mix(in srgb, var(--crit) 60%, transparent); animation: pulse 1.4s ease-in-out infinite; }
+.gx .downnote { border: 1px solid color-mix(in srgb, var(--crit) 55%, #2f2f2d); background: color-mix(in srgb, var(--crit) 8%, #131312); border-radius: 6px; padding: 9px 11px; margin-bottom: 10px; display: grid; gap: 5px; }
+.gx .downnote .dhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; } .gx .downnote .dhead b { color: var(--crit); }
+.gx .downnote .dwhy { font-size: 13px; color: var(--text); }
+.gx .ports.stale, .gx .faceplate.stale { opacity: .4; filter: grayscale(1); }
+.gx .vus { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); gap: 12px; }
+.gx .vus.hall { grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); }
+.gx .vu .face { position: relative; border-radius: 8px; border: 1px solid #343432; overflow: hidden;
+  background: radial-gradient(120% 95% at 50% 108%, color-mix(in srgb, var(--c) 30%, transparent), transparent 72%), linear-gradient(#181817, #0d0d0c);
+  box-shadow: inset 0 0 20px rgba(0, 0, 0, .75); }
+.gx .vu .face::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(115deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, 0) 36%); }
+.gx .vu svg.vf { display: block; width: 100%; height: auto; }
+.gx .vu .arc { fill: none; stroke: #77766f; stroke-width: 1.3; } .gx .vu .band { fill: none; stroke-width: 3.5; }
+.gx .vu .band.warn { stroke: var(--warn); filter: drop-shadow(0 0 3px var(--warn)); } .gx .vu .band.crit { stroke: var(--crit); filter: drop-shadow(0 0 3px var(--crit)); }
+.gx .vu .tk { stroke: #77766f; stroke-width: 1.1; } .gx .vu .tk.maj { stroke: var(--text-2); stroke-width: 1.7; }
+.gx .vu .vl { fill: var(--text-2); font: 10.5px var(--mono); } .gx .vu .vn { fill: var(--muted); font: 8.5px var(--mono); letter-spacing: .16em; }
+.gx .vu .ndl, .gx .vu .pkd { transform-origin: 100px 118px; transition: transform .95s cubic-bezier(.3, 1.5, .5, 1), opacity .3s; }
+.gx .vu .ndl line { stroke: color-mix(in srgb, var(--c) 62%, #fff); stroke-width: 2; stroke-linecap: round; filter: drop-shadow(0 0 3px var(--c)); }
+.gx .vu .pkd circle { fill: var(--text); } .gx .vu .hub { fill: #262624; stroke: #45453f; }
+.gx .vu .foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 9px; min-height: 22px; }
+.gx .vu .foot .k { color: var(--text-2); } .gx .vu .seg7 { height: 21px; }
+.gx .vu.off .face { background: linear-gradient(#151514, #0d0d0c); } .gx .vu.off .band { stroke: #3a3a37; filter: none; }
+.gx .vu.off .ndl line { stroke: #6b6a65; filter: none; } .gx .vu.off .pkd { opacity: 0; }
+.gx .vu .underfoot { margin-top: 7px; }
+.gx .scope { position: relative; border-radius: 5px; overflow: hidden; background: radial-gradient(120% 140% at 50% 50%, #0b1a10, #040705 75%);
+  border: 1px solid #1f2b22; box-shadow: inset 0 0 18px rgba(0, 0, 0, .9); }
+.gx .scope svg { display: block; width: 100%; height: 100%; }
+.gx .scope::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0, 0, 0, .28) 0 1px, transparent 1px 3px); }
+.gx .scope .gr { stroke: #1d3a25; stroke-width: 1; vector-effect: non-scaling-stroke; stroke-dasharray: 2 3; }
+.gx .scope .trace { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; stroke-linejoin: round; filter: drop-shadow(0 0 3px currentColor); }
+.gx .scope .area { opacity: .18; }
+.gx .scope .scale { position: absolute; top: 4px; left: 7px; font: 600 9px var(--mono); color: #5bbf78; letter-spacing: .1em; text-shadow: 0 0 4px #2f7a45; }
+.gx .scope .wait { position: absolute; inset: 0; display: grid; place-items: center; font: 600 10px var(--mono); letter-spacing: .3em; color: #4fae6b; text-shadow: 0 0 6px #2f7a45; animation: pulse 1.6s ease-in-out infinite; }
+.gx .bwmon, .gx .netstats { border: 1px solid #2a3a2e; border-radius: 10px; padding: 12px 14px 10px; margin-bottom: 16px; background: linear-gradient(#0e1410, #0a0d0b); }
+.gx .bwmon { box-shadow: inset 0 0 0 1px rgba(80, 255, 140, .04), 0 0 24px rgba(40, 200, 100, .05); }
+.gx .bwhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; font: 600 10px var(--mono); letter-spacing: .18em; }
+.gx .bwtitle { font: 700 14px var(--mono); letter-spacing: .32em; color: #7dffa0; text-shadow: 0 0 8px rgba(80, 255, 140, .55), 0 0 2px #7dffa0; }
+.gx .bwsub { color: #4f8a60; }
+.gx .rec { display: inline-flex; align-items: center; gap: 6px; color: #ff5d5d; }
+.gx .rec i { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 8px #ff4d4d; animation: pulse 1.2s ease-in-out infinite; }
+.gx .bwbody { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 14px; align-items: stretch; }
+@media (max-width: 760px) { .gx .bwbody { grid-template-columns: minmax(0, 1fr); } }
+.gx .bwread { display: flex; flex-direction: column; justify-content: space-between; gap: 8px; }
+.gx .bwread > div { display: grid; grid-template-columns: 58px 1fr auto; align-items: center; gap: 8px; }
+.gx .bwread .lbl { font: 700 10px var(--mono); letter-spacing: .14em; color: #9a998f; } .gx .bwread .u { font: 600 9px var(--mono); color: #6b6a65; letter-spacing: .12em; }
+.gx .bwch { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 6px 14px; margin-top: 12px; }
+.gx .bwch .ch { display: grid; grid-template-columns: 110px minmax(0, 1fr) 64px 64px; gap: 8px; align-items: center; }
+.gx .bwch .chname { font: 600 10px var(--mono); color: #8fd6a2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .04em; }
+.gx .bwch .chv { font: 600 11px var(--mono); text-align: right; font-variant-numeric: tabular-nums; text-shadow: 0 0 5px currentColor; }
+.gx .bwfoot { margin-top: 9px; font: 10px var(--mono); color: #4f6a55; letter-spacing: .04em; }
+.gx .netstats .counters { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+.gx .netstats .ctr { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; border: 1px solid #1f2b22; border-radius: 6px; background: #070a08; }
+.gx .netstats .ctr span { font: 600 9px var(--mono); letter-spacing: .14em; color: #4f8a60; }
+.gx .vfd { position: relative; border-radius: 8px; padding: 10px 12px 12px; background: radial-gradient(140% 120% at 50% 0%, #06201b, #020a08 70%);
+  border: 1px solid #12392f; box-shadow: inset 0 0 22px rgba(0, 0, 0, .85); color: #48ffd2; font: 600 11px var(--mono); letter-spacing: .06em;
+  text-shadow: 0 0 6px rgba(72, 255, 210, .55), 0 0 1px #48ffd2; overflow-x: auto; }
+.gx .vfd::after { content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: 8px;
+  background: repeating-linear-gradient(90deg, rgba(0, 0, 0, .22) 0 1px, transparent 1px 3px), repeating-linear-gradient(0deg, rgba(0, 0, 0, .18) 0 1px, transparent 1px 3px); }
+.gx .vfdhead { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; font-size: 10px; letter-spacing: .24em; color: #2fd8ae; }
+.gx .vfd .cur { display: inline-block; width: 7px; height: 11px; margin-left: 6px; vertical-align: -1px; background: #48ffd2; box-shadow: 0 0 6px #48ffd2; animation: pulse 1s steps(2, jump-none) infinite; }
+.gx .vfd table { width: 100%; border-collapse: collapse; white-space: nowrap; font-size: inherit; }
+.gx .vfd th { text-align: left; font-size: 9px; letter-spacing: .2em; color: #1fa784; padding: 0 12px 5px 0; border-bottom: 1px dashed #145a48; font-weight: 600; }
+.gx .vfd td { padding: 4px 12px 4px 0; cursor: pointer; border: 0; text-align: left; }
+.gx .vfd tr.swr td:nth-child(2) { color: #d2a8ff; text-shadow: 0 0 6px rgba(176, 124, 255, .6); }
+.gx .vfd tbody tr:hover td { background: rgba(72, 255, 210, .06); } .gx .vfd tr.sel td { background: rgba(72, 255, 210, .13); }
+.gx .flap { display: flex; gap: 2px; padding: 3px; background: #050505; border-radius: 4px; box-shadow: 0 2px 6px rgba(0, 0, 0, .7), inset 0 0 0 1px #2a2a27; }
+.gx .flap i { flex: 1 1 0; min-width: 0; max-width: 17px; height: 22px; display: grid; place-items: center; font: 700 14px var(--mono); font-style: normal; color: #f4f1de;
+  background: linear-gradient(#262624 0 49%, #0d0d0c 49% 51%, #1c1c1a 51%); border-radius: 2px; text-shadow: 0 1px 0 #000; }
+.gx .flap i.flip { animation: flap .07s linear; color: #c9c5ad; }
+@keyframes flap { 0% { transform: scaleY(1); } 50% { transform: scaleY(.15); } 100% { transform: scaleY(1); } }
+.gx .pt.role-firewall, .gx .pt.role-cache { position: relative; overflow: hidden; }
+.gx .pt.role-firewall::after, .gx .pt.role-cache::after { content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: inherit; opacity: .62; }
+.gx .pt.role-firewall::after { background: repeating-linear-gradient(-45deg, #ff2b2b 0 4px, #ffd400 4px 8px); }
+.gx .pt.role-cache::after { background: repeating-linear-gradient(-45deg, #0b0b0a 0 4px, #ffd400 4px 8px); }
+.gx .pt.role-firewall { border-color: #ff2b2b; box-shadow: 0 0 0 1px #ffd400, 0 0 8px rgba(255, 43, 43, .6); }
+.gx .pt.role-cache { border-color: #ffd400; box-shadow: 0 0 0 1px #0b0b0a, 0 0 8px rgba(255, 212, 0, .5); }
+.gx .pt.role-firewall > *, .gx .pt.role-cache > * { position: relative; z-index: 1; }
+.gx .pt.role-firewall span, .gx .pt.role-cache span { color: #fff !important; text-shadow: 0 0 2px #000, 0 0 3px #000, 0 1px 0 #000; font-weight: 800; }
+.gx .rolebadge { font: 800 10px var(--mono); letter-spacing: .14em; padding: 3px 8px; border-radius: 3px; color: #fff; text-shadow: 0 0 2px #000, 0 1px 0 #000; }
+.gx .rolebadge.firewall { background: repeating-linear-gradient(-45deg, #e01e1e 0 6px, #e8b800 6px 12px); }
+.gx .rolebadge.cache { background: repeating-linear-gradient(-45deg, #111 0 6px, #e8b800 6px 12px); }
+.gx .talkers { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+@media (max-width: 1100px) { .gx .talkers { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); } }
+.gx .blm { min-width: 0; } .gx .blm.click { cursor: pointer; }
+.gx .blm .bezel { position: relative; padding: 7px; border-radius: 9px; background: linear-gradient(160deg, #3a3a37, #1c1c1a 45%, #0f0f0e); border: 1px solid #4a4a45;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12), 0 3px 10px rgba(0, 0, 0, .55); }
+.gx .blm.click:hover .bezel { border-color: var(--amber); }
+.gx .blm svg { display: block; width: 100%; height: auto; border-radius: 4px; box-shadow: inset 0 0 0 1px #000, 0 0 0 1px #000;
+  filter: brightness(calc(.42 + .62 * var(--lit))) saturate(calc(.6 + .5 * var(--lit))); transition: filter .9s ease; }
+.gx .blm .bezel::after { content: ""; position: absolute; inset: 7px; border-radius: 4px; pointer-events: none;
+  box-shadow: inset 0 0 18px rgba(60, 30, 0, .55), 0 0 calc(22px * var(--lit)) rgba(255, 196, 92, calc(.35 * var(--lit))); transition: box-shadow .9s ease; }
+.gx .blm .scale { fill: none; stroke: #2a2116; stroke-width: 1.2; } .gx .blm .redzone { fill: none; stroke: #c2241b; stroke-width: 6; opacity: .85; }
+.gx .blm .tk { stroke: #2a2116; stroke-width: 1; } .gx .blm .tk.maj { stroke-width: 1.8; } .gx .blm .tk.hot { stroke: #a8180f; }
+.gx .blm .num { fill: #241b10; font: 700 11px var(--mono); } .gx .blm .num.hot { fill: #a8180f; }
+.gx .blm .unit { fill: #3a2c18; font: 700 10px var(--mono); letter-spacing: .3em; } .gx .blm .legend { fill: #5a4423; font: 700 8px var(--mono); letter-spacing: .14em; }
+.gx .blm .needle { transform-origin: 120px 172px; transition: transform 1.1s cubic-bezier(.25, 1.45, .45, 1); }
+.gx .blm .needle line { stroke: #14100b; stroke-width: 1.9; stroke-linecap: round; } .gx .blm .needle.shadow line { stroke: rgba(40, 20, 0, .45); stroke-width: 2.2; }
+.gx .blm .pivot { fill: #151513; stroke: #000; stroke-width: 1; } .gx .blm .glass { pointer-events: none; }
+.gx .blm .screw { position: absolute; width: 5px; height: 5px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #8b8b85, #2c2c29); box-shadow: 0 0 0 1px #0b0b0a; }
+.gx .blm .screw.tl { top: 2px; left: 2px; } .gx .blm .screw.tr { top: 2px; right: 2px; } .gx .blm .screw.bl { bottom: 2px; left: 2px; } .gx .blm .screw.br { bottom: 2px; right: 2px; }
+.gx .blm .plate { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 6px; border-radius: 4px; background: linear-gradient(#1d1d1b, #141413); border: 1px solid #2c2c29; min-height: 24px; }
+.gx .blm .plate .name { font: 700 11px var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.gx .blm .plate .seg7 { margin-left: auto; flex: none; width: 54px; } .gx .blm.off .plate .name { color: var(--muted); }
+.gx.rig { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 26px; padding: 12px 16px; background: linear-gradient(180deg, #232322, #191918); }
+.gx .gearmons { display: flex; gap: 10px; flex: 1 1 380px; min-width: 0; max-width: 600px; }
+.gx .gearmon { flex: 1 1 0; min-width: 170px; max-width: 290px; padding: 6px 8px 7px; border-radius: 7px; background: linear-gradient(#0e100f, #090a09);
+  border: 1px solid #2a2f2b; display: flex; flex-direction: column; gap: 4px; }
+.gx .gearmon.firewall { border-color: color-mix(in srgb, #ff3d8b 35%, #2a2f2b); box-shadow: inset 0 0 14px rgba(255, 61, 139, .07); }
+.gx .gearmon.cache { border-color: color-mix(in srgb, #b26bff 35%, #2a2f2b); box-shadow: inset 0 0 14px rgba(178, 107, 255, .07); }
+.gx .gmhead { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.gx .gmtitle { font: 700 10.5px var(--mono); letter-spacing: .2em; white-space: nowrap; flex: none; }
+.gx .gearmon.firewall .gmtitle { color: #ff6fa8; text-shadow: 0 0 6px rgba(255, 61, 139, .6); }
+.gx .gearmon.cache .gmtitle { color: #c99bff; text-shadow: 0 0 6px rgba(178, 107, 255, .6); }
+.gx .gmwhere { flex: 1 1 0; min-width: 0; font: 600 9px var(--mono); color: #6b6a65; letter-spacing: .06em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gx .gmread { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 4px 6px; align-items: center; font: 700 9px var(--mono); letter-spacing: .1em; }
+.gx .gmread .seg7 { height: 17px; }
+.gx .gearmon .scope .scale { font-size: 8px; top: 2px; left: 5px; }
+.gx .gearmon .scope .wait { font-size: 8px; letter-spacing: .2em; }
+.gx.rig .rigk { font: 700 10px var(--mono); letter-spacing: .2em; color: var(--muted); }
+.gx .uleg { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); margin-top: 10px; }
+.gx .uleg > span { display: inline-flex; align-items: center; gap: 6px; }
+.fold { display: flex; align-items: center; gap: 8px; align-self: flex-start; font: 600 10px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--muted); background: linear-gradient(#232322, #191918); border: 1px solid #3a3a37; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+.fold span[aria-hidden] { font-size: 15px; line-height: 1; color: var(--amber); } .fold:hover { color: var(--text-2); border-color: #55544f; }
+.layout.folded { grid-template-columns: 40px minmax(0, 1fr); max-width: 2000px; }
+.layout.folded > aside > :not(.fold) { display: none; }
+.layout.folded > aside > .fold { padding: 8px 0; width: 40px; justify-content: center; position: sticky; top: 64px; }
+.layout.folded > aside > .fold .ft { display: none; }
+@media (max-width: 960px) { .layout.folded { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { .gx .vu .ndl, .gx .vu .pkd, .gx .blm .needle, .gx .blm svg, .gx .blm .bezel::after { transition: none; } .gx .flap i.flip, .gx .dtag, .gx .vfd .cur, .gx .rec i, .gx .scope .wait, .gx .pt.crit i { animation: none; } }
+
+/* ---------- CS2 ---------- */
+.csverdict { display: flex; flex-direction: column; gap: 6px; min-width: 230px; }
+.csverdict .big { font: 800 26px/1 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; letter-spacing: .12em; }
+.csverdict .big.ok { color: #3dff7a; text-shadow: 0 0 12px rgba(61, 255, 122, .55); }
+.csverdict .big.warn { color: var(--warn); text-shadow: 0 0 12px color-mix(in srgb, var(--warn) 55%, transparent); }
+.csverdict .big.bad { color: #ff4d4d; text-shadow: 0 0 12px rgba(255, 77, 77, .6); animation: pulse 1.4s ease-in-out infinite; }
+.csverdict ul { margin: 0; padding-left: 16px; font-size: 12.5px; color: var(--text-2); }
+.csrig { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; }
+.csrig .wells { flex: 1; min-width: 300px; }
+.cshead { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 12px; }
+.cshead b { font-size: 16px; }
+.cshead .flap { min-width: 220px; max-width: 320px; flex: 1; }
+.cstbl td, .cstbl th { padding: 5px 8px; font-size: 12.5px; }
+.cstbl .lv-ok { color: #3dff7a; } .cstbl .lv-warn { color: var(--warn); } .cstbl .lv-bad { color: #ff7b7b; }
+.hops { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font: 600 11px ui-monospace, Menlo, Consolas, monospace; }
+.hops .hop { padding: 5px 9px; border-radius: 6px; border: 1px solid #3a3a37; background: #131312; display: flex; gap: 6px; align-items: center; }
+.hops .hop.warn { border-color: color-mix(in srgb, var(--warn) 60%, #3a3a37); } .hops .hop.crit { border-color: #ff4d4d; box-shadow: 0 0 8px rgba(255, 77, 77, .35); }
+.hops .arr { color: var(--amber); }
+.pcs { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 6px; }
+.pc { background: #131312; border: 1px solid #2f2f2d; border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pc b { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc .v { font: 700 15px ui-monospace, Menlo, Consolas, monospace; }
+.pc .k { letter-spacing: .04em; text-transform: none; font-size: 10px; }
+.pc.ok { border-color: #2c7a3f; } .pc.ok .v { color: #3dff7a; } .pc.warn { border-color: #6a5320; } .pc.warn .v { color: var(--warn); }
+.pc.bad { border-color: #7a2b2b; background: #1d1212; } .pc.bad .v { color: #ff7b7b; } .pc.off { opacity: .5; }
+.cnhead { margin: 6px 2px -6px; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--amber); display: flex; align-items: center; gap: 10px; }
+.cnhead .sub { letter-spacing: normal; text-transform: none; }
+/* ---------- guarded switch (Tailscale on/off): slide to arm, then press ---------- */
+.arm-sw { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 12px 10px 14px; border-radius: 8px; background: radial-gradient(ellipse at 50% 30%, #23231f, #121211 75%); border: 1px solid #0b0b0a; box-shadow: inset 0 2px 10px rgba(0,0,0,.7); }
+.arm-latch { position: relative; width: 138px; height: 26px; border-radius: 13px; border: 0; padding: 0; cursor: pointer; background: #0b0b0a; box-shadow: inset 0 2px 5px rgba(0,0,0,.9), 0 0 0 2px #2d2d29; }
+.arm-latch span:not(.arm-knob) { position: absolute; top: 50%; transform: translateY(-50%); font: 700 8.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .22em; color: #cfcab8; opacity: .8; }
+.arm-safe { right: 13px; } .arm-arm { left: 15px; color: var(--amber) !important; }
+.arm-knob { position: absolute; top: 3px; left: 3px; width: 58px; height: 20px; border-radius: 10px; transition: left .22s cubic-bezier(.3,1.3,.5,1);
+  background: repeating-linear-gradient(-45deg, #f2c300 0 5px, #161614 5px 10px); box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 2px 4px rgba(0,0,0,.6); }
+.arm-sw.armed .arm-knob { left: 77px; }
+.arm-korry { width: 88px; height: 88px; border-radius: 7px; padding: 6px; border: 0; cursor: pointer; background: linear-gradient(145deg, #3a3a35, #161614); box-shadow: 0 0 0 2px #0b0b0a, 0 6px 12px rgba(0,0,0,.6); transition: transform .08s, opacity .2s; }
+.arm-korry:active:not(:disabled) { transform: scale(.96); }
+.arm-face { height: 100%; border-radius: 4px; display: grid; grid-template-rows: 1fr 1fr; background: #0c0c0b; box-shadow: inset 0 2px 7px rgba(0,0,0,.9); overflow: hidden; }
+.arm-face span { display: grid; place-items: center; font: 700 10.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .14em; color: #3b3a34; transition: color .2s, background .2s, text-shadow .2s; }
+.arm-face .k1 { border-bottom: 1px solid #222; }
+.arm-sw.on .k2 { color: var(--good, #3dff7a); background: rgba(61,255,122,.08); text-shadow: 0 0 9px #3dff7a; }
+.arm-sw:not(.on) .k2 { color: #a3352c; }
+.arm-sw.busy .k2 { color: var(--amber); background: rgba(255,178,46,.06); animation: armblink .6s steps(2) infinite; }
+.arm-sw.armed .k1 { color: var(--amber); background: rgba(255,178,46,.08); text-shadow: 0 0 9px var(--amber); }
+.arm-sw:not(.armed) .arm-korry { opacity: .75; }
+.arm-row { display: flex; gap: 10px; }
+#pw-sw .k2 { font-size: 9.5px; letter-spacing: .1em; }
+#pw-sw .pw-off .k2 { color: #a3352c; } #pw-sw .pw-re .k2 { color: #8a6a2a; }
+#pw-sw.armed .pw-off .k2 { color: #ff6b5e; text-shadow: 0 0 8px #ff4d40; } #pw-sw.armed .pw-re .k2 { color: var(--amber); text-shadow: 0 0 8px var(--amber); }
+.pw-screen { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 16px; background: radial-gradient(ellipse at center, #1a1a19 0%, #0b0b0a 70%); text-align: center; }
+.pw-screen::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0,0,0,.25) 0 1px, transparent 1px 3px); }
+.pw-screen div { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; align-items: center; max-width: 440px; }
+.pw-screen b { font: 700 22px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .2em; color: var(--amber); text-shadow: 0 0 12px rgba(255,178,46,.5); }
+.pw-screen .sub { line-height: 1.6; }
+.arm-sw :disabled { cursor: not-allowed; opacity: .45; }
+@keyframes armblink { 50% { opacity: .35; } }
+/* ---------- Tailscale map ---------- */
+.tsmap { padding: 0; overflow: hidden; background: #03080d; border-color: #10384d; }
+.tsm-wrap { position: relative; aspect-ratio: 975 / 610; width: 100%; background: radial-gradient(ellipse at 50% 40%, #071a26 0%, #02060a 75%); }
+.tsm-wrap svg, .tsm-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.tsm-wrap::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0, 0, 0, .22) 0 1px, transparent 1px 3px); }
+.tsm-hud { position: absolute; z-index: 2; font: 600 10.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .12em; color: #7fdcff; text-transform: uppercase; display: flex; flex-direction: column; gap: 3px; pointer-events: none; }
+.tsm-hud b { color: #21e6ff; font-size: 12px; letter-spacing: .2em; text-shadow: 0 0 8px rgba(33, 230, 255, .6); }
+.tsm-hud.tl { top: 12px; left: 14px; } .tsm-hud.tr { top: 12px; right: 14px; text-align: right; color: #ffb22e; text-shadow: 0 0 6px rgba(255, 178, 46, .5); }
+.tsm-hud.bl { bottom: 10px; left: 14px; flex-direction: row; flex-wrap: wrap; gap: 4px 14px; color: #6aa9c2; letter-spacing: .06em; }
+.tsm-hud.bl i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; box-shadow: 0 0 6px currentColor; }
+.tsm-hud.bl i.dm { width: 7px; height: 7px; background: none; border: 1.5px solid #ff3df2; transform: rotate(45deg); border-radius: 0; box-shadow: none; }
+.tsm-hud.br { bottom: 10px; right: 14px; text-align: right; color: #6aa9c2; letter-spacing: .06em; max-width: 40%; }
+.tsm-foot { padding: 8px 14px 10px; border-top: 1px solid #10384d; line-height: 1.5; }
+@media (max-width: 700px) { .tsm-hud.bl, .tsm-hud.br { display: none; } }
+tr.dim { opacity: .55; }
+.plist { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px 14px; font-size: 12.5px; }
+.plist div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dashed #2a2a27; padding: 2px 0; }
+/* ---------- login + roles ---------- */
+.gate { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px; overflow: auto;
+  background: radial-gradient(ellipse at center, #1a1a19 0%, #0b0b0a 70%); }
+.gate::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0, 0, 0, .25) 0 1px, transparent 1px 3px); }
+.gate .card { width: min(380px, 100%); position: relative; z-index: 1; box-shadow: 0 0 0 4px #161615, 0 0 0 5px #2e2e2b, 0 20px 60px rgba(0, 0, 0, .6); }
+.gate .big-port { text-align: center; font-size: 22px; letter-spacing: .14em; margin: 4px 0 2px; }
+.gate .brand { justify-content: center; margin-bottom: 8px; }
+body.gated > :not(.gate):not(dialog) { visibility: hidden; }
+.ro .admin-only { display: none !important; }
+.ro :is(button, input, select, textarea):not(.ro-ok):not(.ro-ok *):not(.gate *) { pointer-events: none; opacity: .45; }
+.userpill { gap: 9px; }
+.userpill button { background: none; border: 0; padding: 0; color: var(--muted); cursor: pointer; font-size: 12px; text-decoration: underline; text-underline-offset: 2px; }
+.userpill button:hover { color: var(--text); }
+.role { font: 600 9.5px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; color: var(--amber); }
+.role.viewer { color: #8fb8ff; }
+/* ---------- add-on pages: shared bits ---------- */
+.filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.filters select, .filters input[type=text] { width: auto; flex: 1 1 170px; }
+.filters label.chk { flex: none; }
+pre.cfg { margin: 0; font: 12.5px/1.6 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; color: #9ff0ae; background: #0b0b0a; border: 1px solid rgba(255, 255, 255, .06);
+  border-radius: 8px; padding: 10px 14px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
+.loglist { max-height: 640px; }
+.loglist .ev { grid-template-columns: 76px 12px 120px minmax(0, 1fr); }
+.loglist .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); font-size: 12.5px; }
+.loglist .code { font: 600 11.5px ui-monospace, Menlo, Consolas, monospace; color: var(--amber); margin-right: 8px; }
+.loglist .src-watchdog .who, .loglist .src-cs .who { color: #8fb8ff; }
+@media (max-width: 760px) { .loglist .ev { grid-template-columns: 60px 12px minmax(0, 1fr); } .loglist .who { display: none; } }
+.vsplit { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); gap: 18px; }
+.steps { margin: 0; padding-left: 18px; color: var(--text-2); font-size: 13px; line-height: 1.7; }
+td.wrap { white-space: normal; }
+.hosttab td { vertical-align: top; }
+.hosttab .mk { display: block; color: var(--muted); font-size: 11.5px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+.hosttab .nm small { display: block; color: var(--muted); font-size: 11.5px; }
+.hosttab .chip { margin: 0 4px 3px 0; }
+pre.caplines { max-height: 420px; overflow: auto; white-space: pre; overflow-wrap: normal; font-size: 11.5px; user-select: text; }
+.loginbox { display: flex; flex-direction: column; gap: 10px; padding: 12px; background: var(--well); border: 1px solid var(--line); border-radius: 8px; }
+#f-pulllogin .loginbox { display: grid; grid-template-columns: 1fr 1fr; align-items: end; }
+#f-pulllogin .loginbox > .k, #f-pulllogin .loginbox > .chk { grid-column: 1 / -1; }
+#f-pulllogin .loginbox .f .sub { display: none; }
+#f-pulllogin .loginbox { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+#f-pulllogin .loginbox > .row { display: contents; }
+@media (max-width: 760px) { #f-pulllogin .loginbox { grid-template-columns: 1fr; } }
+.upbar { height: 8px; border-radius: 4px; background: var(--well); overflow: hidden; border: 1px solid var(--line); }
+#lg-senders tr.ign td { opacity: .5; }
+#fl-list tr.sel td, #cf-list tr.sel td { background: rgba(255, 176, 0, .06); }
+.upbar i { display: block; height: 100%; width: 0; background: var(--amber); transition: width .2s; }
+pre.diff { margin-top: 12px; max-height: 620px; overflow: auto; white-space: pre; overflow-wrap: normal; color: var(--text-2); user-select: text; }
+pre.diff .a { color: #7fe08f; } pre.diff .d { color: #ff9b9b; } pre.diff .h { color: #8fb8ff; }
+.svtab td { vertical-align: top; }
+.svtab .why { white-space: normal; min-width: 130px; color: var(--text-2); font-size: 12.5px; }
+.svtab tr.lv-bad td:first-child { box-shadow: inset 3px 0 0 var(--crit); }
+.svtab tr.lv-check td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.svtab tr.lv-good td:first-child { box-shadow: inset 3px 0 0 var(--good); }
+
+/* ---------- speed test instruments (from iPerf Deck) ---------- */
+.sx-src { margin-left: 8px; width: auto; text-transform: none; letter-spacing: 0; font-weight: 500; }
+.sx-src label { padding: 3px 12px; }
+.dials { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 14px; }
+.minis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
+.dial { position: relative; margin: 0 auto; width: 100%; }
+.dial.big { max-width: 290px; }
+.dial.mini { max-width: 170px; }
+.dial svg.face { display: block; width: 100%; height: auto; overflow: visible; }
+.dial .sg { fill: none; stroke: var(--led-off); transition: stroke .3s; }
+.dial .sg.on { stroke: var(--c); filter: drop-shadow(0 0 3px var(--c)); }
+.dial .sl { fill: var(--muted); font: 9px ui-monospace, Menlo, Consolas, monospace; }
+.dial.mini .sl { font-size: 13px; }
+.dial .ttl { fill: var(--text-2); font: 600 11px ui-monospace, Menlo, Consolas, monospace; letter-spacing: .16em; }
+.dial.mini .ttl { font-size: 14.5px; letter-spacing: .1em; }
+.dial .pk, .dial .nd { transform-origin: 100px 100px; transition: transform .9s cubic-bezier(.3, 1.35, .5, 1), opacity .3s; }
+.dial .pk path { fill: var(--text); }
+.dial .nd path { fill: var(--c); filter: drop-shadow(0 0 3px var(--c)); }
+.dial .ctr { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; pointer-events: none; }
+.dial .seg7 { --c: inherit; }
+.dial .ctr .seg7 .on { fill: var(--c); }
+.dial.big .seg7 { height: 34px; }
+.dial.mini .seg7 { height: 21px; }
+.dial.mini .ctr { gap: 3px; }
+.dial.mini .un { font-size: 9px; letter-spacing: .08em; }
+.dial.off .sg.on { stroke: var(--led-off); filter: none; }
+.dial.off .nd, .dial.off .pk { opacity: 0; }
+.subs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; border-top: 1px solid rgba(255, 255, 255, .06); padding-top: 11px; }
+.sr { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+.sr .seg7 { height: 17px; }
+.sr .un { font-size: 9px; letter-spacing: .08em; }
+.chart.big { height: 300px; }
+.chart.small { height: 170px; }
+.wf { position: relative; height: 180px; background: #07080c; border: 1px solid #2f2f2d; border-radius: 6px; overflow: hidden; cursor: pointer; }
+.wf canvas { position: absolute; inset: 0; width: 100%; height: 100%; image-rendering: pixelated; }
+.wf-key { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+.wf-key i { width: 120px; height: 8px; border-radius: 2px; background: linear-gradient(90deg, #0a0e1c, #102a6e, #286edc, #5abeff, #e6f5ff); }
+#sx-tip { position: fixed; z-index: 30; pointer-events: none; background: #2f2f2d; border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .45); min-width: 130px; }
+#sx-tip .t { color: var(--muted); margin-bottom: 4px; }
+#sx-tip .r { display: flex; align-items: center; gap: 7px; }
+#sx-tip .r b { margin-left: auto; padding-left: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+tr.click { cursor: pointer; } tr.click:hover td { background: rgba(255, 255, 255, .03); } tr.click.picked td { background: rgba(255, 176, 0, .07); }
+@media (prefers-reduced-motion: reduce) { .dial .pk, .dial .nd, .dial .sg { transition: none; } }
+.wrsec { margin-bottom: 10px; } .wrsec > .k { display: block; margin: 6px 0 2px; }
+.ev.wr { grid-template-columns: 12px minmax(0, 1fr); }
+.mdtype { margin-bottom: 14px; } .mdh { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
+.mtrtab td { vertical-align: middle; }
+#mc-list tr.sel td { background: rgba(255, 176, 0, .06); }
+</style>
+<style>
+/* the router's additions */
+#v-speed .sx-src { display: none; }      /* only the internet test here */
+#v-wake section:has(#seen) { display: none; }   /* fed by Probe Deck's Watchdog, which the router doesn't have */
+.backlink { text-decoration: none; }
+</style>
+</head>
+<body class="gated">
+<div id="sx-tip" hidden></div>
+<header class="top">
+  <button class="btn ghost navbtn ro-ok" id="b-nav" type="button" aria-label="Show the page list" aria-expanded="false"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+  <div class="brand"><span style="font-size:20px">🐷</span> PorkChopCheck Deck</div>
+  <span class="pill"><span class="dot" id="h-dot"></span><span id="h-name">connecting…</span></span>
+  <span class="spacer"></span>
+  <a class="btn ghost backlink ro-ok" href="/">◂ Port tester</a>
+  <span class="pill" id="h-temp">— °C</span>
+  <span class="pill userpill ro-ok" id="h-user"><span id="h-uname">—</span><span class="role" id="h-role"></span><button type="button" id="b-logout">Log out</button></span>
+</header>
+<div class="shell">
+<nav class="side ro-ok" id="side" aria-label="Pages">
+  <div class="mod" data-mod="net">
+    <button type="button" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v5H4z M4 14h16v5H4z M7.5 7.5h.01 M7.5 16.5h.01 M12 10v4"/></svg><span class="mn">Network</span><span class="dot" data-lamp></span><span class="chev" aria-hidden="true">▾</span></button>
+    <div class="items">
+      <a href="#mtr" data-view="mtr"><span class="dot" id="t-mtr"></span><span class="nm">Traceroute</span><span class="badge" id="tb-mtr" hidden></span></a>
+      <a href="#hosts" data-view="hosts"><span class="dot" id="t-hosts"></span><span class="nm">Host scan</span><span class="badge" id="tb-hosts" hidden></span></a>
+      <a href="#mdns" data-view="mdns"><span class="dot" id="t-mdns"></span><span class="nm">mDNS</span><span class="badge" id="tb-mdns" hidden></span></a>
+      <a href="#mcast" data-view="mcast"><span class="dot" id="t-mcast"></span><span class="nm">Multicast</span><span class="badge" id="tb-mcast" hidden></span></a>
+      <a href="#cache" data-view="cache"><span class="dot" id="t-cache"></span><span class="nm">LAN cache</span><span class="badge" id="tb-cache" hidden></span></a>
+    </div>
+  </div>
+  <div class="mod" data-mod="tests">
+    <button type="button" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18a8 8 0 1 1 16 0 M12 18l4-6"/></svg><span class="mn">Tests</span><span class="dot" data-lamp></span><span class="chev" aria-hidden="true">▾</span></button>
+    <div class="items">
+      <a href="#speed" data-view="speed"><span class="dot" id="t-speed"></span><span class="nm">Internet speed</span><span class="badge" id="tb-speed" hidden></span></a>
+    </div>
+  </div>
+  <div class="mod" data-mod="tools">
+    <button type="button" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/></svg><span class="mn">Tools</span><span class="dot" data-lamp></span><span class="chev" aria-hidden="true">▾</span></button>
+    <div class="items">
+      <a href="#wake" data-view="wake"><span class="dot" id="t-wake"></span><span class="nm">Wake</span><span class="badge" id="tb-wake" hidden></span></a>
+    </div>
+  </div>
+  <div class="mod" data-mod="sys">
+    <button type="button" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h9 M17 7h3 M4 17h3 M11 17h9 M15 5v4 M9 15v4"/></svg><span class="mn">System</span><span class="dot" data-lamp></span><span class="chev" aria-hidden="true">▾</span></button>
+    <div class="items">
+      <a href="#stats" data-view="stats"><span class="dot" id="t-stats"></span><span class="nm">System stats</span><span class="badge" id="tb-stats" hidden></span></a>
+      <a href="#ts" data-view="ts"><span class="dot" id="t-ts"></span><span class="nm">Tailscale</span><span class="badge" id="tb-ts" hidden></span></a>
+    </div>
+  </div>
+  <span class="k ver" id="sj-ver"></span>
+</nav>
+<div class="scrim" id="scrim"></div>
+<div class="content">
+<div class="banner" id="offline" hidden style="margin:14px 20px 0">Lost contact with the router. Retrying…</div>
+<div class="view" id="v-mtr" hidden style="padding:18px 20px 40px;max-width:1640px;margin:0 auto;display:flex;flex-direction:column;gap:18px">
+  <section class="card">
+    <h2>Traceroute <span class="spacer"></span><span class="sub">every hop, probed once a second, like mtr</span></h2>
+    <form class="tracebar" id="f-mtr">
+      <input type="text" id="mt-q" class="ro-ok" placeholder="1.1.1.1 · steamcommunity.com · a game server" spellcheck="false" autocomplete="off">
+      <button class="btn primary admin-only" type="submit" id="mt-go">Start</button>
+      <button class="btn danger admin-only" type="button" id="mt-stop" hidden>Stop</button>
+    </form>
+    <div class="peers" id="mt-recent" style="margin-top:10px"></div>
+  </section>
+  <section class="card">
+    <h2><span id="mt-title">Hops</span> <span class="spacer"></span><span class="lamp" id="mt-lamp"></span></h2>
+    <div class="tablewrap"><table class="mtrtab">
+      <thead><tr><th>#</th><th class="l">Hop</th><th>Loss</th><th>Sent</th><th>Last</th><th>Avg</th><th>Best</th><th>Worst</th><th class="l">Last 40 (same scale for every hop)</th></tr></thead>
+      <tbody id="mt-list"></tbody>
+    </table></div>
+    <p class="sub" style="margin:12px 0 0">A hop that loses probes or answers slowly while the hops after it don't is a router that limits its own replies: not a fault. Loss or delay that carries on to the last hop is real.</p>
+  </section>
+</div>
+
+<div class="layout view" id="v-hosts" hidden>
+<aside>
+  <section class="card">
+    <h2>Scan <span class="spacer"></span><span class="lamp" id="hs-lamp"></span></h2>
+    <dl class="kv" id="hs-info"></dl>
+    <div class="row admin-only" style="margin-top:14px;align-items:center"><button class="btn primary" id="hs-go" type="button" style="flex:none">Scan now</button><span id="hs-msg"></span></div>
+    <p class="sub" style="margin:12px 0 0">Every address on the subnet gets one small packet, and every one that answers ARP counts, even with its firewall up. Names come from DNS, NetBIOS (Windows) and mDNS.</p>
+  </section>
+  <section class="card admin-only">
+    <h2>Settings</h2>
+    <form class="form" id="f-hosts">
+      <label class="f">Scan every (minutes) <span class="sub">0 = only when you press Scan now.</span><input type="number" id="hs-every" min="0" max="1440"></label>
+      <label class="f">TCP ports to try <input type="text" id="hs-ports" spellcheck="false"></label>
+      <label class="chk"><input type="checkbox" id="hs-names"><span>Look up names<small>Reverse DNS, NetBIOS and mDNS.</small></span></label>
+      <label class="chk"><input type="checkbox" id="hs-smart"><span>Identify smart devices<small>SSDP/UPnP, mDNS, Kasa/Tapo, Hue, Roku, Shelly, LIFX, Govee, WiZ, Yeelight, Tuya: type, brand, model and sometimes a serial number. Adds about 20 s to a scan.</small></span></label>
+      <div class="row" style="align-items:center"><button class="btn primary" type="submit" style="flex:none">Save</button><button class="btn" type="button" id="hs-forget" style="flex:none">Forget all</button><span id="hs-smsg"></span></div>
+    </form>
+  </section>
+  <section class="card">
+    <h2>Makers</h2>
+    <div class="tablewrap"><table><tbody id="hs-makers"></tbody></table></div>
+  </section>
+</aside>
+<main>
+  <section class="card deck">
+    <h2>Hosts <span class="spacer"></span><span class="lamp" id="hs-net"></span></h2>
+    <div class="wells">
+      <div class="well"><span class="k">Up now</span><div id="hs-up"></div><span class="un">answered the last scan</span></div>
+      <div class="well" id="hs-neww"><span class="k">New</span><div id="hs-new"></div><span class="un">first seen today</span></div>
+      <div class="well"><span class="k">Makers</span><div id="hs-nmk"></div><span class="un">different</span></div>
+      <div class="well"><span class="k">Open ports</span><div id="hs-nport"></div><span class="un">hosts with any</span></div>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Every host <span class="spacer"></span><span class="sub" id="hs-count"></span></h2>
+    <div class="filters">
+      <input type="text" id="hs-q" class="ro-ok" placeholder="Filter: IP, name, MAC, maker, port" spellcheck="false">
+      <label class="chk ro-ok"><input type="checkbox" id="hs-onlyup" class="ro-ok" checked><span>Up now</span></label>
+      <label class="chk ro-ok"><input type="checkbox" id="hs-onlynew" class="ro-ok"><span>New only</span></label>
+      <label class="chk ro-ok"><input type="checkbox" id="hs-onlysmart" class="ro-ok"><span>Smart devices</span></label>
+    </div>
+    <div class="tablewrap"><table class="hosttab">
+      <thead><tr><th class="l">IP</th><th class="l">Name</th><th class="l">MAC · maker</th><th class="l">Open ports</th><th>First seen</th><th>Last seen</th><th></th></tr></thead>
+      <tbody id="hs-list"></tbody>
+    </table></div>
+  </section>
+</main>
+</div>
+
+<div class="layout view" id="v-mdns" hidden>
+<aside>
+  <section class="card">
+    <h2>mDNS browser <span class="spacer"></span><span class="lamp" id="md-lamp"></span></h2>
+    <p class="sub" style="margin:0 0 12px">Every service announced on the LAN over multicast DNS (Bonjour, Avahi): Chromecasts, AirPlay, printers, ESPHome, WLED, Home Assistant, Matter… It asks every 10 minutes and also listens all the time.</p>
+    <dl class="kv" id="md-info"></dl>
+    <div class="row admin-only" style="margin-top:14px;align-items:center"><button class="btn primary" type="button" id="md-go" style="flex:none">Ask now</button><button class="btn" type="button" id="md-reset" style="flex:none">Start over</button></div>
+  </section>
+</aside>
+<main>
+  <section class="card">
+    <h2>Services <span class="spacer"></span><span class="sub" id="md-count"></span></h2>
+    <div class="filters"><input type="text" id="md-q" class="ro-ok" placeholder="Filter: name, type, address" spellcheck="false"></div>
+    <div id="md-list"></div>
+    <div class="sub" id="md-empty" style="margin-top:12px"></div>
+  </section>
+</main>
+</div>
+
+<div class="layout view" id="v-mcast" hidden>
+<aside>
+  <section class="card">
+    <h2>IGMP querier <span class="spacer"></span><span class="lamp" id="mc-qlamp"></span></h2>
+    <div class="big-port" id="mc-q" style="font-size:20px;white-space:normal">—</div>
+    <p class="sub" id="mc-qnote" style="margin:6px 0 12px"></p>
+    <button class="btn admin-only" type="button" id="mc-probe">Ask for a querier</button>
+    <p class="sub" style="margin:10px 0 0">Joins a scratch group for a moment and leaves it: a querier answers within a second, instead of its next general query up to two minutes later.</p>
+  </section>
+  <section class="card admin-only">
+    <h2>Join test</h2>
+    <form class="form" id="f-mcjoin">
+      <label class="f">Group <span class="sub">The probe joins it through Linux, which sends the IGMP report, and counts what arrives.</span>
+        <input type="text" id="mc-group" placeholder="e.g. 239.1.2.3 or 239.255.255.250" spellcheck="false" autocomplete="off"></label>
+      <div class="row" style="align-items:center"><button class="btn primary" type="submit" id="mc-join" style="flex:none">Join</button><button class="btn" type="button" id="mc-leave" style="flex:none" hidden>Leave</button><span id="mc-msg"></span></div>
+      <div class="wsub" id="mc-jstate" style="white-space:normal"></div>
+    </form>
+  </section>
+</aside>
+<main>
+  <section class="card deck">
+    <h2>Multicast on this port <span class="spacer"></span><span class="lamp" id="mc-lamp"></span></h2>
+    <div class="wells">
+      <div class="well"><span class="k">Groups</span><div id="mc-ng"></div><span class="un">with traffic or members</span></div>
+      <div class="well"><span class="k">Traffic</span><div id="mc-bps"></div><span class="un" id="mc-bpsu">Mbps</span></div>
+      <div class="well" id="mc-wq"><span class="k">Queriers</span><div id="mc-nq"></div><span class="un">heard</span></div>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Groups <span class="spacer"></span><button class="btn ghost admin-only" id="mc-reset">Start over</button></h2>
+    <div class="tablewrap"><table><thead><tr><th class="l">Group</th><th class="l">What</th><th>Rate</th><th>Packets</th><th class="l">Sources</th><th class="l">Members heard</th><th>Last</th></tr></thead><tbody id="mc-list"></tbody></table></div>
+    <p class="sub" style="margin:12px 0 0">With IGMP snooping on, a switch only sends a group to ports that asked for it, so most groups other machines watch won't show here. That's normal.</p>
+  </section>
+</main>
+</div>
+
+<div class="layout view" id="v-cache" hidden>
+<aside>
+  <section class="card">
+    <h2>Check <span class="spacer"></span><span class="lamp" id="lc-lamp"></span></h2>
+    <ol class="steps">
+      <li>The game download names must point at the cache, through <b>every</b> DNS server the LAN hands out.</li>
+      <li>The cache must answer: lancache's heartbeat on port 80, and port 443 open for HTTPS passthrough.</li>
+      <li>Optional: a test file fetched through the cache twice should go <b>MISS</b> then <b>HIT</b>.</li>
+    </ol>
+    <div class="row admin-only" style="margin-top:14px;align-items:center"><button class="btn primary" id="lc-go" type="button" style="flex:none">Check now</button><span id="lc-msg"></span></div>
+    <form class="form admin-only" id="f-lctry" style="margin-top:14px">
+      <label class="f">Try a DNS server <span class="sub">One check against just this server, not saved. For a cache's DNS before it goes into DHCP.</span>
+        <input type="text" id="lc-try" placeholder="e.g. 192.168.1.20" spellcheck="false" autocomplete="off"></label>
+      <button class="btn" type="submit" style="align-self:flex-start">Check this server</button>
+    </form>
+  </section>
+  <section class="card admin-only">
+    <h2>Settings</h2>
+    <form class="form" id="f-cache">
+      <label class="f">Cache address <span class="sub">Leave empty to use the LAN address most game names point at.</span><input type="text" id="lc-ip" placeholder="e.g. 192.168.1.20" spellcheck="false"></label>
+      <label class="f">Also ask these DNS servers <span class="sub">Comma separated, up to 6. Checked every time, next to DHCP's.</span><input type="text" id="lc-dns" placeholder="e.g. 192.168.1.20, 192.168.1.21" spellcheck="false"></label>
+      <label class="chk"><input type="checkbox" id="lc-dhcp"><span>Ask the DNS servers DHCP gave<small>Untick to check only the ones above.</small></span></label>
+      <label class="f">Check every (minutes) <span class="sub">0 = only when you press Check now.</span><input type="number" id="lc-every" min="0" max="1440"></label>
+      <label class="f">Test file <span class="sub">An http:// URL from the cache's access log (a Steam chunk is ideal). Fetched twice through the cache.</span><input type="text" id="lc-url" placeholder="http://lancache.steamcontent.com/depot/…" spellcheck="false"></label>
+      <div class="row" style="align-items:center"><button class="btn primary" type="submit" style="flex:none">Save</button><span id="lc-smsg"></span></div>
+    </form>
+  </section>
+</aside>
+<main>
+  <section class="card deck">
+    <h2>LAN cache <span class="spacer"></span><span class="lamp" id="lc-at"></span></h2>
+    <div class="wells">
+      <div class="well wide" id="lc-wc"><span class="k">Cache</span><div class="big-port" id="lc-cache">—</div><div class="wsub" id="lc-hb"></div></div>
+      <div class="well" id="lc-wn"><span class="k">Names to cache</span><div id="lc-names"></div><span class="un" id="lc-names2">—</span></div>
+      <div class="well" id="lc-wt"><span class="k">Test file</span><div class="big-port" id="lc-hit" style="font-size:24px">—</div><span class="un" id="lc-speed">not set</span></div>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Game download names <span class="spacer"></span><span class="sub" id="lc-dnsw"></span></h2>
+    <div class="tablewrap"><table>
+      <thead id="lc-head"></thead>
+      <tbody id="lc-list"></tbody>
+    </table></div>
+  </section>
+  <section class="card" id="lc-testcard" hidden>
+    <h2>Test file through the cache</h2>
+    <div class="tablewrap"><table><thead><tr><th class="l">Fetch</th><th>Answer</th><th class="l">Cache</th><th>Size</th><th>Time</th><th>Speed</th></tr></thead><tbody id="lc-test"></tbody></table></div>
+  </section>
+</main>
+</div>
+
+<div class="layout view" id="v-speed" hidden>
+<aside>
+
+  <section class="card admin-only">
+    <h2>Internet speed test <span class="spacer"></span><span class="sub">Cloudflare</span></h2>
+    <form class="form" id="f-inet">
+      <p class="sub" style="margin:0">Downloads from and uploads to Cloudflare for a few seconds each way, and measures latency idle and under load (bufferbloat). At gigabit one test moves 1–2 GB.</p>
+      <div class="row">
+        <label class="f">Seconds each way <input type="number" id="in-secs" min="3" max="30"></label>
+        <label class="f">Streams <input type="number" id="in-streams" min="1" max="8"></label>
+      </div>
+      <button class="btn primary" id="in-go" type="submit">Test the internet</button>
+      <div class="msg" id="in-err" hidden></div>
+    </form>
+  </section>
+</aside>
+<main>
+  <section class="card deck" id="sv-deck">
+    <h2><span id="sx-title">Instruments</span> <span class="spacer"></span><span class="lamp" id="sx-lamp"></span>
+      <span class="seg sx-src ro-ok" role="radiogroup" aria-label="Which test"><label><input type="radio" name="sx-src" value="lan" class="ro-ok">LAN</label><label><input type="radio" name="sx-src" value="inet" class="ro-ok">Internet</label></span></h2>
+    <div class="dials">
+      <div class="well"><div id="sx-down"></div><div class="subs" id="sx-sub-down"></div></div>
+      <div class="well"><div id="sx-up"></div><div class="subs" id="sx-sub-up"></div></div>
+    </div>
+    <div class="minis">
+      <div class="well" id="sx-m1"></div><div class="well" id="sx-m2"></div><div class="well" id="sx-m3"></div><div class="well" id="sx-m4"></div>
+    </div>
+    <div class="wsub" id="sx-note" style="white-space:normal"></div>
+  </section>
+  <section class="card">
+    <h2>Throughput <span class="spacer"></span><span class="legend" id="sx-lg-main" style="margin:0;text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+    <div class="chart big" id="sx-main" role="img" aria-label="Throughput over time"></div>
+  </section>
+  <div class="grid2" style="grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))">
+    <section class="card" id="sx-p1"><h2 id="sx-t1">Retransmits per second</h2><div class="legend" id="sx-lg1"></div><div class="chart small" id="sx-c1" role="img"></div></section>
+    <section class="card" id="sx-p2"><h2 id="sx-t2">Round-trip time</h2><div class="legend" id="sx-lg2"></div><div class="chart small" id="sx-c2" role="img"></div></section>
+  </div>
+  <section class="card">
+    <h2>Waterfall <span class="spacer"></span><span class="sub" id="sx-wfn"></span></h2>
+    <div class="wf" id="sx-wf" role="img" aria-label="Heat map of recent tests"><canvas></canvas></div>
+    <div class="wf-key"><span>slower</span><i></i><span>faster</span><span style="margin-left:auto">One row per test, newest on top; left to right is start to finish. Click a row (or a history row) to open it.</span></div>
+  </section>
+
+
+
+
+  <section class="card">
+    <h2>Internet test history <span class="spacer"></span><button class="btn ghost admin-only" id="in-clear">Clear</button></h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>When</th><th class="l">Network · Cloudflare</th><th>Download</th><th>Upload</th><th>Idle</th><th>Loaded</th><th class="l">Port</th></tr></thead>
+      <tbody id="in-hist"></tbody>
+    </table></div>
+  </section>
+</main>
+</div>
+
+<div class="layout view" id="v-wake" hidden>
+<aside>
+  <section class="card admin-only">
+    <h2 id="m-title">Add a machine</h2>
+    <form class="form" id="f-mach">
+      <input type="hidden" id="m-id">
+      <div class="row"><label class="f">Name <input type="text" id="m-name" maxlength="32" placeholder="Seat 12"></label>
+        <label class="f">Group <input type="text" id="m-group" maxlength="20" placeholder="Row A"></label></div>
+      <label class="f">MAC address <input type="text" id="m-mac" spellcheck="false" placeholder="aa:bb:cc:dd:ee:ff"></label>
+      <label class="f">IP <span class="sub">Optional: for the up/down light. Without it, the Watchdog's ARP table fills it in.</span><input type="text" id="m-ip" spellcheck="false"></label>
+      <label class="f">Broadcast to <span class="sub">Optional: another subnet's broadcast, e.g. 192.168.2.255 (needs ip directed-broadcast there).</span><input type="text" id="m-bcast" spellcheck="false"></label>
+      <div class="row" style="align-items:center"><button class="btn primary" type="submit" style="flex:none" id="m-go">Add</button>
+        <button class="btn ghost" type="button" id="m-cancel" style="flex:none" hidden>Cancel</button><span id="m-msg"></span></div>
+    </form>
+  </section>
+  <section class="card admin-only">
+    <h2>Import</h2>
+    <form class="form" id="f-imp">
+      <span class="sub">One per line: <code>name, MAC, IP, group</code> (IP and group optional). A CSV export works too.</span>
+      <textarea id="imp-text" rows="5" spellcheck="false" placeholder="Seat 1, 2c:f0:5d:11:22:33, 192.168.1.51, Row A"></textarea>
+      <div class="row" style="align-items:center"><button class="btn" type="submit" style="flex:none">Import</button><span id="imp-msg" class="sub"></span></div>
+    </form>
+  </section>
+  <section class="card admin-only">
+    <h2>Wake any MAC</h2>
+    <form class="row" id="f-adhoc"><input type="text" id="ah-mac" spellcheck="false" placeholder="aa:bb:cc:dd:ee:ff"><button class="btn" type="submit" style="flex:none">Wake</button></form>
+    <span id="ah-msg"></span>
+  </section>
+  <section class="card">
+    <h2>Seen on the network <span class="spacer"></span><span class="sub" id="seen-n"></span></h2>
+    <span class="sub">From ARP the Watchdog hears. Not saved yet.</span>
+    <div class="tablewrap" style="max-height:320px;overflow:auto;margin-top:8px"><table><tbody id="seen"></tbody></table></div>
+  </section>
+</aside>
+<main>
+  <section class="card deck">
+    <h2>Wake-on-LAN <span class="spacer"></span><span class="lamp" id="wk-lamp"></span></h2>
+    <div class="wells">
+      <div class="well" id="wkw-n"><span class="k">Machines</span><div id="wk-n"></div><span class="un">saved</span></div>
+      <div class="well" id="wkw-up"><span class="k">Up now</span><div id="wk-up"></div><span class="un">answer ping</span></div>
+      <div class="well" id="wkw-wake"><span class="k">Waking</span><div id="wk-wake"></div><span class="un" id="wk-wake2">—</span></div>
+      <div class="well" id="wkw-boot"><span class="k">Last boot</span><div id="wk-boot"></div><span class="un">seconds to ping</span></div>
+    </div>
+  </section>
+  <section class="card">
+    <div class="toolbar" style="margin-bottom:12px">
+      <button class="btn primary admin-only" id="wk-all">Wake all</button>
+      <button class="btn admin-only" id="wk-sel" disabled>Wake selected</button>
+      <button class="btn danger admin-only" id="wk-stop" hidden>Stop</button>
+      <span class="keys" id="wk-groups"></span>
+      <span class="spacer"></span>
+      <label class="sub admin-only" style="display:flex;gap:8px;align-items:center">Stagger <input type="number" id="wk-stagger" min="0" max="60" step="0.5" style="width:70px"> s apart</label>
+    </div>
+    <div class="sub admin-only" id="wk-note" style="margin-bottom:10px"></div>
+    <div class="stlist" id="wk-list"></div>
+  </section>
+</main>
+</div>
+
+<div class="layout one view" id="v-stats" hidden>
+<main>
+  <section class="card deck">
+    <h2>System <span class="spacer"></span><span class="lamp" id="st-lamp"></span></h2>
+    <div class="gx"><div class="vus" id="st-meters"></div></div>
+    <div class="wells" id="st-wells" style="margin-top:14px"></div>
+  </section>
+
+  <div class="grid2">
+    <section class="card"><h2>CPU <span class="spacer"></span><span class="sub" id="st-cpusub"></span></h2>
+      <div class="gx" id="st-cores"></div>
+      <dl class="kv" id="st-cpukv" style="margin-top:14px"></dl>
+    </section>
+    <section class="card"><h2>Heat and cooling <span class="spacer"></span><span class="sub" id="st-heatsub"></span></h2>
+      <div class="gx" id="st-temps"></div>
+      <dl class="kv" id="st-heatkv" style="margin-top:14px"></dl>
+      <p class="note" id="st-heatnote"></p>
+    </section>
+  </div>
+
+  <div class="grid2">
+    <section class="card"><h2>Memory <span class="spacer"></span><span class="sub" id="st-memsub"></span></h2>
+      <div class="st-bar" id="st-membar"></div><div class="st-key" id="st-memkey"></div>
+      <dl class="kv" id="st-memkv"></dl>
+      <h3>Swap (page file)</h3>
+      <div id="st-swap"></div>
+    </section>
+    <section class="card"><h2>Storage <span class="spacer"></span><span class="sub" id="st-disksub"></span></h2>
+      <div class="gx" id="st-fs"></div>
+      <dl class="kv" id="st-diskkv" style="margin-top:14px"></dl>
+    </section>
+  </div>
+
+  <section class="card"><h2>Network interfaces</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th class="l">Interface</th><th class="l">State</th><th>Speed</th><th class="l">MAC</th><th>MTU</th><th>Down now</th><th>Up now</th><th>Received</th><th>Sent</th><th>Errors</th><th>Drops</th></tr></thead>
+      <tbody id="st-if"></tbody>
+    </table></div>
+  </section>
+
+  <div class="grid2">
+    <section class="card"><h2>CPU load <span class="spacer"></span><span class="sub">last 10 min</span></h2><div class="legend" id="st-lg-cpu"></div><div class="chart" id="st-c-cpu"></div></section>
+    <section class="card"><h2>Temperature <span class="spacer"></span><span class="sub">last 10 min</span></h2><div class="legend" id="st-lg-temp"></div><div class="chart" id="st-c-temp"></div></section>
+    <section class="card"><h2>Memory in use <span class="spacer"></span><span class="sub">last 10 min</span></h2><div class="legend" id="st-lg-mem"></div><div class="chart" id="st-c-mem"></div></section>
+    <section class="card"><h2>Network <span class="spacer"></span><span class="sub" id="st-netsub">last 10 min</span></h2><div class="legend" id="st-lg-net"></div><div class="chart" id="st-c-net"></div></section>
+    <section class="card"><h2>Flash reads and writes <span class="spacer"></span><span class="sub">last 10 min</span></h2><div class="legend" id="st-lg-disk"></div><div class="chart" id="st-c-disk"></div></section>
+    <section class="card"><h2>Busiest processes <span class="spacer"></span><span class="sub" id="st-procsub"></span></h2>
+      <div class="tablewrap"><table>
+        <thead><tr><th class="l">Process</th><th>PID</th><th>CPU</th><th>Memory</th><th>Threads</th></tr></thead>
+        <tbody id="st-procs"></tbody>
+      </table></div>
+      <p class="note">CPU is a share of one core: 100% means one core flat out, and this board has <span id="st-ncores">4</span>.</p>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>This probe <span class="spacer"></span><span class="row admin-only" style="gap:8px"><a class="btn sm" href="#settings">Settings &amp; power</a></span></h2>
+    <dl class="kv" id="sys"></dl>
+    <dl class="kv" id="st-about" style="margin-top:12px"></dl>
+  </section>
+</main>
+</div>
+
+<div class="layout view" id="v-ts" hidden>
+<aside>
+  <section class="card admin-only">
+    <h2>On / off</h2>
+    <div class="form">
+      <div class="arm-sw" id="tsx-sw">
+        <button class="arm-latch" id="tsx-latch" type="button" aria-label="Slide the safety latch to arm the Tailscale switch"><span class="arm-safe">SAFE</span><span class="arm-arm">ARM</span><span class="arm-knob"></span></button>
+        <button class="arm-korry" id="tsx-korry" type="button" aria-label="Press to switch Tailscale on or off"><span class="arm-face"><span class="k1">ARMED</span><span class="k2" id="tsx-k2">LINK OFF</span></span></button>
+      </div>
+      <span class="sub">Slide to ARM, then press. Off disconnects from the tailnet but stays logged in (like <code>tailscale down</code>); on reconnects without a new login.</span>
+      <label class="chk"><input type="checkbox" id="tsx-svc"><span>Tailscale service running and started at boot<small>Unticked stops tailscaled completely and keeps it off after a reboot.</small></span></label>
+      <div class="row"><button class="btn ghost" id="tsx-login">Log in</button><button class="btn ghost" id="tsx-logout">Log out</button></div>
+      <span id="tsx-msg"></span>
+    </div>
+  </section>
+  <section class="card admin-only">
+    <h2>Add a Headscale server</h2>
+    <form class="form" id="f-hs">
+      <label class="f">Server <span class="sub">Your Headscale's URL. It's saved as its own connection next to your tailnet, so you can switch back and forth.</span>
+        <input type="text" id="hs-url" spellcheck="false" placeholder="https://headscale.example.com"></label>
+      <label class="f">Pre-auth key (optional) <span class="sub">From <code>headscale preauthkeys create</code>. Left empty, a login link shows here instead. Not stored by the page.</span>
+        <input type="password" id="hs-key" autocomplete="off" spellcheck="false"></label>
+      <div class="row" style="align-items:center"><button class="btn primary" type="submit" style="flex:none">Connect</button><span id="hs-msg"></span></div>
+    </form>
+  </section>
+  <section class="card admin-only">
+    <h2>Settings</h2>
+    <form class="form" id="f-ts">
+      <label class="f">Name on the tailnet <span class="sub">The device name, and the start of its MagicDNS name.</span><input type="text" id="tsx-host" spellcheck="false"></label>
+      <label class="chk"><input type="checkbox" id="tsx-dns"><span>Use the tailnet's DNS<small>MagicDNS names and the DNS servers set in the admin console.</small></span></label>
+      <label class="chk"><input type="checkbox" id="tsx-routeall"><span>Accept routes from other devices<small>Reach subnets other subnet routers share.</small></span></label>
+      <label class="f">Share these LAN subnets (subnet router) <span class="sub">So tailnet devices reach PCs and switches on the network the WAN port is plugged into, through the router. Approve them in the Tailscale admin console.</span>
+        <input type="text" id="tsx-routes" spellcheck="false" placeholder="192.168.1.0/24"></label>
+      <button class="btn ghost" type="button" id="tsx-lan" style="align-self:flex-start">Use this LAN</button>
+      <label class="chk"><input type="checkbox" id="tsx-exit"><span>Offer as an exit node<small>Other devices can send all their internet traffic out through this LAN. Needs approving too.</small></span></label>
+      <label class="chk"><input type="checkbox" id="tsx-ssh"><span>Tailscale SSH<small>SSH to the router with tailnet logins, under your tailnet's SSH rules.</small></span></label>
+      <label class="chk"><input type="checkbox" id="tsx-shields"><span>Shields up<small>Block all incoming tailnet connections, this page included.</small></span></label>
+      <label class="chk"><input type="checkbox" id="tsx-auto"><span>Update Tailscale automatically</span></label>
+      <label class="chk"><input type="checkbox" id="tsx-geo"><span>City-level map locations<small>Looks up public IPs (the router's, and devices with a direct connection) at ip-api.com. Off: devices sit at their nearest Tailscale relay city.</small></span></label>
+      <div class="row" style="align-items:center"><button class="btn primary" type="submit" style="flex:none">Save</button><span id="tsx-smsg"></span></div>
+    </form>
+  </section>
+</aside>
+<main>
+  <div class="note" id="ts-locked" hidden>You're a viewer: only admins can change Tailscale.</div>
+  <section class="card tsmap" aria-label="Tailnet map">
+    <div class="tsm-wrap" id="tsm-wrap">
+      <svg id="tsm-svg" viewBox="0 0 975 610" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        <defs>
+          <pattern id="tsm-grid" width="24.375" height="24.4" patternUnits="userSpaceOnUse"><path d="M24.375 0H0V24.4" fill="none" stroke="#0f3346" stroke-width=".6"/></pattern>
+          <radialGradient id="tsm-vig" cx="50%" cy="45%" r="70%"><stop offset="60%" stop-color="#000" stop-opacity="0"/><stop offset="100%" stop-color="#000" stop-opacity=".75"/></radialGradient>
+          <filter id="tsm-glow" x="-5%" y="-5%" width="110%" height="110%"><feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+        <rect width="975" height="610" fill="url(#tsm-grid)"/>
+        <path id="tsm-nation" fill="#071622" stroke="#19c8ff" stroke-width="1.1" stroke-opacity=".85" filter="url(#tsm-glow)"/>
+        <path id="tsm-states" fill="none" stroke="#19c8ff" stroke-width=".45" stroke-opacity=".28"/>
+        <rect width="975" height="610" fill="url(#tsm-vig)"/>
+      </svg>
+      <canvas id="tsm-cv"></canvas>
+      <div class="tsm-hud tl"><b>TAILNET · LIVE TRAFFIC</b><span id="tsm-stat">—</span></div>
+      <div class="tsm-hud tr" id="tsm-clock"></div>
+      <div class="tsm-hud bl"><span><i style="background:#39ff88"></i>direct</span><span><i style="background:#ff3df2"></i>through a relay</span><span><i style="background:#ffb22e"></i>router sends</span><span><i style="background:#21e6ff"></i>router receives</span><span><i class="dm"></i>relay city</span></div>
+      <div class="tsm-hud br" id="tsm-away"></div>
+    </div>
+    <div class="sub tsm-foot" id="tsm-foot"></div>
+  </section>
+  <div class="note crit" id="ts-note" hidden></div>
+  <div class="note" id="ts-health" hidden></div>
+  <section class="card deck">
+    <h2>Tailscale <span class="spacer"></span><span class="lamp" id="ts-lamp"></span></h2>
+    <div class="wells">
+      <div class="well" id="tsw-state"><span class="k">State</span><div class="big-port" id="ts-state">—</div><span class="un" id="ts-state2">—</span></div>
+      <div class="well" id="tsw-ip"><span class="k">Tailscale IP</span><div class="big-port" id="ts-ip" style="font-size:clamp(15px,1.6vw,22px);white-space:nowrap">—</div><span class="un" id="ts-ip2">—</span></div>
+      <div class="well" id="tsw-peers"><span class="k">Devices online</span><div id="ts-peers"></div><span class="un" id="ts-peers2">—</span></div>
+      <div class="well" id="tsw-relay"><span class="k">Home relay</span><div class="big-port" id="ts-relay">—</div><span class="un">nearest DERP server</span></div>
+    </div>
+  </section>
+  <section class="card">
+    <h2>This router on the tailnet <span class="spacer"></span><button class="btn ghost admin-only" id="tsx-cert">Add these names to the HTTPS certificate</button></h2>
+    <dl class="kv" id="ts-kv"></dl><span id="tsx-cmsg"></span>
+  </section>
+  <section class="card">
+    <h2>Connections <span class="spacer"></span><span class="sub">one in use at a time · each keeps its own login</span></h2>
+    <div class="tablewrap"><table><tbody id="ts-prof"></tbody></table></div><span id="ts-pmsg"></span>
+  </section>
+  <section class="card">
+    <h2>Devices <span class="spacer"></span><span class="sub" id="ts-psub"></span></h2>
+    <div class="tablewrap"><table><thead><tr><th class="l">Device</th><th>Tailscale IP</th><th>OS</th><th>Connection</th><th>Last seen</th><th>Traffic</th></tr></thead><tbody id="ts-list"></tbody></table></div>
+  </section>
+</main>
+</div>
+
+</div><!-- .content -->
+</div><!-- .shell -->
+<script>
+'use strict';
+// ---------- Probe Deck's shared helpers ----------
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = { s: [1, 2, 3, 4, 5, 6, 7, 8].map(i => css('--s' + i)), grid: css('--grid'), axis: css('--axis'), muted: css('--muted'), panel: css('--panel'), crit: css('--crit') };
+
+// ---------- formatting ----------
+const sig = x => x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2);
+function splitBps(v) {
+  if (v == null) return ['—', ''];
+  for (const [u, d] of [['Gbps', 1e9], ['Mbps', 1e6], ['Kbps', 1e3]]) if (v >= d * .9995) return [sig(v / d), u];
+  return [String(Math.round(v)), 'bps'];
+}
+const fmtBps = v => splitBps(v).join(' ').trim();
+function axisBps(v) {
+  for (const [u, d] of [['G', 1e9], ['M', 1e6], ['K', 1e3]]) if (v >= d) return parseFloat((v / d).toPrecision(3)) + u;
+  return String(Math.round(v));
+}
+const fmtMs = v => v == null ? '—' : (v >= 10 ? v.toFixed(1) : v.toFixed(2)) + ' ms';
+function fmtDur(s) {
+  if (s == null) return '—';
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${Math.floor(s % 60)}s` : `${Math.round(s)}s`;
+}
+function fmtWhen(ts) {
+  const d = new Date(ts * 1000), now = new Date();
+  const t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return d.toDateString() === now.toDateString() ? t : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + t;
+}
+
+// ---------- seven-segment readout (from iPerf Deck) ----------
+const SEG = { 0: 'abcdef', 1: 'bc', 2: 'abged', 3: 'abgcd', 4: 'fgbc', 5: 'afgcd', 6: 'afgecd', 7: 'abc', 8: 'abcdefg', 9: 'abcdfg', '-': 'g', ' ': '' };
+const SEGP = (() => {
+  const h = 1.6, o = .7;
+  const H = y => `${2 + o},${y} ${2 + o + h},${y - h} ${14 - o - h},${y - h} ${14 - o},${y} ${14 - o - h},${y + h} ${2 + o + h},${y + h}`;
+  const V = (x, y) => `${x},${y + o} ${x + h},${y + o + h} ${x + h},${y + 15 - o - h} ${x},${y + 15 - o} ${x - h},${y + 15 - o - h} ${x - h},${y + o + h}`;
+  return { a: H(2), g: H(17), d: H(32), f: V(2, 2), b: V(14, 2), e: V(2, 17), c: V(14, 17) };
+})();
+function seg7(text, cells) {
+  const glyphs = [];
+  for (const ch of String(text)) ch === '.' && glyphs.length ? glyphs.at(-1).dot = true : glyphs.push({ ch });
+  while (glyphs.length < cells) glyphs.unshift({ ch: ' ' });
+  let x = 0, out = '';
+  for (const g of glyphs) {
+    const on = SEG[g.ch] ?? '';
+    for (const k in SEGP) out += `<polygon class="${on.includes(k) ? 'on' : 'off'}" points="${SEGP[k]}" transform="translate(${x})"/>`;
+    out += `<circle class="${g.dot ? 'on' : 'off'}" cx="${x + 17.8}" cy="32" r="1.5"/>`;
+    x += 21;
+  }
+  return `<svg class="seg7" viewBox="-5 -1 ${x + 5} 36" role="img" aria-label="${esc(String(text).trim())}"><g transform="skewX(-6)">${out}</g></svg>`;
+}
+const setSeg = (id, text, cells) => { const el = $(id), html = seg7(text, cells); if (el._h !== html) { el.innerHTML = html; el._h = html; } };
+
+// ---------- charts ----------
+function niceScale(max, n) {
+  if (!(max > 0)) max = 1;
+  const raw = max / n, p = 10 ** Math.floor(Math.log10(raw)), f = raw / p;
+  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
+  return { step, top: Math.ceil(max / step - 1e-9) * step };
+}
+class Chart {
+  // series: [{name, color, pts: [[x, y|null]]}]; x is seconds (age or elapsed). Nulls break the line and draw a red tick.
+  constructor(id, o) {
+    this.host = $(id); this.o = o; this.series = [];
+    this.cv = document.createElement('canvas'); this.host.append(this.cv); this.ctx = this.cv.getContext('2d');
+    new ResizeObserver(() => this.draw()).observe(this.host);
+  }
+  set(series, xMax) { this.series = series; this.xMax = xMax; this.draw(); }
+  draw() {
+    const w = this.host.clientWidth, h = this.host.clientHeight, dpr = devicePixelRatio || 1, ctx = this.ctx;
+    if (w < 40 || h < 40) return;
+    if (this.cv.width !== Math.round(w * dpr) || this.cv.height !== Math.round(h * dpr)) { this.cv.width = Math.round(w * dpr); this.cv.height = Math.round(h * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    const g = { l: 50, t: 10, pw: w - 66, ph: h - 34 }, xMax = this.xMax || 60;
+    let max = 0;
+    for (const s of this.series) for (const p of s.pts) if (p[1] > max) max = p[1];
+    const sc = niceScale(Math.max(max * 1.08, this.o.minTop || 0), 4), y = v => g.t + g.ph - v / sc.top * g.ph;
+    const x = t => this.o.ago ? g.l + g.pw - t / xMax * g.pw : g.l + t / xMax * g.pw;
+    ctx.font = '11px system-ui, sans-serif'; ctx.fillStyle = C.muted; ctx.lineWidth = 1; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (let v = 0; v <= sc.top + sc.step / 2; v += sc.step) {
+      const yy = Math.round(y(v)) + .5;
+      ctx.strokeStyle = v === 0 ? C.axis : C.grid; ctx.beginPath(); ctx.moveTo(g.l, yy); ctx.lineTo(g.l + g.pw, yy); ctx.stroke();
+      ctx.fillText(this.o.axis(v), g.l - 8, yy);
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const fit = Math.max(2, Math.floor(g.pw / 70)), xs = [1, 2, 5, 10, 15, 30, 60, 120, 300].find(s => xMax / s <= fit) || 600;
+    const lbl = t => t >= 60 && t % 60 === 0 ? t / 60 + 'm' : t >= 60 ? Math.floor(t / 60) + 'm' + (t % 60) + 's' : t + 's';
+    for (let t = 0; t <= xMax + 1e-6; t += xs) ctx.fillText(this.o.ago ? (t ? '-' + lbl(t) : 'now') : lbl(t), x(t), g.t + g.ph + 7);
+    for (const s of this.series) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.beginPath(); let pen = false;
+      for (const p of s.pts) {
+        if (p[0] > xMax || p[0] < 0) { pen = false; continue; }
+        if (p[1] == null) {
+          pen = false;
+          ctx.save(); ctx.strokeStyle = C.crit; ctx.beginPath(); ctx.moveTo(x(p[0]), g.t + g.ph); ctx.lineTo(x(p[0]), g.t + g.ph - 8); ctx.stroke(); ctx.restore();
+          continue;
+        }
+        ctx[pen ? 'lineTo' : 'moveTo'](x(p[0]), y(p[1])); pen = true;
+      }
+      ctx.stroke();
+    }
+  }
+}
+const legend = (id, items) => { const h = items.map(i => `<span><i class="sw" style="background:${i.color}"></i>${esc(i.name)}</span>`).join(''); if ($(id)._h !== h) { $(id).innerHTML = h; $(id)._h = h; } };
+
+// ---------- API ----------
+async function api(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && !path.startsWith('/api/auth/')) { showGate(); throw new Error('Logged out'); }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const lsGet = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+const ago = t => t ? fmtDur(Date.now() / 1000 - t) + ' ago' : '—';
+const setHTML = (id, h) => { const el = $(id); if (el._h !== h) { el.innerHTML = h; el._h = h; } };
+const flash = (el, text, ok) => { el.className = ok ? 'ok-msg' : 'msg'; el.textContent = text; clearTimeout(el._t); el._t = setTimeout(() => { el.textContent = ''; el.className = ''; }, 5000); };
+const shortMac = m => m || '—';
+
+const ifShort = p => (p || '?').replace(/^GigabitEthernet/, 'Gi').replace(/^FastEthernet/, 'Fa').replace(/^TenGigabitEthernet/, 'Te');
+const num3 = v => v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+const gAgo = t => { const s = Math.max(0, Date.now() / 1000 - t); return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} d ago`; };
+const lasted = t => { const s = Math.max(0, Math.floor(Date.now() / 1000 - t)); return s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86400 ? `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min` : `${Math.floor(s / 86400)} d ${Math.floor((s % 86400) / 3600)} h`; };
+const gUptime = s => { if (s == null) return null; const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`; };
+const LEVEL_COLOR = { ok: 'var(--good)', warn: 'var(--warn)', crit: 'var(--crit)' };
+const shortPort = name => (name.match(/(\d+)$/) || [, name.slice(-3)])[1];
+const worst = levels => levels.includes('crit') ? 'crit' : levels.includes('warn') ? 'warn' : 'ok';
+const sty = o => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => `${k}:${v}`).join(';');
+
+// DOM patcher: keeps elements in place between readings, so needles swing instead of jumping
+function morph(el, html) {
+  const t = document.createElement(el.tagName === 'TBODY' ? 'tbody' : 'div');
+  t.innerHTML = html;
+  patchKids(el, t);
+}
+function patchKids(a, b) {
+  const an = [...a.childNodes], bn = [...b.childNodes];
+  bn.forEach((y, i) => { const x = an[i]; if (!x) a.appendChild(y); else patchNode(x, y, a); });
+  for (let i = bn.length; i < an.length; i++) a.removeChild(an[i]);
+}
+function patchNode(x, y, parent) {
+  if (x.nodeType !== y.nodeType || x.nodeName !== y.nodeName) { parent.replaceChild(y, x); return; }
+  if (x.nodeType !== 1) { if (x.nodeValue !== y.nodeValue) x.nodeValue = y.nodeValue; return; }
+  for (const at of [...x.attributes]) if (!y.hasAttribute(at.name)) x.removeAttribute(at.name);
+  for (const at of [...y.attributes]) if (x.getAttribute(at.name) !== at.value) x.setAttribute(at.name, at.value);
+  patchKids(x, y);
+}
+
+// seven-segment readout with ":" and coloured by --c
+function gSeg(text, cells = 0, color, height) {
+  const g = [];
+  for (const ch of String(text)) ch === '.' && g.length ? g[g.length - 1].dot = true : g.push({ ch, dot: false });
+  while (g.length < cells) g.unshift({ ch: ' ', dot: false });
+  let x = 0, out = '';
+  for (const c of g) {
+    if (c.ch === ':') { out += `<circle class="on" cx="${x + 2}" cy="11" r="1.7"/><circle class="on" cx="${x + 2}" cy="24" r="1.7"/>`; x += 8; continue; }
+    const lit = SEG[c.ch] ?? '';
+    for (const k in SEGP) out += `<polygon class="${lit.includes(k) ? 'on' : 'off'}" points="${SEGP[k]}" transform="translate(${x})"/>`;
+    out += `<circle class="${c.dot ? 'on' : 'off'}" cx="${x + 17.8}" cy="32" r="1.5"/>`;
+    x += 21;
+  }
+  return `<svg class="seg7" viewBox="-5 -1 ${x + 5} 36" role="img" aria-label="${esc(String(text).trim())}" style="${sty({ '--c': color, height: height ? height + 'px' : null })}"><g transform="skewX(-6)">${out}</g></svg>`;
+}
+const gLeds = (value, count = 30, { thin, color } = {}) => {
+  const lit = Math.round(Math.max(0, Math.min(1, value || 0)) * count);
+  return `<div class="leds${thin ? ' thin' : ''}" style="${sty({ '--c': color })}" aria-hidden="true">${Array.from({ length: count }, (_, i) => `<i${i < lit ? ' class="on"' : ''}></i>`).join('')}</div>`;
+};
+// analog panel meter (Perf-Deck's): log scales by tens; warn/crit light the top of the scale
+function gNeedle({ title, value, max, readout, unit, warn, crit, color = 'var(--good)', peak, cells = 4, log, under = '' }) {
+  const at = v => log ? Math.log10(1 + Math.max(0, v)) / Math.log10(1 + max) : v / max;
+  const valueAt = f => log ? 10 ** (f * Math.log10(1 + max)) - 1 : max * f;
+  const cx = 100, cy = 118, R = 84, A = 46;
+  const deg = f => -A + 2 * A * Math.max(0, Math.min(1, f));
+  const pt = (r, f) => { const a = (deg(f) - 90) * Math.PI / 180; return [cx + r * Math.cos(a), cy + r * Math.sin(a)].map(v => v.toFixed(2)); };
+  const arc = (r, f0, f1) => `M${pt(r, f0).join(' ')}A${r} ${r} 0 0 1 ${pt(r, f1).join(' ')}`;
+  let ticks = '';
+  for (let i = 0; i <= 20; i++) { const a = pt(R, i / 20), b = pt(R - (i % 5 ? 5 : i % 10 ? 8 : 11), i / 20); ticks += `<line class="tk${i % 5 ? '' : ' maj'}" x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}"/>`; }
+  const fmt = v => v >= 1000 ? `${Math.round(v / 100) / 10}k` : String(Math.round(v));
+  const labels = [0, .5, 1].map(f => { const [x, y] = pt(R + 13, f); return `<text class="vl" x="${x}" y="${y}" text-anchor="middle" dominant-baseline="middle">${fmt(valueAt(f))}</text>`; }).join('');
+  const off = value == null, f = off ? 0 : at(value);
+  return `<div class="vu${off ? ' off' : ''}" style="--c:${color}" role="meter" aria-label="${esc(title)}"><div class="face"><svg class="vf" viewBox="0 0 200 128" aria-hidden="true">
+    <path class="arc" d="${arc(R, 0, 1)}"/>${warn !== undefined ? `<path class="band warn" d="${arc(R + 3.5, at(warn), at(crit ?? max))}"/>` : ''}${crit !== undefined ? `<path class="band crit" d="${arc(R + 3.5, at(crit), 1)}"/>` : ''}
+    ${ticks}${labels}<text class="vn" x="100" y="92" text-anchor="middle">${esc(unit.toUpperCase())}</text>
+    <g class="pkd" style="transform:rotate(${deg(at(peak ?? 0))}deg);opacity:${peak ? 1 : 0}"><circle cx="100" cy="${cy - R + 17}" r="2.4"/></g>
+    <g class="ndl" style="transform:rotate(${off ? -A - 6 : deg(f)}deg)"><line x1="100" y1="${cy + 4}" x2="100" y2="${cy - R + 3}"/></g>
+    <circle class="hub" cx="100" cy="${cy}" r="10"/></svg></div>
+    <div class="foot"><span class="k">${esc(title)}</span>${gSeg(readout, cells, off ? undefined : color)}</div>${under ? `<div class="underfoot">${under}</div>` : ''}</div>`;
+}
+// backlit VU meter for the busiest ports
+const pct = n => Math.max(0, Math.min(1, (n ?? 0) / 100));
+const gauge = (label, value, text, level) => { const color = LEVEL_COLOR[level || 'ok']; return `<div class="gauge"><span class="k">${label}</span>${gLeds(value, 20, { thin: true, color })}<span class="gv" style="color:${color}">${esc(text)}</span></div>`; };
+
+// ---------- the router's glue: login, views, state ----------
+let S = null, ME = null, timer = 0;
+const isAdmin = () => !!ME && ME.role === 'admin';
+const showGate = () => { location.href = '/'; };   // the phone page has the login
+const PAGES = {};
+const VIEWS = ['mtr', 'hosts', 'mdns', 'mcast', 'cache', 'speed', 'wake', 'stats', 'ts'];
+let view = 'stats';
+lsSet('pd-speed-src', 'inet');
+function showView() {
+  const v = location.hash.slice(1);
+  view = VIEWS.includes(v) ? v : 'stats';
+  for (const n of VIEWS) $('#v-' + n).hidden = n !== view;
+  for (const a of document.querySelectorAll('.side .items a')) a.classList.toggle('on', a.dataset.view === view);
+  for (const m of document.querySelectorAll('.side .mod')) m.classList.toggle('has-on', !!m.querySelector('a.on'));
+  navOpen(false);
+  if (view === 'ts') tsRefresh();
+  if (view === 'wake') poll();
+  if (PAGES[view] && ME) PAGES[view].show();
+}
+addEventListener('hashchange', showView);
+function navOpen(open) { document.body.classList.toggle('navopen', open); $('#b-nav').setAttribute('aria-expanded', String(open)); }
+$('#b-nav').addEventListener('click', () => navOpen(!document.body.classList.contains('navopen')));
+$('#scrim').addEventListener('click', () => navOpen(false));
+let navClosed;
+try { navClosed = new Set(JSON.parse(lsGet('pcc-deck-nav-closed', '[]'))); } catch { navClosed = new Set(); }
+for (const m of document.querySelectorAll('.side .mod')) {
+  const btn = m.querySelector('button'), id = m.dataset.mod;
+  const set = closed => { m.classList.toggle('closed', closed); btn.setAttribute('aria-expanded', String(!closed)); };
+  set(navClosed.has(id));
+  btn.addEventListener('click', () => { const c = !m.classList.contains('closed'); set(c); c ? navClosed.add(id) : navClosed.delete(id); lsSet('pcc-deck-nav-closed', JSON.stringify([...navClosed])); });
+}
+{ const hdr = $('header.top'); new ResizeObserver(() => document.documentElement.style.setProperty('--hdr', hdr.offsetHeight + 'px')).observe(hdr); }
+function navLamps() {
+  for (const m of document.querySelectorAll('.side .mod')) {
+    let worst = 0;
+    for (const a of m.querySelectorAll('.items a')) {
+      const d = a.querySelector('.dot').classList;
+      worst = Math.max(worst, d.contains('err') ? 3 : d.contains('warn') ? 2 : d.contains('on') ? 1 : 0);
+    }
+    m.querySelector('[data-lamp]').className = 'dot ' + ['', 'on', 'warn', 'err'][worst];
+  }
+}
+async function poll() {
+  clearTimeout(timer);
+  try {
+    const r = await fetch('/api/deck/state', { cache: 'no-store' });
+    if (r.status === 401) return showGate();
+    S = await r.json();
+    $('#offline').hidden = true;
+    $('#h-dot').className = 'dot ' + (S.link && S.link.up ? 'on' : 'err');
+    $('#h-name').textContent = `${S.name} · ${S.ip || 'no address'} · ${S.mode === 'ap' ? 'Access point' : 'Router'}`;
+    const t = S.temp;
+    $('#h-temp').innerHTML = `<span class="dot ${t == null ? '' : t >= 85 ? 'err' : t >= 75 ? 'warn' : 'on'}"></span>${t == null ? '—' : t.toFixed(0)} °C`;
+    $('#sj-ver').textContent = `${S.name} · Deck from Probe Deck 54f3e90`;
+    for (const [k, a] of Object.entries(S.apps || {})) {
+      const d = $('#t-' + k), b = $('#tb-' + k);
+      if (d) d.className = 'dot ' + ((a && a.dot) || '');
+      if (b) { b.hidden = !(a && a.badge); b.textContent = (a && a.badge) || ''; }
+    }
+    navLamps();
+    if (view === 'wake') renderWake();
+  } catch { $('#offline').hidden = false; }
+  timer = setTimeout(poll, view === 'wake' ? 2000 : 5000);
+}
+async function boot() {
+  let a;
+  try { a = await (await fetch('/api/auth/me', { cache: 'no-store' })).json(); } catch { return setTimeout(boot, 3000); }
+  if (!a.user) return showGate();
+  ME = a.user;
+  document.body.classList.toggle('ro', ME.role !== 'admin');
+  $('#h-uname').textContent = ME.name; $('#h-role').textContent = ME.role; $('#h-role').className = 'role ' + ME.role;
+  document.body.classList.remove('gated');
+  showView(); poll();
+}
+$('#b-logout').onclick = async () => { await api('/api/auth/logout').catch(() => {}); showGate(); };
+
+// ---------- Wake (Probe Deck's) ----------
+// ---------- wake ----------
+const selected = new Set();
+let wkGroup = null;
+function renderWake() {
+  const w = S.wol;
+  if (!w || view !== 'wake') return;
+  const hosts = w.hosts, up = hosts.filter(h => h.up).length, waking = hosts.filter(h => h.waking && h.waking.up_in == null && !h.up);
+  setSeg('#wk-n', hosts.length, 3); $('#wkw-n').classList.toggle('off', !hosts.length);
+  setSeg('#wk-up', up, 3); $('#wkw-up').classList.toggle('off', !up);
+  setSeg('#wk-wake', waking.length, 3); $('#wkw-wake').classList.toggle('off', !waking.length);
+  $('#wk-wake2').textContent = waking.length ? 'waiting for ping' : 'none';
+  const boots = hosts.filter(h => h.waking && h.waking.up_in != null).sort((a, b) => a.waking.ago - b.waking.ago);
+  setSeg('#wk-boot', boots.length ? boots[0].waking.up_in : '---', 3); $('#wkw-boot').classList.toggle('off', !boots.length);
+  const job = w.job, running = job && !job.done_at;
+  $('#wk-lamp').innerHTML = running ? `<span class="dot live"></span>waking ${job.done} of ${job.total}` : `<span class="dot ${up ? 'on' : ''}"></span>${up} of ${hosts.length} up`;
+  $('#wk-stop').hidden = !running;
+  $('#wk-all').disabled = running || !hosts.length;
+  const groups = [...new Set(hosts.map(h => h.group).filter(Boolean))].sort();
+  if (wkGroup && !groups.includes(wkGroup)) wkGroup = null;
+  setHTML('#wk-groups', groups.length ? ['<span class="sub">Group</span>', `<button class="key${wkGroup ? '' : ' sel'}" data-g="">All</button>`, ...groups.map(g => `<button class="key${g === wkGroup ? ' sel' : ''}" data-g="${esc(g)}">${esc(g)}</button>`)].join('') : '');
+  const shown = hosts.filter(h => !wkGroup || h.group === wkGroup);
+  $('#wk-all').textContent = wkGroup ? `Wake ${wkGroup}` : 'Wake all';
+  for (const id of [...selected]) if (!hosts.some(h => h.id === id)) selected.delete(id);
+  $('#wk-sel').disabled = running || !selected.size;
+  $('#wk-sel').textContent = selected.size ? `Wake selected (${selected.size})` : 'Wake selected';
+  const n = wkGroup ? shown.length : hosts.length;
+  $('#wk-note').textContent = running ? `One magic packet every ${job.stagger} s, so the machines don't all draw power at once.`
+    : n > 1 ? `Wakes ${n} machines ${w.stagger} s apart: about ${fmtDur(Math.max(0, n - 1) * w.stagger)}.` : '';
+  if (document.activeElement !== $('#wk-stagger')) $('#wk-stagger').value = w.stagger;
+  setHTML('#wk-list', shown.map(h => {
+    const wk = h.waking, wakingNow = wk && wk.up_in == null && !h.up;
+    const state = wakingNow ? 'waking' : h.up ? 'ready' : h.up === false ? 'off' : '';
+    const word = wakingNow ? `waking · ${wk.ago} s` : h.up ? (wk && wk.up_in != null ? `up · booted in ${wk.up_in} s` : 'up') : h.up === false ? 'down' : h.cur_ip ? 'checking' : 'no IP yet';
+    return `<div class="mrow"><input type="checkbox" class="admin-only" data-sel="${h.id}"${selected.has(h.id) ? ' checked' : ''} aria-label="Select ${esc(h.name)}">
+      <span class="sled ${state}"></span>
+      <div class="who"><b>${esc(h.name)}</b><span class="k">${esc(word)}</span></div>
+      <span class="k grp">${esc(h.group || '')}</span>
+      <span class="k macc mono">${esc(h.mac)}</span>
+      <div class="ipc mono" style="font-size:12.5px;overflow:hidden;text-overflow:ellipsis">${esc(h.cur_ip || '—')}${h.learned ? '<small class="sub" style="display:block">from ARP</small>' : ''}</div>
+      <div class="num ping">${h.ms != null ? (h.ms < 10 ? h.ms.toFixed(2) : h.ms.toFixed(0)) : '—'}<small>ms</small></div>
+      <div class="keys"><a class="key ro-ok" href="#trace?q=${encodeURIComponent(h.mac)}" title="Find the switch port" style="text-decoration:none">Trace</a><span class="keys admin-only"><button class="key" data-wake="${h.id}"${running ? ' disabled' : ''}>Wake</button><button class="key" data-edit="${h.id}">Edit</button><button class="key" data-del="${h.id}" title="Delete">✕</button></span></div></div>`;
+  }).join('') || '<div class="empty">No machines saved. Add one on the left, import a list, or pick from "Seen on the network".</div>');
+  $('#seen-n').textContent = w.seen.length ? w.seen.length : '';
+  setHTML('#seen', w.seen.map(x => `<tr><td class="mono">${esc(x.mac)}</td><td class="l mono">${esc(x.ip)}</td><td><button class="btn ghost" data-add="${esc(x.mac)}" data-ip="${esc(x.ip)}">Add</button></td></tr>`).join('')
+    || `<tr><td class="sub">${S.watch && S.watch.listening ? 'Nothing new heard yet.' : 'Turn on the Watchdog to fill this in.'}</td></tr>`);
+}
+function editMachine(h) {
+  $('#m-id').value = h ? h.id : ''; $('#m-name').value = h ? h.name : ''; $('#m-mac').value = h ? h.mac : ''; $('#m-ip').value = h ? h.ip || '' : '';
+  $('#m-group').value = h ? h.group || '' : ''; $('#m-bcast').value = h ? h.bcast || '' : '';
+  $('#m-title').textContent = h ? 'Edit machine' : 'Add a machine'; $('#m-go').textContent = h ? 'Save' : 'Add'; $('#m-cancel').hidden = !h;
+}
+$('#wk-list').onclick = async e => {
+  const t = e.target.closest('[data-wake],[data-edit],[data-del]');
+  if (!t) return;
+  const h = S.wol.hosts.find(x => x.id === (t.dataset.wake || t.dataset.edit || t.dataset.del));
+  if (!h) return;
+  if (t.dataset.edit) { editMachine(h); $('#m-name').focus(); return; }
+  if (t.dataset.del) { if (confirm(`Delete ${h.name}?`)) { await api('/api/wol/delete', { id: h.id }).catch(err => alert(err.message)); selected.delete(h.id); } return poll(); }
+  await api('/api/wol/wake', { ids: [h.id] }).catch(err => alert(err.message));
+  poll();
+};
+$('#wk-list').onchange = e => { const c = e.target.closest('[data-sel]'); if (c) { c.checked ? selected.add(c.dataset.sel) : selected.delete(c.dataset.sel); renderWake(); } };
+$('#wk-groups').onclick = e => { const b = e.target.closest('[data-g]'); if (b) { wkGroup = b.dataset.g || null; renderWake(); } };
+$('#wk-all').onclick = async () => {
+  const ids = wkGroup ? S.wol.hosts.filter(h => h.group === wkGroup).map(h => h.id) : null;
+  await api('/api/wol/wake', ids ? { ids } : {}).catch(err => alert(err.message));
+  poll();
+};
+$('#wk-sel').onclick = async () => { await api('/api/wol/wake', { ids: [...selected] }).catch(err => alert(err.message)); selected.clear(); poll(); };
+$('#wk-stop').onclick = () => api('/api/wol/stop').then(poll);
+$('#wk-stagger').onchange = () => api('/api/settings', { wol_stagger: +$('#wk-stagger').value }).catch(err => alert(err.message)).then(poll);
+$('#f-mach').onsubmit = async e => {
+  e.preventDefault();
+  try {
+    await api('/api/wol/save', { id: $('#m-id').value, name: $('#m-name').value, mac: $('#m-mac').value, ip: $('#m-ip').value, group: $('#m-group').value, bcast: $('#m-bcast').value });
+    flash($('#m-msg'), $('#m-id').value ? 'Saved' : 'Added', true); editMachine(null);
+  } catch (err) { flash($('#m-msg'), err.message); }
+  poll();
+};
+$('#m-cancel').onclick = () => editMachine(null);
+$('#f-imp').onsubmit = async e => {
+  e.preventDefault();
+  try { const r = await api('/api/wol/import', { text: $('#imp-text').value }); $('#imp-msg').textContent = `Added or updated ${r.added}.` + (r.errors.length ? ' ' + r.errors.join('; ') : ''); if (!r.errors.length) $('#imp-text').value = ''; }
+  catch (err) { $('#imp-msg').textContent = err.message; }
+  poll();
+};
+$('#f-adhoc').onsubmit = async e => {
+  e.preventDefault();
+  try { await api('/api/wol/wake', { mac: $('#ah-mac').value }); flash($('#ah-msg'), 'Magic packet sent', true); } catch (err) { flash($('#ah-msg'), err.message); }
+};
+$('#seen').onclick = e => { const b = e.target.closest('[data-add]'); if (b) { editMachine(null); $('#m-mac').value = b.dataset.add; $('#m-ip').value = b.dataset.ip; $('#m-name').focus(); } };
+
+
+
+// ---------- Tailscale and its map (Probe Deck's) ----------
+// ---------- Tailscale ----------
+let TS = null;
+async function tsRefresh() {
+  try { const r = await fetch('/api/tailscale', { cache: 'no-store' }); if (r.status === 401) return showGate(); TS = await r.json(); } catch { return; }
+  renderTS(); tsmUpdate();
+}
+setInterval(() => { if (ME && view === 'ts') tsRefresh(); }, 2000);
+setInterval(() => { if (ME && view !== 'ts') tsRefresh(); }, 60000);
+const fmtB = v => v >= 1e9 ? (v / 1e9).toFixed(1) + ' GB' : v >= 1e6 ? (v / 1e6).toFixed(1) + ' MB' : v >= 1e3 ? (v / 1e3).toFixed(0) + ' kB' : v + ' B';
+function renderTS() {
+  const t = TS;
+  if (!t) return;
+  const svc = t.service || {}, run = t.state === 'Running', pr = t.prefs || {};
+  $('#t-ts').className = 'dot ' + (run ? 'on' : t.state === 'NeedsLogin' ? 'warn' : '');
+  if (view !== 'ts') return;
+  const locked = ME && ME.role !== 'admin';
+  $('#ts-locked').hidden = !locked;
+  const label = !t.installed ? 'NOT INSTALLED' : !svc.active ? 'SERVICE OFF' : t.error ? 'NO ANSWER' : run ? 'ON' : t.state === 'Stopped' ? 'OFF' : t.state === 'NeedsLogin' ? 'LOG IN' : t.state === 'NeedsMachineAuth' ? 'NEEDS APPROVAL' : (t.state || '—').toUpperCase();
+  $('#ts-state').textContent = label;
+  $('#ts-state2').textContent = t.version ? 'Tailscale ' + t.version : svc.state || '—';
+  $('#tsw-state').classList.toggle('alarm', t.installed && !run);
+  $('#ts-lamp').innerHTML = run ? `<span class="dot on"></span>connected${t.tailnet ? ' · ' + esc(t.tailnet) : ''}` : `<span class="dot ${t.state === 'Stopped' ? '' : 'err'}"></span>${esc(t.error || 'not connected')}`;
+  const v4 = (t.ips || []).find(i => i.includes('.'));
+  $('#ts-ip').textContent = run && v4 ? v4 : '—'; $('#ts-ip2').textContent = run && t.dns ? t.dns.split('.')[0] : '—';
+  $('#tsw-ip').classList.toggle('off', !run);
+  const peers = t.peers || [], on = peers.filter(p => p.online).length;
+  setSeg('#ts-peers', run ? on : '----', 3); $('#ts-peers2').textContent = run ? `of ${peers.length} on the tailnet` : '—';
+  $('#tsw-peers').classList.toggle('off', !run);
+  $('#ts-relay').textContent = run && t.relay ? t.relay.toUpperCase() : '—'; $('#tsw-relay').classList.toggle('off', !run);
+  let note = '';
+  if (!t.installed) note = 'Tailscale isn’t installed on the router. Over SSH: <code>curl -fsSL https://tailscale.com/install.sh | sh</code>';
+  else if (t.auth_url) note = `Log in to finish: <a href="${esc(t.auth_url)}" target="_blank" rel="noopener">${esc(t.auth_url)}</a>`;
+  else if (t.state === 'NeedsLogin') note = 'Logged out. Press Log in, then open the link that shows here.';
+  else if (t.state === 'NeedsMachineAuth') note = 'Waiting for an admin to approve this device in the Tailscale admin console.';
+  else if ((pr.routes || []).length && !pr.routes.every(r => (t.approved || []).includes(r))) note = 'Subnet routes are shared but not approved yet: approve them under Machines → this router → Edit route settings in the Tailscale admin console.';
+  $('#ts-note').hidden = !note; $('#ts-note').innerHTML = note;
+  const hl = (t.health || []).map(h => 'Tailscale says: ' + esc(h)).join('<br>');
+  $('#ts-health').hidden = !hl; $('#ts-health').innerHTML = hl;
+  setHTML('#ts-kv', run ? [['MagicDNS name', t.dns], ['Addresses', (t.ips || []).join(', ')], ['Tailnet', t.tailnet], ['Open this page', t.dns ? `https://${t.dns}/` : null],
+    ['Subnets shared', (pr.routes || []).join(', ') || 'none'], ['Exit node', pr.exit_node ? 'offered' : 'no'], ['Tailscale SSH', pr.run_ssh ? 'on' : 'off'],
+    ['Networking', 'userspace (PorkChopCheck’s own Tailscale)']].map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v || '')}">${esc(v || '—')}</dd></div>`).join('')
+    : '<div><dd class="sub">Not connected.</dd></div>');
+  $('#tsx-cert').hidden = !run;
+  const host = u => { try { return new URL(u).host; } catch { return u; } };
+  setHTML('#ts-prof', (t.profiles || []).map(p => `<tr><td class="l"><span class="dot ${p.current ? (run ? 'on' : 'warn') : ''}"></span> <b>${esc(p.name || (p.pending ? 'Waiting for login' : '(not logged in yet)'))}</b>
+    ${p.headscale ? `<span class="chip">Headscale</span>` : '<span class="chip ok">Tailscale</span>'}${p.current ? ' <span class="chip ok">in use</span>' : ''}
+    <div class="sub mono">${esc(host(p.control))}${p.user && p.user !== p.name ? ' · ' + esc(p.user) : ''}${p.dns ? ' · ' + esc(p.dns) : ''}</div></td>
+    <td class="admin-only" style="white-space:nowrap">${p.current || !p.id ? '' : `<button class="btn ghost" data-tsswitch="${esc(p.id)}">Switch to</button> <button class="btn ghost" data-tsrm="${esc(p.id)}" data-name="${esc(p.name || host(p.control))}">Remove</button>`}</td></tr>`).join('')
+    || '<tr><td class="sub">No connections yet. Log in, or add a Headscale server.</td></tr>');
+  $('#ts-psub').textContent = run ? `${on} online` : '';
+  setHTML('#ts-list', run ? peers.map(p => `<tr class="${p.online ? '' : 'dim'}"><td class="l"><span class="dot ${p.online ? 'on' : ''}"></span> <b>${esc(p.name)}</b>${p.exit ? ' <span class="chip">exit node</span>' : ''}<div class="sub mono">${esc(p.dns)}</div></td>
+    <td class="mono">${esc(p.ip || '')}</td><td>${esc(p.os || '')}</td><td>${p.online ? (p.direct ? `direct <span class="sub mono">${esc(p.direct)}</span>` : p.active ? 'relay ' + esc(p.relay) : 'idle') : '—'}</td>
+    <td>${p.online ? 'now' : p.last_seen && !p.last_seen.startsWith('0001') ? esc(fmtWhen(Date.parse(p.last_seen) / 1000)) : '—'}</td><td class="sub">${p.rx || p.tx ? `↓ ${fmtB(p.rx)} · ↑ ${fmtB(p.tx)}` : ''}</td></tr>`).join('')
+    || '<tr><td class="sub" colspan="6">No other devices.</td></tr>' : '<tr><td class="sub" colspan="6">Not connected.</td></tr>');
+  for (const el of document.querySelectorAll('#v-ts aside button, #v-ts aside input')) el.disabled = locked || (!svc.active && el.id !== 'tsx-svc');
+  $('#tsx-svc').checked = !!(svc.active && svc.enabled);
+  tsSwitch(run, t.state);
+  $('#tsx-logout').disabled ||= !run && t.state !== 'Stopped'; $('#tsx-login').disabled ||= run;
+  if (!$('#f-ts')._filled && t.prefs) {
+    $('#tsx-host').value = pr.hostname || ''; $('#tsx-dns').checked = !!pr.corp_dns; $('#tsx-routeall').checked = !!pr.route_all;
+    $('#tsx-routes').value = (pr.routes || []).join(', '); $('#tsx-exit').checked = !!pr.exit_node; $('#tsx-ssh').checked = !!pr.run_ssh;
+    $('#tsx-shields').checked = !!pr.shields_up; $('#tsx-auto').checked = !!pr.auto_update; $('#tsx-geo').checked = !!t.geoip; $('#f-ts')._filled = true;
+  }
+}
+const viaTailnet = () => TS && TS.client_tailnet && !confirm('You are on this page through Tailscale. This cuts your connection to it. Go ahead?');
+async function tsDo(body, msg, el = '#tsx-msg') {
+  let ok = true;
+  try { await api('/api/tailscale', body); flash($(el), msg, true); } catch (err) { flash($(el), err.message); ok = false; }
+  setTimeout(tsRefresh, 600); setTimeout(tsRefresh, 2500);
+  return ok;
+}
+// the guarded on/off switch: slide the latch to arm, then press; it disarms by itself after 8 s
+const TSW = { timer: 0, busy: 0, want: null };
+function tsArm(on) {
+  clearTimeout(TSW.timer);
+  $('#tsx-sw').classList.toggle('armed', on);
+  if (on) TSW.timer = setTimeout(() => tsArm(false), 8000);
+}
+function tsSwitch(run, state) {
+  const sw = $('#tsx-sw');
+  if (TSW.want != null && (run === TSW.want || Date.now() - TSW.busy > 15000)) TSW.want = null;
+  sw.classList.toggle('on', run); sw.classList.toggle('busy', TSW.want != null);
+  $('#tsx-k2').textContent = TSW.want != null ? (TSW.want ? 'LINKING' : 'DROPPING') : run ? 'LINK ON' : state === 'NeedsLogin' ? 'LOG IN' : 'LINK OFF';
+  if ($('#tsx-latch').disabled) tsArm(false);
+}
+$('#tsx-latch').onclick = () => tsArm(!$('#tsx-sw').classList.contains('armed'));
+$('#tsx-korry').onclick = () => {
+  if (!$('#tsx-sw').classList.contains('armed') || TSW.want != null || !TS) return;
+  const on = TS.state !== 'Running';
+  if (!on && viaTailnet()) return;
+  tsArm(false); TSW.want = on; TSW.busy = Date.now(); tsSwitch(!on, TS.state);
+  tsDo({ action: on ? 'up' : 'down' }, on ? 'Turning on…' : 'Turned off').then(ok => { if (!ok) { TSW.want = null; tsSwitch(!on, TS.state); } });
+};
+$('#tsx-login').onclick = () => tsDo({ action: 'login' }, 'The login link shows at the top in a moment');
+$('#tsx-logout').onclick = () => { if (!viaTailnet() && confirm('Log the router out of the tailnet? It needs a new login (a link) to come back.')) tsDo({ action: 'logout' }, 'Logged out'); };
+$('#tsx-svc').onchange = e => {
+  const on = e.target.checked;
+  if (!on && (viaTailnet() || !confirm('Stop the Tailscale service, and keep it off after reboots?'))) { e.target.checked = true; return; }
+  tsDo({ action: 'service', on }, on ? 'Service started' : 'Service stopped');
+};
+$('#ts-prof').onclick = e => {
+  const sw = e.target.closest('[data-tsswitch]'), rm = e.target.closest('[data-tsrm]');
+  if (sw && !viaTailnet()) tsDo({ action: 'switch', id: sw.dataset.tsswitch }, 'Switching…', '#ts-pmsg');
+  if (rm && confirm(`Remove the saved connection ${rm.dataset.name}? Coming back to it needs a new login.`)) tsDo({ action: 'remove', id: rm.dataset.tsrm }, 'Removed', '#ts-pmsg');
+};
+$('#f-hs').onsubmit = async e => {
+  e.preventDefault();
+  if (viaTailnet()) return;
+  const key = $('#hs-key').value;
+  await tsDo({ action: 'add_server', url: $('#hs-url').value, key }, key ? 'Connecting with the key…' : 'The login link shows at the top in a moment', '#hs-msg');
+  $('#hs-key').value = ''; $('#f-ts')._filled = false;
+};
+$('#tsx-lan').onclick = () => { if (TS && TS.lan) $('#tsx-routes').value = TS.lan; };
+$('#tsx-cert').onclick = () => { if (confirm('Make a new self-signed certificate that also covers the Tailscale name and IP? Browsers warn again until you trust the new one.')) tsDo({ action: 'cert' }, 'New certificate in use. Reload the page and accept it.', '#tsx-cmsg'); };
+$('#f-ts').onsubmit = async e => {
+  e.preventDefault();
+  if ($('#tsx-shields').checked && !TS.prefs.shields_up && viaTailnet()) return;
+  await tsDo({ action: 'settings', hostname: $('#tsx-host').value, corp_dns: $('#tsx-dns').checked, route_all: $('#tsx-routeall').checked, routes: $('#tsx-routes').value,
+    exit_node: $('#tsx-exit').checked, run_ssh: $('#tsx-ssh').checked, shields_up: $('#tsx-shields').checked, auto_update: $('#tsx-auto').checked, geoip: $('#tsx-geo').checked }, 'Saved', '#tsx-smsg');
+  $('#f-ts')._filled = false;
+};
+
+// ---------- Tailscale map: devices at their relay city (or looked-up city), arcs to the probe, a pulse per burst of traffic ----------
+const usProj = (() => {   // d3's Albers USA (lower 48 part), the projection the map outline was drawn with
+  const R = Math.PI / 180, y0 = 29.5 * R, y1 = 45.5 * R, s0 = Math.sin(y0), n = (s0 + Math.sin(y1)) / 2, c = 1 + s0 * (2 * n - s0), r0 = Math.sqrt(c) / n;
+  const raw = (l, p) => { const r = Math.sqrt(c - 2 * n * Math.sin(p)) / n; return [r * Math.sin(l * n), r0 - r * Math.cos(l * n)]; };
+  const k = 1300, ctr = raw(-0.6 * R, 38.7 * R);
+  return (lon, lat) => {
+    if (lat < 30 && lon < -150) return [266.92 + (lon + 157.86) * 9, 549.12 - (lat - 21.31) * 9];   // Hawaii inset
+    if (lat > 50 && lon < -128) return [112.29 + (lon + 149.9) * 3.2, 544.42 - (lat - 61.2) * 5.5]; // Alaska inset
+    const [x, y] = raw((lon + 96) * R, lat * R); const p = [487.5 + k * (x - ctr[0]), 305 - k * (y - ctr[1])];
+    return p[0] < -10 || p[0] > 985 || p[1] < -10 || p[1] > 620 || lat < 15 || lon > -50 ? null : p;
+  };
+})();
+const TSM = { prev: {}, pulses: [], last: {}, nodes: [], relays: {}, probe: null, map: false, raf: 0, cv: null, scale: 1 };
+const tsmHash = s => { let h = 2166136261; for (const ch of String(s)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619); return (h >>> 0) / 4294967296; };
+async function tsmLoad() {
+  if (TSM.map) return; TSM.map = true;
+  try { const m = await (await fetch('/vendor/us-map.json')).json(); $('#tsm-nation').setAttribute('d', m.nation); $('#tsm-states').setAttribute('d', m.states); } catch { TSM.map = false; }
+}
+function tsmUpdate() {
+  const t = TS;
+  if (!t || view !== 'ts') return;
+  tsmLoad();
+  const run = t.state === 'Running', now = performance.now();
+  const where = (geo, home) => geo && geo.lat != null ? { p: usProj(geo.lon, geo.lat), city: geo.city + (geo.region ? ', ' + geo.region : ''), exact: true }
+    : home && home.lat != null ? { p: usProj(home.lon, home.lat), city: home.name, exact: false } : { p: null, city: home ? home.name : null };
+  const me = where(t.geo, t.home);
+  TSM.probe = run && me.p ? { x: me.p[0], y: me.p[1], name: (t.dns || 'probe').split('.')[0], city: me.city } : null;
+  const groups = {}, away = [], relays = {};
+  const peers = run ? (t.peers || []) : [];
+  for (const p of peers) {
+    const w = where(p.geo, p.home);
+    if (p.home && p.home.lat != null) { const rp = usProj(p.home.lon, p.home.lat); if (rp) relays[p.home.code] = { x: rp[0], y: rp[1], code: p.home.code }; }
+    if (!w.p) { if (p.online) away.push(`${p.name} · ${w.city || 'unknown'}`); continue; }
+    const key = w.p.map(Math.round).join(',');
+    (groups[key] = groups[key] || []).push({ ...p, bx: w.p[0], by: w.p[1], city: w.city, exact: w.exact });
+  }
+  if (t.home && t.home.lat != null) { const rp = usProj(t.home.lon, t.home.lat); if (rp) relays[t.home.code] = { x: rp[0], y: rp[1], code: t.home.code }; }
+  // devices that share a city sit on a small ring around it, in a stable order
+  const nodes = [];
+  for (const g of Object.values(groups)) {
+    g.sort((a, b) => tsmHash(a.id) - tsmHash(b.id));
+    g.forEach((p, i) => {
+      const withProbe = TSM.probe && Math.hypot(p.bx - TSM.probe.x, p.by - TSM.probe.y) < 4;
+      const r = g.length === 1 && !withProbe ? 0 : Math.min(40, 20 + 2.5 * g.length) + 9 * Math.floor(i / 10);
+      const a = -Math.PI / 2 + ((i % 10) + .5) / Math.min(10, g.length) * Math.PI * 2;
+      nodes.push({ ...p, x: p.bx + r * Math.cos(a), y: p.by + r * Math.sin(a), ang: r ? a : null, crowd: g.length });
+    });
+  }
+  // traffic since the last poll: pulses out (probe sends) and in (probe receives)
+  let up = 0, down = 0, links = 0;
+  for (const n of nodes) {
+    const pv = TSM.prev[n.id];
+    if (pv) {
+      const dtx = Math.max(0, n.tx - pv.tx), drx = Math.max(0, n.rx - pv.rx);
+      up += dtx; down += drx;
+      if (dtx || drx) TSM.last[n.id] = now;
+      for (const [bytes, dir] of [[dtx, 1], [drx, -1]]) {
+        const count = bytes ? Math.min(7, 1 + Math.floor(Math.log10(Math.max(1, bytes / 200)))) : 0;
+        for (let i = 0; i < count; i++) TSM.pulses.push({ id: n.id, dir, t0: now + i * (1800 / count), dur: 1300 + Math.random() * 300 });
+      }
+    }
+    if (now - (TSM.last[n.id] || -1e9) < 12000) links++;
+  }
+  TSM.prev = Object.fromEntries(peers.map(p => [p.id, { rx: p.rx, tx: p.tx }]));
+  TSM.nodes = nodes; TSM.relays = relays;
+  const rate = v => v >= 1e6 ? (v / 1e6 / 2).toFixed(1) + ' MB/s' : (v / 1e3 / 2).toFixed(1) + ' kB/s';
+  $('#tsm-stat').textContent = run ? `${peers.filter(p => p.online).length} of ${peers.length} online · ${links} talking · ↑ ${rate(up)} ↓ ${rate(down)}` : 'not connected';
+  setHTML('#tsm-away', away.length ? 'Off the map: ' + away.map(esc).join(' · ') : '');
+  $('#tsm-foot').textContent = !run ? 'Connect Tailscale to see the map.' : t.geoip
+    ? 'Places: the city of each public IP the probe knows (its own, and devices with a direct connection); the rest sit at their nearest Tailscale relay city. Lines show only the probe’s own traffic with each device.'
+    : 'Places: each device sits at its nearest Tailscale relay city (Tailscale doesn’t share devices’ addresses unless they connect directly). Turn on city-level locations in the settings for more. Lines show only the probe’s own traffic with each device.';
+  if (!TSM.raf) TSM.raf = requestAnimationFrame(tsmDraw);
+}
+function tsmArc(a, b, lift = .22) {
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, d = Math.hypot(b.x - a.x, b.y - a.y);
+  return { a, b, c: { x: mx, y: my - d * lift } };
+}
+const tsmAt = (q, u) => ({ x: (1 - u) * (1 - u) * q.a.x + 2 * (1 - u) * u * q.c.x + u * u * q.b.x, y: (1 - u) * (1 - u) * q.a.y + 2 * (1 - u) * u * q.c.y + u * u * q.b.y });
+function tsmRoute(n) {   // the probe to a device: straight when direct, through its relay city when relayed
+  const P = TSM.probe, rl = n.home && TSM.relays[n.home.code];
+  if (n.direct || !rl || Math.hypot(rl.x - n.x, rl.y - n.y) < 3) return { segs: [tsmArc(P, n)], color: n.direct ? '#39ff88' : '#ff3df2' };
+  return { segs: [tsmArc(P, rl, .18), tsmArc(rl, n, .1)], color: '#ff3df2' };
+}
+function tsmDraw(ts) {
+  TSM.raf = 0;
+  if (view !== 'ts' || document.hidden) return;
+  TSM.raf = requestAnimationFrame(tsmDraw);
+  const cv = $('#tsm-cv'), wrap = $('#tsm-wrap'), dpr = devicePixelRatio || 1;
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+  const g = cv.getContext('2d'), sc = Math.min(W / 975, H / 610), ox = (W - 975 * sc) / 2, oy = (H - 610 * sc) / 2;
+  g.setTransform(dpr * sc, 0, 0, dpr * sc, dpr * ox, dpr * oy);
+  g.clearRect(-ox / sc, -oy / sc, W / sc, H / sc);
+  const now = performance.now(), P = TSM.probe;
+  $('#tsm-clock').textContent = new Date().toLocaleTimeString([], { hour12: false }) + ' · ' + Intl.DateTimeFormat().resolvedOptions().timeZone.split('/').pop().replace('_', ' ');
+  // a slow sweep across the map
+  const sx = (now / 28 % 1100) - 60, sw = g.createLinearGradient(sx - 60, 0, sx, 0);
+  sw.addColorStop(0, 'rgba(33,230,255,0)'); sw.addColorStop(1, 'rgba(33,230,255,.07)');
+  g.fillStyle = sw; g.fillRect(sx - 60, 0, 60, 610);
+  // relay cities
+  for (const r of Object.values(TSM.relays)) {
+    g.save(); g.translate(r.x, r.y); g.rotate(Math.PI / 4); g.strokeStyle = 'rgba(255,61,242,.75)'; g.lineWidth = 1.3; g.strokeRect(-4, -4, 8, 8); g.restore();
+    g.fillStyle = 'rgba(255,61,242,.75)'; g.font = '600 9px ui-monospace, Menlo, monospace'; g.fillText(r.code.toUpperCase(), r.x + 8, r.y + 12);
+  }
+  // links: faint when idle, bright for a while after traffic
+  const routes = {};
+  if (P) for (const n of TSM.nodes) {
+    if (!n.online) continue;
+    const rt = routes[n.id] = tsmRoute(n), hot = Math.max(0, 1 - (now - (TSM.last[n.id] || -1e9)) / 12000);
+    g.strokeStyle = rt.color; g.lineWidth = 1 + hot * 1.4; g.globalAlpha = .16 + hot * .6;
+    g.setLineDash(hot ? [] : [3, 5]); g.shadowColor = rt.color; g.shadowBlur = hot * 10;
+    for (const q of rt.segs) { g.beginPath(); g.moveTo(q.a.x, q.a.y); g.quadraticCurveTo(q.c.x, q.c.y, q.b.x, q.b.y); g.stroke(); }
+    g.setLineDash([]); g.shadowBlur = 0; g.globalAlpha = 1;
+  }
+  // pulses travel along the route: amber out from the probe, cyan in to it
+  TSM.pulses = TSM.pulses.filter(p => now - p.t0 < p.dur);
+  for (const p of TSM.pulses) {
+    const rt = routes[p.id]; if (!rt || now < p.t0) continue;
+    let u = (now - p.t0) / p.dur; if (p.dir < 0) u = 1 - u;
+    const segs = rt.segs, k = Math.min(segs.length - 1, Math.floor(u * segs.length)), uu = u * segs.length - k;
+    const col = p.dir > 0 ? '#ffb22e' : '#21e6ff';
+    for (let tail = 0; tail < 6; tail++) {
+      const v = Math.max(0, Math.min(1, uu - tail * .018 * p.dir)), pt = tsmAt(segs[k], v);
+      g.globalAlpha = 1 - tail / 6; g.fillStyle = col; g.shadowColor = col; g.shadowBlur = 12;
+      g.beginPath(); g.arc(pt.x, pt.y, 2.8 - tail * .35, 0, Math.PI * 2); g.fill();
+    }
+    g.globalAlpha = 1; g.shadowBlur = 0;
+  }
+  // devices
+  g.font = '600 10px ui-monospace, Menlo, monospace';
+  for (const n of TSM.nodes) {
+    const col = n.online ? '#21e6ff' : '#3c5563', hot = Math.max(0, 1 - (now - (TSM.last[n.id] || -1e9)) / 12000);
+    g.fillStyle = col; g.shadowColor = col; g.shadowBlur = n.online ? 8 + hot * 10 : 0;
+    g.beginPath(); g.arc(n.x, n.y, n.online ? 3.6 : 2.6, 0, Math.PI * 2); g.fill(); g.shadowBlur = 0;
+    if (n.online || n.crowd <= 3) {   // labels point away from the city they ring
+      const left = n.ang != null && Math.cos(n.ang) < -.2, dy = n.ang == null ? -5 : Math.sin(n.ang) * 6 + 3.5;
+      g.textAlign = left ? 'right' : 'left'; g.fillStyle = n.online ? 'rgba(190,240,255,.92)' : 'rgba(110,140,155,.6)';
+      g.fillText(n.name.slice(0, 18), n.x + (left ? -7 : 7), n.y + dy); g.textAlign = 'left';
+    }
+  }
+  // the probe: an amber beacon
+  if (P) {
+    const ph = (now % 2000) / 2000;
+    g.strokeStyle = `rgba(255,178,46,${1 - ph})`; g.lineWidth = 1.5; g.beginPath(); g.arc(P.x, P.y, 5 + ph * 22, 0, Math.PI * 2); g.stroke();
+    g.fillStyle = '#ffb22e'; g.shadowColor = '#ffb22e'; g.shadowBlur = 16; g.beginPath(); g.arc(P.x, P.y, 5, 0, Math.PI * 2); g.fill(); g.shadowBlur = 0;
+    g.font = '700 11px ui-monospace, Menlo, monospace'; g.fillStyle = '#ffd27a'; g.textAlign = 'center'; g.fillText(P.name.toUpperCase(), P.x, P.y + 19); g.textAlign = 'left';
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && view === 'ts' && !TSM.raf) TSM.raf = requestAnimationFrame(tsmDraw); });
+
+
+boot();
+</script>
+<script src="/deck/web/mtr.js"></script>
+<script src="/deck/web/hosts.js"></script>
+<script src="/deck/web/mdns.js"></script>
+<script src="/deck/web/mcast.js"></script>
+<script src="/deck/web/cache.js"></script>
+<script src="/deck/web/speed.js"></script>
+<script src="/deck/web/stats.js"></script>
+</body></html>

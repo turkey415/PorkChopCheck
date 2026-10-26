@@ -1,6 +1,6 @@
 """The router port tester (router/pcc_router): frames in, verdict out, screen pages, the phone page.
 Runs on a PC; nothing here needs a router."""
-import json, os, socket, struct, sys, tempfile, threading, time, urllib.request
+import json, os, socket, struct, sys, tempfile, threading, time, types, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "router"))
@@ -472,5 +472,88 @@ if True:
     COOKIE["v"] = jar(call("/api/auth/login", {"name": "crew", "password": "crewpass1"}, cookie="")[2])
     check("viewers can't change Wi-Fi", post("/api/wifi", {"id": "wifi2g", "ssid": "Nope"})[0] == 403)
     wsrv.shutdown()
+
+# ---------- the Deck: Probe Deck's pages on the router ----------
+from pcc_router import deckhost as D
+class DeckSvc:
+    def __init__(self):
+        self.tester, self.iface, self.netmode = good, "eth0", {"mode": "router"}
+pr = D.Probe(DeckSvc(), tempfile.mkdtemp())
+check("the probe shim: address, prefix, broadcast, gateway", pr.net["ip"] == "10.2.1.108" and pr.net["broadcast"] == "10.2.1.255" and pr.net["gateway"] == "10.2.1.254")
+check("the probe shim: the switch port", pr.neighbor == {"port": "GigabitEthernet1/0/14", "switch": "Texas-CORE"})
+check("router mode tests on the WAN port", pr.l3() == "eth0" and pr.watch.iface == "eth0")
+pr.s.netmode = {"mode": "ap"}
+check("Access point mode: the address is on the LAN bridge", pr.l3() == "br-lan")
+dk = D.Deck.__new__(D.Deck)
+check("Deck files: the page, page scripts and the map only", dk.file("index.html")[0] and dk.file("web/stats.js")[0] and dk.file("vendor/us-map.json")[0]
+      and dk.file("../deckhost.py") == (None, None) and dk.file("web/../../auth.py") == (None, None) and dk.file("appbase.py") == (None, None))
+html_deck = dk.file("index.html")[0].decode()
+check("Deck page has every view and its scripts", all(f'id="v-{v}"' in html_deck for v in ("mtr", "hosts", "mdns", "mcast", "cache", "speed", "wake", "stats", "ts"))
+      and all(f'/deck/web/{v}.js' in html_deck for v in ("mtr", "hosts", "mdns", "mcast", "cache", "speed", "stats")))
+check("Deck speed page has only the internet test", "LAN speed test" not in html_deck and 'id="f-inet"' in html_deck)
+class FakeDeck:
+    def __init__(self): self.posts = []
+    def file(self, rel): return dk.file(rel)
+    def state(self, user): return {"name": "r", "user": user}
+    def app_get(self, name, sub, arg, q, user):
+        if name != "stats": raise LookupError(name)
+        return {"cpu": 5}
+    def app_post(self, name, action, body, user):
+        if user["role"] != "admin" and action != "peek": raise PermissionError("Admins only")
+        self.posts.append((name, action)); return {"ok": 1}
+    def wol(self, action, body): self.posts.append(("wol", action)); return {}
+    def settings(self, body): return {}
+class DeckService(FakeService):
+    def __init__(self):
+        super().__init__(); self.deck = FakeDeck()
+dsvc = DeckService()
+dsrv = web.Server(("127.0.0.1", 0), web.make_handler(dsvc))
+threading.Thread(target=dsrv.serve_forever, daemon=True).start()
+base_url = f"http://127.0.0.1:{dsrv.server_address[1]}"
+check("the Deck page loads without a login (it checks itself)", "PorkChopCheck Deck" in call("/deck", cookie="")[1])
+check("Deck data needs a login", call("/api/deck/state", cookie="")[0] == 401 and call("/api/x/stats", cookie="")[0] == 401)
+COOKIE["v"] = admin_cookie
+check("Deck tool data", call("/api/x/stats")[1] == {"cpu": 5} and call("/api/x/nope")[0] == 404)
+check("Deck tool action", post("/api/x/hosts/scan", {})[0] == 200 and ("hosts", "scan") in dsvc.deck.posts)
+check("Wake from the Deck", post("/api/wol/wake", {"mac": "02:00:00:00:00:01"})[0] == 200 and ("wol", "wake") in dsvc.deck.posts)
+COOKIE["v"] = jar(call("/api/auth/login", {"name": "crew", "password": "crewpass1"}, cookie="")[2])
+check("viewers can't start Deck tools", post("/api/x/hosts/scan", {})[0] == 403 and post("/api/wol/wake", {})[0] == 403)
+check("viewers can look at Deck tools", call("/api/x/stats")[0] == 200)
+dsrv.shutdown()
+
+# ---------- Send to GXL ----------
+from pcc_router import gxl as G
+import io
+class GxlSvc:
+    def __init__(self):
+        self.config = {}
+        self.log = types.SimpleNamespace(list=lambda: [
+            {"label": "A1", "switch": "sw-a", "port": "Gi0/1", "vlan": "10", "speed": "1000", "verdict": "good", "findings": "Port looks good"},
+            {"label": "", "switch": "sw-a", "port": "Gi0/2", "verdict": "good", "findings": ""},
+            {"label": "A2", "switch": "sw-a", "port": "Gi0/3", "vlan": "10", "speed": "100", "verdict": "warn", "findings": "Link 100M; Slow"}])
+    def set_option(self, k, v): self.config[k] = v
+sent = {}
+class Resp(io.BytesIO):
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+def opener(req, timeout=10):
+    sent["url"], sent["auth"], sent["body"] = req.full_url, req.headers.get("Authorization"), json.loads(req.data)
+    return Resp(json.dumps({"updated": ["A1"], "unknown": ["A2"]}).encode())
+gs = GxlSvc(); g = G.Gxl(gs, opener)
+try:
+    g.send(); check("GXL needs its address and key first", False)
+except ValueError:
+    check("GXL needs its address and key first", True)
+try:
+    g.settings({"url": "not a url"}); check("bad GXL address refused", False)
+except ValueError:
+    check("bad GXL address refused", True)
+g.settings({"url": "http://10.2.1.143:8000/", "key": "event-key-1234"})
+check("the key is never shown back", "event-key" not in json.dumps(g.state()) and g.state()["key_set"])
+r = g.send()
+recs = sent["body"]["records"]
+check("only labelled rows go to GXL, graded the way GXL reads them", [x["label"] for x in recs] == ["A1", "A2"] and recs[0]["level"] == "good" and recs[0]["why"] == []
+      and recs[1]["level"] == "check" and recs[1]["why"] == ["Link 100M", "Slow"])
+check("sent to GXL's survey with the agent key", sent["url"] == "http://10.2.1.143:8000/agent/survey" and sent["auth"] == "Agent event-key-1234" and r["updated"] == 1 and r["unknown"] == ["A2"])
 
 print(f"\n{ok} checks passed")
