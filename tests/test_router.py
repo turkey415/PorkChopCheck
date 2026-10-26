@@ -447,6 +447,12 @@ if True:
     w.change("wifi2g", "Event-2G", "brand-new-pass"); settle()
     sent = [p for f, p in calls if f == "set_config"][-1]
     check("2.4 GHz change sends the new password", sent["iface_name"] == "wifi2g" and sent["key"] == "brand-new-pass" and sent["device"] == "wifi0" and sent["hidden"] is True)
+    w.change("mld0", hidden=True); settle()
+    sent = [p for f, p in calls if f == "set_mlo_config"][-1]
+    check("hide a network: keeps its name and password", sent["hidden"] is True and sent["ssid"] == "GL-MLO" and sent["key"] == "old-key-123")
+    w.change("wifi2g", hidden=False); settle()
+    sent = [p for f, p in calls if f == "set_config"][-1]
+    check("make a hidden network visible", sent["hidden"] is False and sent["ssid"] == "GL-2G")
     # the phone page: admins only
     class WifiService(FakeService):
         def __init__(self):
@@ -459,6 +465,10 @@ if True:
     wj = call("/api/wifi")[1]
     check("Wi-Fi list served without passwords", wj["networks"][0]["ssid"] == "GL-MLO" and "old-key" not in json.dumps(wj))
     check("Wi-Fi save from the page", post("/api/wifi", {"id": "wifi2g", "ssid": "Page-2G"})[0] == 200)
+    for _ in range(100):
+        if wsvc.wifi.state["state"] != "saving": break
+        time.sleep(0.02)
+    check("visibility button from the page", post("/api/wifi", {"id": "mld0", "hidden": True})[0] == 200 and [p for f, p in calls if f == "set_mlo_config"][-1]["hidden"] is True)
     COOKIE["v"] = jar(call("/api/auth/login", {"name": "crew", "password": "crewpass1"}, cookie="")[2])
     check("viewers can't change Wi-Fi", post("/api/wifi", {"id": "wifi2g", "ssid": "Nope"})[0] == 403)
     wsrv.shutdown()

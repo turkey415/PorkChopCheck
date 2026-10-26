@@ -15,7 +15,7 @@ GET /api/state, /api/tools?span=30, /api/wifi, /api/tls, /cert.pem, /ports.csv
 POST /api/recheck, /api/auth/password {"current", "new"}   (viewers too)
 Admins only:
 POST /api/screen {"mode": "pcc" | "gl"}, /api/netmode {"mode": "router" | "ap"},
-     /api/wifi {"id", "ssid", "key"}, /api/ping, /api/tick, /api/reflector, /api/speed, /api/blink, /api/log,
+     /api/wifi {"id", "ssid", "key", "hidden"} (any of them; left out = unchanged), /api/ping, /api/tick, /api/reflector, /api/speed, /api/blink, /api/log,
      /api/tls/generate {"names", "days"}, /api/tls/upload {"cert", "key"},
 GET /api/users; POST /api/users {"action": "add" | "role" | "password" | "delete", "name", "role", "password"}
 
@@ -192,7 +192,9 @@ def make_handler(service):
                 service.set_netmode(body.get("mode"))
                 return self._json(200, {"ok": True})
             if self.path == "/api/wifi":
-                service.wifi.change(str(body.get("id") or ""), body.get("ssid"), str(body.get("key") or ""))
+                hidden = body.get("hidden")
+                service.wifi.change(str(body.get("id") or ""), body.get("ssid"), str(body.get("key") or ""),
+                                    None if hidden is None else bool(hidden))
                 return self._json(200, {"ok": True})
             if self.path == "/api/tls/generate":
                 service.tls.generate(body.get("names") or ", ".join(service.tls.default_names()), body.get("days") or 3650)
@@ -575,13 +577,26 @@ async function loadWifi() {
     wnets = j.networks || [];
     $('wf').innerHTML = j.error ? `<div class="sub bad">${esc(j.error)}</div>` : wnets.map(n => `<div class="line" style="justify-content:space-between;border-top:1px solid var(--line);padding-top:6px">
       <span><span class="v" style="font-weight:700">${esc(n.ssid)}</span><br><span class="sub">${esc(n.label)} · ${n.on ? (n.hidden ? 'on, hidden' : 'on, visible') : 'off'}${n.secured ? '' : ' · open, no password'}</span></span>
-      <button class="key admin-only" type="button" data-w="${esc(n.id)}">Change</button></div>`).join('') || '<div class="sub">No networks found.</div>';
+      <span class="line" style="margin:0"><button class="key admin-only${n.hidden ? '' : ' on'}" type="button" data-vis="${esc(n.id)}" title="${n.hidden ? 'Hidden: phones must type the name to join. Tap to broadcast it.' : 'Visible: phones see it in their Wi-Fi list. Tap to hide it.'}">${n.hidden ? 'Hidden' : 'Visible'}</button>
+      <button class="key admin-only" type="button" data-w="${esc(n.id)}">Change</button></span></div>`).join('') || '<div class="sub">No networks found.</div>';
     const sv = j.save || {};
     $('wmsg').className = 'sub ' + (sv.state === 'error' ? 'bad' : sv.state === 'saving' ? 'warn' : 'good');
-    $('wmsg').textContent = sv.state === 'saving' ? `Saving ${sv.ssid}… Wi-Fi restarts now.` : sv.state === 'done' && Date.now() / 1000 - sv.t < 300 ? `Saved: ${sv.ssid}.` : sv.state === 'error' ? 'Not saved: ' + sv.error : '';
+    $('wmsg').textContent = sv.state === 'saving' ? `Saving ${sv.ssid}… Wi-Fi restarts now.` : sv.state === 'done' && Date.now() / 1000 - sv.t < 300 ? `Saved: ${sv.ssid} (${sv.hidden ? 'hidden' : 'visible'}).` : sv.state === 'error' ? 'Not saved: ' + sv.error : '';
   } catch (e) { $('wf').innerHTML = '<div class="sub">router not answering</div>'; }
 }
-$('wf').addEventListener('click', e => {
+$('wf').addEventListener('click', async e => {
+  const v = e.target.closest('[data-vis]');
+  if (v) {
+    const n = wnets.find(x => x.id === v.dataset.vis); if (!n) return;
+    const hide = !n.hidden;
+    if (!confirm(hide ? `Hide "${n.ssid}"?\n\nIt stops showing in Wi-Fi lists. Phones already joined stay joined; new ones must type the name. Wi-Fi restarts for a moment.`
+                      : `Make "${n.ssid}" visible?\n\nIt shows in everyone's Wi-Fi list again. Wi-Fi restarts for a moment.`)) return;
+    v.disabled = true;
+    const r = await post('/api/wifi', {id: n.id, hidden: hide}), j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('wmsg').className = 'sub bad'; $('wmsg').textContent = j.error || 'Not saved'; }
+    setTimeout(loadWifi, 1500);
+    return;
+  }
   const b = e.target.closest('[data-w]'); if (!b) return;
   wedit = wnets.find(n => n.id === b.dataset.w); if (!wedit) return;
   $('wfor').textContent = 'Changing ' + wedit.label + (wedit.hidden ? ' (hidden network)' : '');

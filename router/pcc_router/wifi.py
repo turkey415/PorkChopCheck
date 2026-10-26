@@ -82,24 +82,30 @@ class Wifi:
         return out
 
     # ---------- saving ----------
-    def change(self, net_id, ssid, key):
-        """Checks everything, then saves in the background: Wi-Fi restarts, so the phone may drop."""
-        ssid = check_ssid(ssid)
+    def change(self, net_id, ssid=None, key=None, hidden=None):
+        """Checks everything, then saves in the background: Wi-Fi restarts, so the phone may drop.
+        ssid None keeps the name, key None or "" keeps the password, hidden None keeps the visibility."""
+        ssid = check_ssid(ssid) if ssid is not None else None
         key = check_key(key) if key else None
         mlo, bands = self._raw()
+        cur = next((i for i in mlo if i["name"] == net_id), None) or next((i for _, i in bands if i["name"] == net_id), None)
+        if cur is None:
+            raise ValueError("No such network")
+        ssid = ssid if ssid is not None else cur.get("ssid")
+        hidden = bool(hidden) if hidden is not None else bool(cur.get("hidden", False))
         params, func = None, None
         for i in mlo:
             if i["name"] == net_id:
                 func = "set_mlo_config"
                 params = {"name": i["name"], "ssid": ssid, "key": key if key is not None else i.get("key"),
-                          "encryption": i.get("encryption"), "hidden": i.get("hidden", False),
+                          "encryption": i.get("encryption"), "hidden": hidden,
                           "random_bssid": i.get("random_bssid", True), "mlo_enable": i.get("mlo_enable", True),
                           "mlo_band": i.get("mlo_band")}  # fmt: skip
         for dev, i in bands:
             if i["name"] == net_id:
                 func = "set_config"
                 params = {"iface_name": i["name"], "ssid": ssid, "key": key if key is not None else i.get("key"),
-                          "encryption": i.get("encryption"), "hidden": i.get("hidden", False),
+                          "encryption": i.get("encryption"), "hidden": hidden,
                           "random_bssid": i.get("random_bssid", True), "device": dev.get("device"),
                           "txpower": dev.get("txpower"), "hwmode": dev.get("hwmode"), "htmode": dev.get("htmode"),
                           "channel": dev.get("channel")}  # fmt: skip
@@ -111,12 +117,12 @@ class Wifi:
         with self.lock:
             if self.state.get("state") == "saving":
                 raise ValueError("Still saving the last change")
-            self.state = {"state": "saving", "id": net_id, "ssid": ssid, "t": time.time()}
-        threading.Thread(target=self._save, args=(func, params, net_id, ssid), daemon=True).start()
+            self.state = {"state": "saving", "id": net_id, "ssid": ssid, "hidden": hidden, "t": time.time()}
+        threading.Thread(target=self._save, args=(func, params, net_id, ssid, hidden), daemon=True).start()
 
-    def _save(self, func, params, net_id, ssid):
+    def _save(self, func, params, net_id, ssid, hidden):
         try:
             self.call("wifi", func, params, 60)
-            self.state = {"state": "done", "id": net_id, "ssid": ssid, "t": time.time()}
+            self.state = {"state": "done", "id": net_id, "ssid": ssid, "hidden": hidden, "t": time.time()}
         except ValueError as e:
             self.state = {"state": "error", "id": net_id, "error": str(e), "t": time.time()}
