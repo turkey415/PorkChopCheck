@@ -11,6 +11,7 @@ Runs under procd (router/pcc-router.init). Threads:
 - ping, four a second, to the chosen target, for the event timeline (tools.py)
 - the port log, filled in whenever CDP/LLDP names a port
 - the phone page (web.py), which also starts the tick test, reflector, speed test and port finder
+- the network mode (Router or Access point) and the side switch's position; netmode.lua changes it
 """
 
 import json
@@ -28,6 +29,11 @@ from .screen import PAGES, Display, Touch
 from .tester import Tester
 
 CONFIG = os.environ.get("PCC_CONFIG", "/etc/pcc-router/config.json")
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NETMODE_STATE = "/tmp/pcc-netmode.json"
+NETMODE_LOCK = "/var/lock/pcc-netmode.lock"
+MODE_NAMES = {"router": "Router", "ap": "Access point"}
+CHANGE_SECS = 120  # a change that says "changing" for longer than this has died
 DEFAULTS = {"iface": "eth0", "wan": "wan", "screen": "pcc", "port": 8088,
             "ping_target": "gateway", "tick_server": "", "iperf_server": "", "iperf_port": 5201}
 
@@ -66,6 +72,8 @@ class Service:
         self.blink = tools.Blink(self.iface, self.tester)
         self.log = tools.PortLog(folder)
         self._resolved = {}
+        self.netmode = {"mode": None, "switch": None, "switch_set": False, "state": None, "lan_ip": None}
+        self.hold_hint = 0  # when a finger on the Mode page passed the first hold: "keep holding"
 
     # ---------- config ----------
     def _load(self):
@@ -111,6 +119,65 @@ class Service:
                 pass
             self.stop.wait(3)
 
+    # ---------- Router or Access point ----------
+    def read_netmode(self):
+        """The mode GL.iNet is in, the side switch's position, and any change in progress."""
+        mode = run(["uci", "-q", "get", "glconfig.general.mode"]).strip() or None
+        func = run(["uci", "-q", "get", "switch-button.@main[0].func"]).strip()
+        gpio = read("/proc/gl-hw-info/switch-button")
+        switch = None
+        if gpio:
+            for line in read("/sys/kernel/debug/gpio").splitlines():
+                parts = line.split()
+                if parts and parts[0] == gpio:
+                    switch = "on" if " hi" in line else "off"
+        state = {}
+        try:
+            with open(NETMODE_STATE) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            pass
+        if state.get("state") == "changing" and time.time() - state.get("t", 0) > CHANGE_SECS:
+            state = {"state": "error", "error": "The change did not finish", "t": state.get("t", 0) + CHANGE_SECS}
+        if state.get("state") == "error" and time.time() - state.get("t", 0) > 600:
+            state = {}  # an old failure: stop showing it
+        lan_ip = run(["uci", "-q", "get", "network.lan.ipaddr"]).strip() or None
+        return {"mode": mode, "switch": switch, "switch_set": func == "netmode", "state": state.get("state"),
+                "want": state.get("want"), "error": state.get("error"), "lan_ip": lan_ip}
+
+    def netmode_loop(self):
+        while not self.stop.is_set():
+            was = self.netmode.get("mode")
+            self.netmode = self.read_netmode()
+            if was and self.netmode["mode"] != was:
+                with self.tester.lock:
+                    self.tester.event(f"Now in {MODE_NAMES.get(self.netmode['mode'], self.netmode['mode'])} mode")
+                    self.tester.wan = {}
+                self.recheck.set()
+            self.stop.wait(2)
+
+    def set_netmode(self, want):
+        """Starts a change to "router" or "ap". It runs on its own (the network restarts under it)."""
+        if want not in ("router", "ap"):
+            raise ValueError("mode is router or ap")
+        if self.netmode.get("state") == "changing":
+            raise ValueError("Already changing")
+        if want == "ap" and read(f"/sys/class/net/{self.iface}/carrier") != "1":
+            raise ValueError("Plug a cable into WAN first")
+        subprocess.Popen(["flock", "-n", NETMODE_LOCK, "lua", os.path.join(HERE, "netmode.lua"), "set", want],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)  # fmt: skip
+        self.netmode = {**self.netmode, "state": "changing", "want": want, "error": None}
+        self.screen_changed.set()
+
+    def toggle_netmode(self):
+        self.set_netmode("router" if self.netmode.get("mode") == "ap" else "ap")
+
+    def screen_snap(self):
+        snap = self.tester.snapshot()
+        snap["netmode"] = {**self.netmode, "hold": time.monotonic() - self.hold_hint < 2.5}
+        return snap
+
     # ---------- whose screen ----------
     def set_screen(self, mode):
         """"pcc" (ours) or "gl" (GL.iNet's screen program). Remembered across reboots."""
@@ -140,7 +207,7 @@ class Service:
                     if not self.display.lit():  # something blanked it: light it again
                         self.display.light(True)
                     try:
-                        snap = self.tester.snapshot()
+                        snap = self.screen_snap()
                         snap["blink"] = self.blink.state()
                         if PAGES[self.page % len(PAGES)] == "ping":
                             snap["ping"] = self.pinger.state(60, [], cols=270)
@@ -157,9 +224,22 @@ class Service:
                 time.sleep(1)
                 continue
             for press in touch.presses(lambda: self.stop.is_set() or self.config["screen"] != "pcc"):
+                on_mode = PAGES[self.page % len(PAGES)] == "mode"
                 if press in ("tap", "next", "prev"):
                     self.page = (self.page + (-1 if press == "prev" else 1)) % len(PAGES)
                     self.screen_changed.set()  # redraw now
+                elif on_mode:  # the Mode page: hold 1.5 s shows "keep holding", 3 s changes mode
+                    if press == "hold":
+                        self.hold_hint = time.monotonic()
+                    elif press == "long":
+                        self.hold_hint = 0
+                        try:
+                            self.toggle_netmode()
+                        except ValueError as e:
+                            self.netmode = {**self.netmode, "state": "error", "error": str(e)}
+                    self.screen_changed.set()
+                elif press == "long":
+                    pass  # the hold already handed the screen over
                 else:  # held: give the screen back to GL.iNet's program
                     self.set_screen("gl")
                     break
@@ -227,8 +307,10 @@ class Service:
         self.tester.probe_done()
 
     def wan_loop(self):
-        name = self.config["wan"]
         while not self.stop.is_set():
+            # in Access point mode the WAN port joins the LAN bridge and the router's own address
+            # comes from the network on "lan"
+            name = "lan" if self.netmode.get("mode") == "ap" else self.config["wan"]
             try:
                 status = json.loads(run(["ubus", "call", f"network.interface.{name}", "status"]) or "{}")
             except ValueError:
@@ -236,7 +318,7 @@ class Service:
             self.tester.on_wan(status)
             gw = self.tester.wan.get("gateway")
             if gw:
-                out = run(["ip", "neigh", "show", gw, "dev", self.iface])
+                out = run(["ip", "neigh", "show", gw])
                 parts = out.split()
                 if "lladdr" in parts:
                     self.tester.set_gateway_mac(parts[parts.index("lladdr") + 1])
@@ -266,8 +348,9 @@ class Service:
     def start(self):
         self.apply_screen()
         self.reflector.tidy()
+        self.netmode = self.read_netmode()
         for target in (self.link_loop, self.listen_loop, self.wan_loop, self.checks_loop, self.screen_loop,
-                       self.touch_loop, self.log_loop):  # fmt: skip
+                       self.touch_loop, self.log_loop, self.netmode_loop):  # fmt: skip
             threading.Thread(target=target, daemon=True, name=target.__name__).start()
         threading.Thread(target=self.pinger.run, args=(self.stop,), daemon=True, name="ping").start()
         web.serve(self, self.config["port"])  # blocks

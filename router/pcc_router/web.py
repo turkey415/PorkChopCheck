@@ -4,14 +4,16 @@ knows, refreshed every 2 seconds, and the switch between GL.iNet's screen and ou
 GET /            the page
 GET /api/state   everything, as JSON
 POST /api/screen {"mode": "pcc" | "gl"}
+POST /api/netmode {"mode": "router" | "ap"}  change the network mode (as GL.iNet's Network Mode page does)
 POST /api/recheck  run the DHCP probe and the checks again now
 GET /api/tools?span=30  ping (with the event timeline), tick test, reflector, speed test, port finder, port log
 POST /api/ping {"target"}, /api/tick {"action", "server", "rate", "secs"}, /api/reflector {"on"},
      /api/speed {"server", "port"}, /api/blink {"on"}, /api/log {"label"}
 GET /ports.csv     the port log
 
-GL.iNet's firewall keeps this port closed on the WAN side, so only the router's own Wi-Fi and LAN
-can reach it.
+In Router mode GL.iNet's firewall keeps this port closed on the WAN side, so only the router's own
+Wi-Fi and LAN reach it. In Access point mode there is no WAN side: the page is at the address the
+network gave the router, as the screen's Mode page shows.
 """
 
 import json
@@ -64,7 +66,7 @@ def make_handler(service):
             if self.path in ("/", "/index.html"):
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif self.path == "/api/state":
-                snap = service.tester.snapshot()
+                snap = service.screen_snap()
                 snap["screen"] = service.config["screen"]
                 snap["page"] = service.page
                 self._send(200, json.dumps(snap, default=str))
@@ -83,6 +85,12 @@ def make_handler(service):
                 except ValueError:
                     return self._send(400, '{"error": "mode is pcc or gl"}')
                 return self._send(200, json.dumps({"screen": service.config["screen"]}))
+            if self.path == "/api/netmode":
+                try:
+                    service.set_netmode(body.get("mode"))
+                except ValueError as e:
+                    return self._send(400, json.dumps({"error": str(e)}))
+                return self._send(200, '{"ok": true}')
             if self.path == "/api/recheck":
                 threading.Thread(target=service.dhcp_probe, daemon=True).start()
                 service.recheck.set()
@@ -188,12 +196,16 @@ th { color:var(--muted); font-weight:600; }
 <nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button></nav>
 <main id="tab-port">
   <div class="banner" id="banner">Loading…</div>
+  <section><h2>Network mode</h2>
+    <div class="line"><span class="big" id="nm" style="font-size:22px">…</span><span class="spacer"></span>
+      <div class="seg" id="nmseg"><button data-n="router">Router</button><button data-n="ap">Access point</button></div></div>
+    <div class="sub" id="nminfo"></div><div class="sub bad" id="nmerr"></div></section>
   <section><h2>Switch</h2><div id="sw"></div></section>
   <section><h2>Port</h2><div class="rows" id="port"></div></section>
   <section><h2>DHCP and layer 2</h2><div class="rows" id="l2"></div></section>
   <section><h2>Events</h2><div id="ev"></div></section>
   <div><button class="act" id="re">Re-check now</button> <span class="sub" id="age"></span></div>
-  <p class="sub">The router's WAN port is the one being tested. Tap or swipe the router's screen for the next page; hold it to hand the screen back to GL.iNet.</p>
+  <p class="sub">The router's WAN port is the one being tested. Tap or swipe the router's screen for the next page; hold it to hand the screen back to GL.iNet. On the screen's Mode page, hold 3 s to change the network mode. The side switch changes it too: on = Access point, off = Router.</p>
 </main>
 <main id="tab-tools" hidden>
   <section><h2>Ping</h2>
@@ -231,8 +243,31 @@ const chk = c => !c ? ['…', ''] : c.ok ? [(c.ms != null ? c.ms.toFixed(1) + ' 
 const ago = t => { const s = Math.round(Date.now() / 1000 - t); return s < 60 ? s + ' s ago' : Math.round(s / 60) + ' min ago'; };
 let screen = null;
 
+const MODES = {router: 'Router', ap: 'Access point'};
+let netmode = null;
+function renderMode(m) {
+  netmode = m;
+  const changing = m.state === 'changing';
+  $('nm').textContent = changing ? 'Changing to ' + (MODES[m.want] || m.want) + '…' : (MODES[m.mode] || m.mode || '?');
+  $('nm').className = 'big ' + (changing ? 'warn' : m.mode === 'ap' ? 'acc' : '');
+  document.querySelectorAll('#nmseg button').forEach(b => { b.classList.toggle('on', b.dataset.n === m.mode); b.disabled = changing; });
+  const sw = !m.switch_set ? 'The side switch is not set to change the mode.' : m.switch ? `Side switch: ${m.switch} (${m.switch === 'on' ? 'Access point' : 'Router'})${(m.switch === 'on') !== (m.mode === 'ap') && !changing ? ', the other way from the mode now: the next flip changes it' : ''}.` : '';
+  $('nminfo').textContent = (changing ? 'Wi-Fi drops for about a minute. In Access point mode this page moves to the address the network gives the router: the screen\'s Mode page shows it. ' : '') + sw;
+  $('nmerr').textContent = m.state === 'error' && m.error ? m.error : '';
+}
+document.querySelectorAll('#nmseg button').forEach(b => b.onclick = async () => {
+  if (!netmode || b.dataset.n === netmode.mode) return;
+  const ap = b.dataset.n === 'ap';
+  if (!confirm(ap ? 'Switch to Access point mode?\n\nThe WAN port joins the LAN, the router stops handing out addresses, and it takes an address from the network on WAN. 192.168.8.1 stops working: this page moves to that new address (shown on the router\'s screen). Wi-Fi drops for about a minute.'
+                  : 'Switch to Router mode?\n\nThe router hands out 192.168.8.x addresses again and this page goes back to http://192.168.8.1:8088. Wi-Fi drops for about a minute.')) return;
+  const r = await post('/api/netmode', {mode: b.dataset.n});
+  if (!r.ok) { $('nmerr').textContent = (await r.json().catch(() => ({}))).error || 'Could not start'; return; }
+  load();
+});
+
 function render(s) {
   screen = s.screen;
+  if (s.netmode) renderMode(s.netmode);
   document.querySelectorAll('#seg button').forEach(b => b.classList.toggle('on', b.dataset.m === s.screen));
   const bad = s.findings.filter(f => f[0] !== 'good');
   $('banner').className = 'banner ' + s.verdict;

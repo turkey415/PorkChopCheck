@@ -1,6 +1,6 @@
 """The router port tester (router/pcc_router): frames in, verdict out, screen pages, the phone page.
 Runs on a PC; nothing here needs a router."""
-import json, os, socket, struct, sys, tempfile, threading, urllib.request
+import json, os, socket, struct, sys, tempfile, threading, time, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "router"))
@@ -100,6 +100,26 @@ for p in range(len(screen.PAGES)):
     for snap in (good.snapshot(), Tester(clock=Clock()).snapshot()):
         screen.draw(c, snap, p)
         check(f"page {screen.PAGES[p]} draws", any(c.buf) and len(c.frame()) == 76 * 284 * 2)
+# the network mode: badge on every page, and the Mode page in each state
+NM = {"mode": "router", "switch": "off", "switch_set": True, "state": None, "lan_ip": "192.168.8.1"}
+mode_states = [NM, {**NM, "mode": "ap", "switch": "on"}, {**NM, "state": "changing", "want": "ap"},
+               {**NM, "state": "error", "error": "Plug a cable into WAN first"}, {**NM, "hold": True}, {**NM, "switch_set": False}, {}]
+for m in mode_states:
+    snap = good.snapshot(); snap["netmode"] = m
+    for p in range(len(screen.PAGES)):
+        screen.draw(c, snap, p)
+    check(f"mode page draws ({m.get('state') or m.get('mode') or 'unknown'})", any(c.buf))
+ap_snap = good.snapshot(); ap_snap["netmode"] = {**NM, "mode": "ap"}
+check("phone page address: AP mode shows the address the network gave", screen.phone_address(ap_snap) == "10.2.1.108:8088")
+rt_snap = good.snapshot(); rt_snap["netmode"] = NM
+check("phone page address: Router mode shows the LAN address", screen.phone_address(rt_snap) == "192.168.8.1:8088")
+def badge_px(m):
+    snap = good.snapshot(); snap["netmode"] = m
+    screen.draw(c, snap, 0)
+    i = ((screen.FB_H - 1 - (screen.W - 30)) * screen.FB_W + 12) * 2  # inside the badge, bottom row
+    return int.from_bytes(c.buf[i:i + 2], "little")
+check("AP badge is blue, Router grey, changing amber",
+      (badge_px({**NM, "mode": "ap"}), badge_px(NM), badge_px({**NM, "state": "changing", "want": "ap"})) == (screen.ACC, screen.DIM, screen.WARN))
 check("short port names", screen.short_port("GigabitEthernet1/0/14") == "Gi1/0/14" and screen.short_port("TenGigabitEthernet1/1/1") == "Te1/1/1")
 check("speed text", screen.speed_text({"up": True, "speed": 2500, "duplex": "full"}) == "2G" and screen.speed_text({"up": False}) == "no link")
 
@@ -127,6 +147,8 @@ swipe_back = [(0.0, ev(1, 40) + ev(0x39, 0)), (0.1, ev(1, 200) + ev(0x39, 0)), (
 check("swipe the other way is the next page", presses(swipe_back) == ["next"])
 hold = [(0.0, ev(1, 100) + ev(0x39, 0))] + [(0.01 * i, ev(0x39, 0)) for i in range(1, 250)] + [(2.6, ev(0x39, -1))]
 check("hold fires while still holding, and only once", presses(hold) == ["hold"])
+long_hold = [(0.0, ev(1, 100) + ev(0x39, 0))] + [(0.01 * i, ev(0x39, 0)) for i in range(1, 350)] + [(3.6, ev(0x39, -1))]
+check("a 3 s hold gives hold, then long, once each", presses(long_hold) == ["hold", "long"])
 check("BTN_TOUCH screens work too", presses([(0.0, ev(0x14A, 1, typ=1)), (0.1, ev(0x14A, 0, typ=1))]) == ["tap"])
 
 # ---------- the backlight ----------
@@ -147,6 +169,11 @@ class FakeService:
         if mode not in ("pcc", "gl"): raise ValueError(mode)
         self.config["screen"] = mode
     def dhcp_probe(self): self.probed.set()
+    def screen_snap(self):
+        snap = self.tester.snapshot(); snap["netmode"] = dict(NM); return snap
+    def set_netmode(self, mode):
+        if mode not in ("router", "ap"): raise ValueError("mode is router or ap")
+        self.netmode_set = mode
 svc = FakeService()
 srv = web.ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(svc))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -163,6 +190,9 @@ state = json.loads(urllib.request.urlopen(base_url + "/api/state").read())
 check("state served", state["switch"]["port"] == "GigabitEthernet1/0/14" and state["screen"] == "pcc")
 check("switch the screen to GL.iNet", post("/api/screen", {"mode": "gl"}) == (200, {"screen": "gl"}) and svc.config["screen"] == "gl")
 check("a bad screen mode is refused", post("/api/screen", {"mode": "nope"})[0] == 400)
+check("network mode shown on the page", state["netmode"]["mode"] == "router" and 'id="nmseg"' in html)
+check("change the network mode from the page", post("/api/netmode", {"mode": "ap"})[0] == 200 and svc.netmode_set == "ap")
+check("a bad network mode is refused", post("/api/netmode", {"mode": "bridge"})[0] == 400)
 check("re-check", post("/api/recheck", {})[0] == 200 and svc.recheck.is_set() and svc.probed.wait(2))
 srv.shutdown()
 
@@ -177,6 +207,34 @@ with tempfile.TemporaryDirectory() as d:
     svc.set_screen("gl")
     check("GL.iNet's screen started", ["/etc/init.d/gl_screen", "start"] in calls)
     check("choice saved", json.load(open(path))["screen"] == "gl" and S.Service(path).config["screen"] == "gl")
+    # reading the mode and the side switch the way GL.iNet's firmware does
+    files = {"/proc/gl-hw-info/switch-button": "gpio35",
+             "/sys/kernel/debug/gpio": " gpio34  : in  low  func0\n gpio35  : in  hi   func0 8mA pull up\n"}
+    uci = {"glconfig.general.mode": "ap\n", "switch-button.@main[0].func": "netmode\n", "network.lan.ipaddr": "192.168.8.1\n"}
+    real_read, real_run = S.read, S.run
+    S.read = lambda path, default="": files.get(path, default)
+    S.run = lambda cmd, timeout=10: uci.get(cmd[-1], "") if cmd[:2] == ["uci", "-q"] else ""
+    S.NETMODE_STATE = os.path.join(d, "none.json")
+    nm = svc.read_netmode()
+    check("mode and switch read", (nm["mode"], nm["switch"], nm["switch_set"]) == ("ap", "on", True))
+    open(S.NETMODE_STATE, "w").write(json.dumps({"state": "changing", "want": "router", "t": time.time() - 500}))
+    check("a change stuck for minutes shows as failed", svc.read_netmode()["state"] == "error")
+    asked = []
+    S.run = lambda cmd, timeout=10: asked.append(cmd) or "{}"
+    svc.netmode = {"mode": "ap"}
+    import types
+    svc.stop = types.SimpleNamespace(is_set=lambda it=iter([False, True]): next(it))  # one pass of the loop (it sleeps 2 s)
+    svc.wan_loop()
+    check("AP mode reads the router's address from lan", ["ubus", "call", "network.interface.lan", "status"] in asked)
+    svc.stop = threading.Event()
+    S.read, S.run = real_read, lambda cmd, timeout=10: calls.append(cmd) or ""
+    try:
+        S.read = lambda path, default="": "0" if path.endswith("carrier") else default
+        svc.netmode = {"mode": "router"}
+        svc.set_netmode("ap"); check("AP mode needs a cable in WAN", False)
+    except ValueError as e:
+        check("AP mode needs a cable in WAN", "cable" in str(e))
+    S.read = real_read
     svc.set_screen("pcc")
     check("ours stops theirs and lights the screen", ["/etc/init.d/gl_screen", "stop"] in calls and ["light", True] in calls)
     try:
@@ -186,7 +244,6 @@ with tempfile.TemporaryDirectory() as d:
 
 # ---------- tools ----------
 from pcc_router import tools as T
-import time
 req = T.echo_request(0x1234, 7)
 check("icmp checksum checks out", T.icmp_checksum(req) == 0)
 reply = bytes([0x45]) + bytes(19) + bytes([0, 0]) + req[2:4] + req[4:]

@@ -1,8 +1,9 @@
 """The router's little screen: a 284 x 76 landscape strip (on the GL-BE3600, a 76 x 284 framebuffer
 turned a quarter turn, the way GL.iNet's own screen program draws it), RGB565, with touch.
 
-Pages: Summary, Switch, Port, Layer 2, Ping. Tap or swipe for the next page; hold for 1.5 s to hand
-the screen back to GL.iNet's screen program.
+Pages: Summary, Switch, Port, Layer 2, Ping, Mode. Tap or swipe for the next page; hold for 1.5 s to
+hand the screen back to GL.iNet's screen program. On the Mode page a 3 s hold changes the network mode
+instead. Every page shows the mode (ROUTER or AP) in the top corner.
 """
 
 import base64
@@ -15,6 +16,7 @@ from .font import FONTS
 W, H = 284, 76  # as seen: landscape
 FB_W, FB_H = 76, 284  # as stored
 HOLD = 1.5  # seconds of touch that mean "give the screen back"
+LONG = 3.0  # seconds of touch on the Mode page that change the network mode
 
 BG, FG, DIM = 0x0000, 0xFFFF, 0x8410
 GOOD, WARN, BAD, ACC = 0x07E0, 0xFE60, 0xF800, 0x5DDF
@@ -81,7 +83,8 @@ class Canvas:
 
 
 # ---------- pages ----------
-PAGES = ["summary", "switch", "port", "l2", "ping"]
+PAGES = ["summary", "switch", "port", "l2", "ping", "mode"]
+TITLE_W = W - 90  # room for page titles, left of the mode badge and page number
 PING_COLS = 270  # one column per pixel across the ping graph
 
 
@@ -112,7 +115,8 @@ def draw(c, snap, page):
     c.rect(0, 0, 4, H, color)  # a stripe in the verdict's colour down the left edge
     name = PAGES[page % len(PAGES)]
     c.text(W - 2, 1, f"{page % len(PAGES) + 1}/{len(PAGES)}", "small", DIM, right=True)
-    {"summary": _summary, "switch": _switch, "port": _port, "l2": _l2, "ping": _ping}[name](c, snap, color)
+    _badge(c, snap.get("netmode") or {}, W - 2 - c.text_width(f"{page % len(PAGES) + 1}/{len(PAGES)}", "small") - 5)
+    {"summary": _summary, "switch": _switch, "port": _port, "l2": _l2, "ping": _ping, "mode": _mode}[name](c, snap, color)
     if (snap.get("blink") or {}).get("running"):  # the port finder is on: say so on every page
         c.rect(8, H - 14, W - 8, 14, ACC)
         c.text(W // 2, H - 13, f"PORT FINDER ON · {snap['blink']['cycles']} flashes", "small", BG, center=True)
@@ -121,7 +125,7 @@ def draw(c, snap, page):
 def _summary(c, s, color):
     sw, link, wan = s["switch"], s["link"], s["wan"]
     top = s["findings"][0][1]
-    c.text(8, 1, top, "medium", color, max_w=W - 40)
+    c.text(8, 1, top, "medium", color, max_w=TITLE_W)
     if sw["heard"]:
         c.text(8, 21, short_port(sw["port"]), "large", FG)
         vlan = f"VLAN {sw['vlan']}" if sw.get("vlan") is not None else ""
@@ -201,7 +205,7 @@ def _l2(c, s, color):
 def _ping(c, s, color):
     p = s.get("ping") or {}
     target = p.get("target") or "-"
-    c.text(8, 1, f"PING {target}", "small", ACC, max_w=W - 40)
+    c.text(8, 1, f"PING {target}", "small", ACC, max_w=TITLE_W)
     cols = p.get("cols") or []
     top_y, h = 16, 40
     worst = max([col[0] or 0 for col in cols] + [5])
@@ -223,6 +227,55 @@ def _ping(c, s, color):
         c.text(W - 4, 59, f"jit {p['jitter']:.1f}" if p.get("jitter") is not None else "", "small", DIM, right=True)
     else:
         c.text(8, 59, "waiting for replies", "small", DIM)
+
+
+MODE_SHORT = {"router": "ROUTER", "ap": "AP"}
+MODE_LONG = {"router": "ROUTER", "ap": "ACCESS POINT"}
+
+
+def _badge(c, m, right):
+    """ROUTER or AP in the top corner of every page; "> AP" in amber while changing."""
+    mode = m.get("mode")
+    if not mode:
+        return
+    if m.get("state") == "changing":
+        text, fill = "> " + MODE_SHORT.get(m.get("want"), "?"), WARN
+    else:
+        text, fill = MODE_SHORT.get(mode, mode.upper()[:6]), ACC if mode == "ap" else DIM
+    w = c.text_width(text, "small") + 6
+    c.rect(right - w, 0, w, 14, fill)
+    c.text(right - w + 3, 1, text, "small", BG)
+
+
+def phone_address(s):
+    """Where the phone page is: 192.168.8.1 in Router mode, the address the network gave in AP mode."""
+    m = s.get("netmode") or {}
+    ip = (s.get("wan") or {}).get("address") if m.get("mode") == "ap" else m.get("lan_ip") or "192.168.8.1"
+    return f"{ip}:8088" if ip else "waiting for an address"
+
+
+def _mode(c, s, color):
+    m = s.get("netmode") or {}
+    mode, state = m.get("mode"), m.get("state")
+    c.text(8, 1, "NETWORK MODE", "small", ACC)
+    if state == "changing":
+        c.text(8, 16, "TO " + MODE_LONG.get(m.get("want"), "?"), "large", WARN, max_w=W - 12)
+    else:
+        c.text(8, 16, MODE_LONG.get(mode, (mode or "?").upper()), "large", ACC if mode == "ap" else FG, max_w=W - 12)
+    c.text(8, 47, "Page", "small", DIM)
+    c.text(44, 47, phone_address(s), "small", FG if "." in phone_address(s) else WARN, max_w=W - 48)
+    other = "Router" if mode == "ap" else "AP"
+    if state == "changing":
+        hint, col = "Changing... Wi-Fi drops for about a minute", WARN
+    elif state == "error" and m.get("error"):
+        hint, col = m["error"], BAD
+    elif m.get("hold"):
+        hint, col = f"Keep holding to switch to {other}...", WARN
+    else:
+        sw = m.get("switch")
+        side = ("switch on=AP" if sw == "on" else "switch off=Router") if m.get("switch_set") and sw else "switch not set"
+        hint, col = f"Hold 3 s for {other} · {side}", DIM
+    c.text(8, 62, hint, "small", col, max_w=W - 12)
 
 
 # ---------- the device ----------
@@ -283,7 +336,8 @@ class Touch:
         self.path = path
 
     def presses(self, stop):
-        """Yields "tap", "next", "prev" (swipes) or "hold" until stop() is true."""
+        """Yields "tap", "next", "prev" (swipes), "hold" (1.5 s) and then "long" (3 s, still holding)
+        until stop() is true."""
         try:
             f = open(self.path, "rb", buffering=0)
         except OSError:
@@ -294,13 +348,16 @@ class Touch:
 
     def read(self, chunk, stop, now=time.monotonic, idle=lambda: time.sleep(0.05)):
         down_at = start_y = last_y = None
-        held = False
+        held = longed = False
         while not stop():
             data = chunk()
             # a held finger keeps sending events, so the hold is checked whether or not any came
             if down_at is not None and not held and now() - down_at >= HOLD:
                 held = True
                 yield "hold"
+            if down_at is not None and held and not longed and now() - down_at >= LONG:
+                longed = True
+                yield "long"  # still holding: the Mode page changes mode
             if not data:
                 idle()
                 continue
@@ -316,7 +373,7 @@ class Touch:
                     if down_at is not None and start_y is None:
                         start_y = value
                 if touching is True and down_at is None:
-                    down_at, start_y, held = now(), last_y, False
+                    down_at, start_y, held, longed = now(), last_y, False, False
                 elif touching is False and down_at is not None:
                     moved = (last_y or 0) - (start_y if start_y is not None else last_y or 0)
                     if not held:
