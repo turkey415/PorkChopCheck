@@ -1,27 +1,40 @@
-"""The phone page: join the router's Wi-Fi and open http://192.168.8.1:8088. Everything the tester
-knows, refreshed every 2 seconds, and the switch between GL.iNet's screen and ours.
+"""The phone page: open https://192.168.8.1:8088 (or the address the screen's Mode page shows).
+Everything the tester knows, refreshed every 2 seconds, behind a login.
 
-GET /            the page
-GET /api/state   everything, as JSON
-POST /api/screen {"mode": "pcc" | "gl"}
-POST /api/netmode {"mode": "router" | "ap"}  change the network mode (as GL.iNet's Network Mode page does)
-GET /api/wifi     the router's own Wi-Fi networks (names, never passwords) and the last save
-POST /api/wifi {"id", "ssid", "key", "admin"}  change a name and password; needs the admin password
-POST /api/recheck  run the DHCP probe and the checks again now
-GET /api/tools?span=30  ping (with the event timeline), tick test, reflector, speed test, port finder, port log
-POST /api/ping {"target"}, /api/tick {"action", "server", "rate", "secs"}, /api/reflector {"on"},
-     /api/speed {"server", "port"}, /api/blink {"on"}, /api/log {"label"}
-GET /ports.csv     the port log
+One port speaks both: a browser that starts TLS gets HTTPS, and plain http:// is sent to https://.
+The certificate is made on the router (tls.py) and can be replaced from Settings. Logins and users
+work like Probe Deck's (auth.py): admins change things, viewers look.
+
+Open without a login:
+GET /                 the page (it shows the login itself)
+GET /api/auth/me      who is logged in, and whether the first admin still has to be made
+POST /api/auth/login {"name", "password"}, /api/auth/setup {"name", "password", "owner"}, /api/auth/logout
+
+Logged in:
+GET /api/state, /api/tools?span=30, /api/wifi, /api/tls, /cert.pem, /ports.csv
+POST /api/recheck, /api/auth/password {"current", "new"}   (viewers too)
+Admins only:
+POST /api/screen {"mode": "pcc" | "gl"}, /api/netmode {"mode": "router" | "ap"},
+     /api/wifi {"id", "ssid", "key", "hidden"} (any of them; left out = unchanged), /api/ping, /api/tick, /api/reflector, /api/speed, /api/blink, /api/log,
+     /api/tls/generate {"names", "days"}, /api/tls/upload {"cert", "key"},
+GET /api/users; POST /api/users {"action": "add" | "role" | "password" | "delete", "name", "role", "password"}
 
 In Router mode GL.iNet's firewall keeps this port closed on the WAN side, so only the router's own
-Wi-Fi and LAN reach it. In Access point mode there is no WAN side: the page is at the address the
-network gave the router, as the screen's Mode page shows.
+Wi-Fi and LAN reach it. In Access point mode there is no WAN side: the page is open to the network
+on WAN, which is why it has a login.
 """
 
 import json
+import socket
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+OPEN_GET = ("/", "/index.html", "/api/auth/me")
+OPEN_POST = ("/api/auth/login", "/api/auth/setup", "/api/auth/logout")
+VIEWER_POST = ("/api/recheck", "/api/auth/password")
+MAX_BODY = 256 * 1024
 
 
 def tools_state(service, span):
@@ -36,85 +49,173 @@ def tools_state(service, span):
 def make_handler(service):
     class Handler(BaseHTTPRequestHandler):
         server_version = "PorkChopCheck-router"
+        timeout = 60
 
         def log_message(self, *args):  # quiet: procd keeps the log small
             pass
 
-        def _send(self, code, body, kind="application/json"):
+        @property
+        def is_tls(self):
+            return isinstance(self.connection, ssl.SSLSocket)
+
+        def _send(self, code, body, kind="application/json", headers=()):
             data = body if isinstance(body, bytes) else body.encode()
             self.send_response(code)
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            for k, v in headers:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(data)
 
+        def _json(self, code, obj, headers=()):
+            self._send(code, json.dumps(obj, default=str), headers=headers)
+
+        def _to_https(self):
+            """Plain http:// while HTTPS works: send the browser to https:// on the same port."""
+            tls = getattr(service, "tls", None)
+            if self.is_tls or not tls or not tls.ctx:
+                return False
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            body = b"Moved to HTTPS"
+            self.send_response(308)
+            self.send_header("Location", f"https://{host}{self.path}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+
+        def _user(self):
+            return service.auth.user(self.headers)
+
         def do_GET(self):
+            if self._to_https():
+                return
             url = urlparse(self.path)
+            if url.path in ("/", "/index.html"):
+                return self._send(200, PAGE, "text/html; charset=utf-8")
+            user = self._user()
+            if url.path == "/api/auth/me":
+                return self._json(200, {"user": user, "setup": service.auth.needs_setup()})
+            if not user:
+                return self._json(401, {"error": "log in first", "login": True})
             if url.path == "/api/tools":
                 try:
                     span = int(parse_qs(url.query).get("span", ["30"])[0])
                 except ValueError:
                     span = 30
-                return self._send(200, json.dumps(tools_state(service, max(10, min(span, 1800))), default=str))
+                return self._json(200, tools_state(service, max(10, min(span, 1800))))
             if url.path == "/api/wifi":
                 try:
                     nets, err = service.wifi.networks(), None
                 except ValueError as e:
                     nets, err = [], str(e)
-                return self._send(200, json.dumps({"networks": nets, "error": err, "save": service.wifi.state}))
+                return self._json(200, {"networks": nets, "error": err, "save": service.wifi.state})
+            if url.path == "/api/tls":
+                return self._json(200, service.tls.info() or {"error": service.tls.error or "no certificate"})
+            if url.path == "/cert.pem":
+                try:
+                    data = service.tls.cert.read_bytes()
+                except OSError:
+                    return self._json(404, {"error": "no certificate"})
+                return self._send(200, data, "application/x-pem-file", [("Content-Disposition", 'attachment; filename="pcc-router.pem"')])
+            if url.path == "/api/users":
+                if user["role"] != "admin":
+                    return self._json(403, {"error": "Admins only"})
+                return self._json(200, {"users": service.auth.listing(), "me": user["name"]})
             if url.path == "/ports.csv":
-                data = service.log.csv_text().encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv")
-                self.send_header("Content-Disposition", 'attachment; filename="ports.csv"')
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                return self.wfile.write(data)
-            if self.path in ("/", "/index.html"):
-                self._send(200, PAGE, "text/html; charset=utf-8")
-            elif self.path == "/api/state":
+                return self._send(200, service.log.csv_text().encode(), "text/csv", [("Content-Disposition", 'attachment; filename="ports.csv"')])
+            if url.path == "/api/state":
                 snap = service.screen_snap()
                 snap["screen"] = service.config["screen"]
                 snap["page"] = service.page
-                self._send(200, json.dumps(snap, default=str))
-            else:
-                self._send(404, '{"error": "not found"}')
+                return self._json(200, snap)
+            self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self._to_https():
+                return
             length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY:
+                return self._json(413, {"error": "too big"})
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
             except ValueError:
-                return self._send(400, '{"error": "not JSON"}')
+                return self._json(400, {"error": "not JSON"})
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "not JSON"})
+            # forms on other sites can't send JSON without asking first, so this stops them posting here
+            if "application/json" not in (self.headers.get("Content-Type") or ""):
+                return self._json(415, {"error": "send JSON"})
+            ip = self.client_address[0]
+            try:
+                if self.path in OPEN_POST:
+                    return self._auth(body, ip)
+                user = self._user()
+                if not user:
+                    return self._json(401, {"error": "log in first", "login": True})
+                if self.path not in VIEWER_POST and user["role"] != "admin":
+                    return self._json(403, {"error": "Admins only: you're logged in as a viewer"})
+                return self._post(body, user)
+            except PermissionError as e:
+                return self._json(403, {"error": str(e)})
+            except (ValueError, OSError) as e:
+                return self._json(400, {"error": str(e) or "could not do that"})
+
+        def _auth(self, body, ip):
+            au = service.auth
+            if self.path == "/api/auth/logout":
+                au.logout(self.headers)
+                return self._json(200, {"ok": True}, [("Set-Cookie", au.cookie(None, self.is_tls))])
+            if self.path == "/api/auth/setup":
+                tok = au.setup(body.get("name"), body.get("password"), body.get("owner"), ip)
+            else:
+                tok = au.login(body.get("name"), body.get("password"), ip)
+            return self._json(200, {"ok": True}, [("Set-Cookie", au.cookie(tok, self.is_tls))])
+
+        def _post(self, body, user):
+            if self.path == "/api/recheck":
+                threading.Thread(target=service.dhcp_probe, daemon=True).start()
+                service.recheck.set()
+                return self._json(200, {"ok": True})
+            if self.path == "/api/auth/password":
+                service.auth.change_own(user["name"], body.get("current"), body.get("new"), service.auth.token(self.headers))
+                return self._json(200, {"ok": True})
             if self.path == "/api/screen":
                 try:
                     service.set_screen(body.get("mode"))
                 except ValueError:
-                    return self._send(400, '{"error": "mode is pcc or gl"}')
-                return self._send(200, json.dumps({"screen": service.config["screen"]}))
+                    return self._json(400, {"error": "mode is pcc or gl"})
+                return self._json(200, {"screen": service.config["screen"]})
             if self.path == "/api/netmode":
-                try:
-                    service.set_netmode(body.get("mode"))
-                except ValueError as e:
-                    return self._send(400, json.dumps({"error": str(e)}))
-                return self._send(200, '{"ok": true}')
+                service.set_netmode(body.get("mode"))
+                return self._json(200, {"ok": True})
             if self.path == "/api/wifi":
-                try:
-                    service.wifi.change(str(body.get("id") or ""), body.get("ssid"), str(body.get("key") or ""), str(body.get("admin") or ""))
-                except PermissionError as e:
-                    return self._send(403, json.dumps({"error": str(e)}))
-                except ValueError as e:
-                    return self._send(400, json.dumps({"error": str(e)}))
-                return self._send(200, '{"ok": true}')
-            if self.path == "/api/recheck":
-                threading.Thread(target=service.dhcp_probe, daemon=True).start()
-                service.recheck.set()
-                return self._send(200, '{"ok": true}')
-            try:
-                return self._tool(body)
-            except (ValueError, OSError) as e:
-                return self._send(400, json.dumps({"error": str(e) or "could not start"}))
+                hidden = body.get("hidden")
+                service.wifi.change(str(body.get("id") or ""), body.get("ssid"), str(body.get("key") or ""),
+                                    None if hidden is None else bool(hidden))
+                return self._json(200, {"ok": True})
+            if self.path == "/api/tls/generate":
+                service.tls.generate(body.get("names") or ", ".join(service.tls.default_names()), body.get("days") or 3650)
+                return self._json(200, service.tls.info() or {})
+            if self.path == "/api/tls/upload":
+                service.tls.upload(body.get("cert"), body.get("key"))
+                return self._json(200, service.tls.info() or {})
+            if self.path == "/api/users":
+                au, act, name = service.auth, body.get("action"), str(body.get("name") or "")
+                if act == "add":
+                    au.add(name, body.get("role") or "viewer", body.get("password"))
+                elif act == "role":
+                    au.update(name, role=body.get("role"))
+                elif act == "password":
+                    au.update(name, pw=body.get("password"))
+                elif act == "delete":
+                    au.delete(name, user["name"])
+                else:
+                    raise ValueError("Unknown action")
+                return self._json(200, {"users": au.listing(), "me": user["name"]})
+            return self._tool(body)
 
         def _tool(self, body):
             src = service.tester.wan.get("address")
@@ -145,16 +246,47 @@ def make_handler(service):
             elif self.path == "/api/blink":
                 service.blink.set(bool(body.get("on")))
             elif self.path == "/api/log":
-                return self._send(200, json.dumps(service.log.save(service.tester.snapshot(), str(body.get("label") or ""))))
+                return self._json(200, service.log.save(service.tester.snapshot(), str(body.get("label") or "")))
             else:
-                return self._send(404, '{"error": "not found"}')
-            self._send(200, '{"ok": true}')
+                return self._json(404, {"error": "not found"})
+            self._json(200, {"ok": True})
 
     return Handler
 
 
+class Server(ThreadingHTTPServer):
+    """HTTP and HTTPS on one port: a connection that opens with a TLS handshake (first byte 0x16) is
+    wrapped in TLS, anything else is plain HTTP (and gets sent to https:// by the handler)."""
+
+    daemon_threads = True
+
+    def __init__(self, addr, handler, tls=None):
+        super().__init__(addr, handler)
+        self.tls = tls
+
+    def finish_request(self, request, client_address):
+        ctx = self.tls.ctx if self.tls else None
+        wrapped = None
+        if ctx:
+            try:
+                request.settimeout(10)
+                if request.recv(1, socket.MSG_PEEK) == b"\x16":
+                    wrapped = request = ctx.wrap_socket(request, server_side=True)
+                request.settimeout(None)
+            except (OSError, ssl.SSLError):
+                return  # e.g. a browser that hasn't accepted the self-signed certificate yet
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            if wrapped:
+                try:
+                    wrapped.close()
+                except OSError:
+                    pass
+
+
 def serve(service, port):
-    ThreadingHTTPServer(("0.0.0.0", port), make_handler(service)).serve_forever()
+    Server(("0.0.0.0", port), make_handler(service), getattr(service, "tls", None)).serve_forever()
 
 
 PAGE = r"""<!doctype html>
@@ -204,17 +336,41 @@ table { width:100%; border-collapse:collapse; font-size:13px; }
 td, th { text-align:left; padding:4px 6px; border-top:1px solid var(--line); }
 th { color:var(--muted); font-weight:600; }
 .excellent, .good2 { color:var(--good); } .fair { color:var(--warn); } .badg { color:var(--bad); }
+.gate { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
+.gate form { width:min(380px,100%); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; display:flex; flex-direction:column; gap:10px; }
+.gate h1 { margin:0 0 4px; font-size:20px; }
+.gate input { width:100%; }
+.gate label { display:flex; flex-direction:column; gap:4px; font-size:13px; color:var(--muted); }
+.who { display:flex; align-items:center; gap:8px; font-size:13px; }
+.who a { color:var(--muted); cursor:pointer; text-decoration:underline; }
+.role { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--warn); }
+body.viewer .admin-only { display:none !important; }
+textarea { width:100%; min-height:90px; background:var(--well); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px; font:12px ui-monospace, monospace; }
+.ok { color:var(--good); }
 </style></head><body>
+<div class="gate" id="gate" hidden>
+  <form id="gform" autocomplete="on">
+    <h1>🐷 PorkChopCheck</h1>
+    <div class="sub" id="gintro">Log in to the router's tester.</div>
+    <label id="gownl" hidden>Router admin password <input id="gown" type="password" autocomplete="off"><span class="sub">The one for GL.iNet's admin page. It proves you own this router; it isn't stored.</span></label>
+    <label>User name <input id="guser" autocomplete="username" autocapitalize="none" spellcheck="false"></label>
+    <label>Password <input id="gpass" type="password" autocomplete="current-password"></label>
+    <label id="gpass2l" hidden>Password again <input id="gpass2" type="password" autocomplete="new-password"></label>
+    <button class="act" type="submit" id="gbtn">Log in</button>
+    <div class="sub bad" id="gerr"></div>
+  </form>
+</div>
 <header><b>🐷 PorkChopCheck</b>
-  <span class="grp"><span class="sub">Screen</span>
-  <div class="seg" id="seg"><button data-m="gl">GL.iNet</button><button data-m="pcc">PorkChop</button></div></span>
+  <span class="grp"><span class="admin-only sub">Screen</span>
+  <div class="seg admin-only" id="seg"><button data-m="gl">GL.iNet</button><button data-m="pcc">PorkChop</button></div>
+  <span class="who"><span id="me"></span><span class="role" id="myrole"></span><a id="logout">Log out</a></span></span>
 </header>
-<nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button></nav>
+<nav class="tabs"><button data-t="port" class="on">Port</button><button data-t="tools">Tools</button><button data-t="settings">Settings</button></nav>
 <main id="tab-port">
   <div class="banner" id="banner">Loading…</div>
   <section><h2>Network mode</h2>
     <div class="line"><span class="big" id="nm" style="font-size:22px">…</span><span class="spacer"></span>
-      <div class="seg" id="nmseg"><button data-n="router">Router</button><button data-n="ap">Access point</button></div></div>
+      <div class="seg admin-only" id="nmseg"><button data-n="router">Router</button><button data-n="ap">Access point</button></div></div>
     <div class="sub" id="nminfo"></div><div class="sub bad" id="nmerr"></div></section>
   <section><h2>Wi-Fi</h2>
     <div id="wf"><div class="sub">Loading…</div></div>
@@ -223,12 +379,11 @@ th { color:var(--muted); font-weight:600; }
       <div class="line"><label class="k" for="wssid" style="width:130px">Wi-Fi name</label><input id="wssid" class="grow" maxlength="32" spellcheck="false"></div>
       <div class="line"><label class="k" for="wkey" style="width:130px">New password</label><input id="wkey" class="grow" type="password" maxlength="63" placeholder="leave blank to keep it" autocomplete="new-password"></div>
       <div class="line"><label class="k" style="width:130px"></label><label class="sub"><input type="checkbox" id="wshow"> show password</label></div>
-      <div class="line"><label class="k" for="wadm" style="width:130px">Admin password</label><input id="wadm" class="grow" type="password" placeholder="GL.iNet admin page password" autocomplete="current-password"></div>
       <div class="line"><button class="act" type="submit" id="wsave">Save</button><button class="key" type="button" id="wcancel">Cancel</button></div>
       <div class="sub bad" id="werr"></div>
     </form>
     <div class="sub" id="wmsg"></div>
-    <p class="sub">Changes go through GL.iNet's own Wi-Fi settings, so its admin page shows them too. Saving restarts Wi-Fi: phones on it drop and must join again with the new name or password. The admin password is needed because in Access point mode anyone on the network can open this page. Current passwords are never shown here.</p>
+    <p class="sub">Changes go through GL.iNet's own Wi-Fi settings, so its admin page shows them too. Saving restarts Wi-Fi: phones on it drop and must join again with the new name or password. Only admins can change them, and current passwords are never shown here.</p>
   </section>
   <section><h2>Switch</h2><div id="sw"></div></section>
   <section><h2>Port</h2><div class="rows" id="port"></div></section>
@@ -264,6 +419,36 @@ th { color:var(--muted); font-weight:600; }
     <div class="line"><input id="lab" class="grow" placeholder="label, e.g. Row C seat 7"><button class="act" id="lgo">Save</button><a class="sub" href="/ports.csv">Download CSV</a></div>
     <table id="log"></table></section>
 </main>
+<main id="tab-settings" hidden>
+  <section><h2>HTTPS certificate</h2>
+    <div class="rows" id="tlsinfo"></div>
+    <div class="sub warn" id="tlswarn" style="margin-top:6px"></div>
+    <p class="sub"><a href="/cert.pem" style="color:var(--acc)">Download the certificate</a> and install it on a phone or PC to trust this router and stop the browser warning.</p>
+    <div class="admin-only">
+      <h2 style="margin-top:14px">Make a new one</h2>
+      <div class="line"><input id="tlsnames" class="grow" placeholder="names and addresses, comma separated" spellcheck="false"></div>
+      <div class="line"><button class="act" id="tlsgen">Make certificate</button><span class="sub">Self-signed, good for 10 years. Browsers warn once for each new one.</span></div>
+      <h2 style="margin-top:14px">Use your own</h2>
+      <div class="sub">For example one signed by your own CA. PEM text: the certificate (with its chain after it, if any), and its private key without a password.</div>
+      <textarea id="tlscert" placeholder="-----BEGIN CERTIFICATE-----" spellcheck="false"></textarea>
+      <textarea id="tlskey" placeholder="-----BEGIN PRIVATE KEY-----" spellcheck="false" style="margin-top:6px"></textarea>
+      <div class="line"><button class="act" id="tlsup">Upload</button><span class="sub">or load files:</span><input type="file" id="tlsfile" multiple accept=".pem,.crt,.cer,.key,.txt"></div>
+    </div>
+    <div class="sub" id="tlsmsg"></div>
+  </section>
+  <section class="admin-only"><h2>Users</h2>
+    <table id="users"></table>
+    <h2 style="margin-top:14px">Add someone</h2>
+    <div class="line"><input id="unew" placeholder="user name" autocapitalize="none" spellcheck="false" style="flex:1 1 130px"><input id="upw" type="password" placeholder="password (8+)" autocomplete="new-password" style="flex:1 1 130px">
+      <select id="urole"><option value="viewer">Viewer</option><option value="admin">Admin</option></select><button class="act" id="uadd">Add</button></div>
+    <div class="sub">Admins change things; viewers look and can re-check the port. Locked out? Over SSH: <span class="v">PYTHONPATH=/usr/share/pcc-router python3 -m pcc_router.auth passwd NAME</span></div>
+    <div class="sub" id="umsg"></div>
+  </section>
+  <section><h2>My password</h2>
+    <div class="line"><input id="mycur" type="password" placeholder="current password" autocomplete="current-password" style="flex:1 1 140px"><input id="mynew" type="password" placeholder="new password (8+)" autocomplete="new-password" style="flex:1 1 140px"><button class="act" id="mysave">Change</button></div>
+    <div class="sub" id="mymsg"></div>
+  </section>
+</main>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -289,11 +474,101 @@ document.querySelectorAll('#nmseg button').forEach(b => b.onclick = async () => 
   if (!netmode || b.dataset.n === netmode.mode) return;
   const ap = b.dataset.n === 'ap';
   if (!confirm(ap ? 'Switch to Access point mode?\n\nThe WAN port joins the LAN, the router stops handing out addresses, and it takes an address from the network on WAN. 192.168.8.1 stops working: this page moves to that new address (shown on the router\'s screen). Wi-Fi drops for about a minute.'
-                  : 'Switch to Router mode?\n\nThe router hands out 192.168.8.x addresses again and this page goes back to http://192.168.8.1:8088. Wi-Fi drops for about a minute.')) return;
+                  : 'Switch to Router mode?\n\nThe router hands out 192.168.8.x addresses again and this page goes back to https://192.168.8.1:8088. Wi-Fi drops for about a minute.')) return;
   const r = await post('/api/netmode', {mode: b.dataset.n});
   if (!r.ok) { $('nmerr').textContent = (await r.json().catch(() => ({}))).error || 'Could not start'; return; }
   load();
 });
+
+// ---------- login ----------
+let ME = null, setupMode = false;
+const realFetch = window.fetch.bind(window);
+window.fetch = async (...a) => { const r = await realFetch(...a); if (r.status === 401 && !String(a[0]).startsWith('/api/auth/')) showGate(); return r; };
+async function whoami() {
+  const j = await (await realFetch('/api/auth/me', {cache: 'no-store'})).json();
+  ME = j.user; setupMode = j.setup;
+  if (!ME) { showGate(); return false; }
+  $('gate').hidden = true;
+  $('me').textContent = ME.name; $('myrole').textContent = ME.role === 'admin' ? '' : 'viewer';
+  document.body.classList.toggle('viewer', ME.role !== 'admin');
+  return true;
+}
+function showGate() {
+  ME = null;
+  $('gate').hidden = false;
+  $('gintro').textContent = setupMode ? 'First time here: make the admin account. You need the router\'s admin password to prove it\'s yours.' : 'Log in to the router\'s tester.';
+  $('gownl').hidden = $('gpass2l').hidden = !setupMode;
+  $('gbtn').textContent = setupMode ? 'Make admin and log in' : 'Log in';
+  $('gpass').autocomplete = setupMode ? 'new-password' : 'current-password';
+  (setupMode ? $('gown') : $('guser')).focus();
+}
+$('gform').onsubmit = async e => {
+  e.preventDefault(); $('gerr').textContent = '';
+  if (setupMode && $('gpass').value !== $('gpass2').value) { $('gerr').textContent = 'The passwords don\'t match.'; return; }
+  const body = {name: $('guser').value, password: $('gpass').value};
+  if (setupMode) body.owner = $('gown').value;
+  $('gbtn').disabled = true;
+  try {
+    const r = await realFetch(setupMode ? '/api/auth/setup' : '/api/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('gerr').textContent = j.error || 'Could not log in'; return; }
+    $('gpass').value = $('gpass2').value = $('gown').value = '';
+    if (await whoami()) { load(); loadWifi(); }
+  } finally { $('gbtn').disabled = false; }
+};
+$('logout').onclick = async () => { await post('/api/auth/logout'); setupMode = false; showGate(); };
+
+// ---------- settings ----------
+const fmtDate = t => new Date(t * 1000).toLocaleDateString([], {year: 'numeric', month: 'short', day: 'numeric'});
+async function loadSettings() {
+  const t = await (await fetch('/api/tls')).json().catch(() => ({}));
+  $('tlsinfo').innerHTML = t.sha256 ? rows([['Names', (t.names || []).join(', ')], ['Issued by', t.self_signed ? 'itself (self-signed)' : t.issuer],
+    ['Valid', `${fmtDate(t.from)} to ${fmtDate(t.to)}`, t.to - t.now < 30 * 86400 ? 'warn' : ''], ['Key', t.key], ['SHA-256', t.sha256]]) : `<span class="bad">${esc(t.error || 'No certificate')}</span>`;
+  $('tlswarn').textContent = (t.missing || []).length ? `It doesn't cover ${t.missing.join(', ')}: make a new one (the names below include it) or the browser will name-check it and complain.` : '';
+  if (!$('tlsnames').value) $('tlsnames').value = t.suggest || '';
+  if (ME && ME.role === 'admin') {
+    const u = await (await fetch('/api/users')).json().catch(() => ({users: []}));
+    renderUsers(u);
+  }
+}
+function renderUsers(u) {
+  $('users').innerHTML = '<tr><th>User</th><th>Role</th><th>Last login</th><th></th></tr>' + (u.users || []).map(x => `<tr><td>${esc(x.name)}${x.name === u.me ? ' <span class="sub">(you)</span>' : ''}</td>
+    <td><select data-role="${esc(x.name)}"><option value="admin"${x.role === 'admin' ? ' selected' : ''}>Admin</option><option value="viewer"${x.role === 'viewer' ? ' selected' : ''}>Viewer</option></select></td>
+    <td class="sub">${x.last ? fmtDate(x.last) : '-'}</td>
+    <td><button class="key" data-pw="${esc(x.name)}">Password</button>${x.name === u.me ? '' : ` <button class="key" data-del="${esc(x.name)}">Delete</button>`}</td></tr>`).join('');
+}
+async function users(body, msg) {
+  const r = await post('/api/users', body), j = await r.json().catch(() => ({}));
+  $('umsg').className = 'sub ' + (r.ok ? 'ok' : 'bad'); $('umsg').textContent = r.ok ? msg : (j.error || 'Not done');
+  if (r.ok) renderUsers(j); else loadSettings();
+  return r.ok;
+}
+$('users').addEventListener('change', e => { const s = e.target.closest('[data-role]'); if (s) users({action: 'role', name: s.dataset.role, role: s.value}, `${s.dataset.role} is now ${s.value === 'admin' ? 'an admin' : 'a viewer'}.`); });
+$('users').addEventListener('click', e => {
+  const p = e.target.closest('[data-pw]'), d = e.target.closest('[data-del]');
+  if (p) { const pw = prompt(`New password for ${p.dataset.pw} (8 or more characters). They log in again with it.`); if (pw) users({action: 'password', name: p.dataset.pw, password: pw}, 'Password set.'); }
+  if (d && confirm(`Delete ${d.dataset.del}?`)) users({action: 'delete', name: d.dataset.del}, `${d.dataset.del} deleted.`);
+});
+$('uadd').onclick = async () => { if (await users({action: 'add', name: $('unew').value, password: $('upw').value, role: $('urole').value}, `${$('unew').value} added.`)) { $('unew').value = $('upw').value = ''; } };
+$('mysave').onclick = async () => {
+  const r = await post('/api/auth/password', {current: $('mycur').value, new: $('mynew').value}), j = await r.json().catch(() => ({}));
+  $('mymsg').className = 'sub ' + (r.ok ? 'ok' : 'bad'); $('mymsg').textContent = r.ok ? 'Changed. Your other browsers are logged out.' : (j.error || 'Not changed');
+  if (r.ok) $('mycur').value = $('mynew').value = '';
+};
+async function tlsDo(url, body, okMsg) {
+  $('tlsmsg').className = 'sub'; $('tlsmsg').textContent = 'Working…';
+  const r = await post(url, body), j = await r.json().catch(() => ({}));
+  $('tlsmsg').className = 'sub ' + (r.ok ? 'ok' : 'bad'); $('tlsmsg').textContent = r.ok ? okMsg : (j.error || 'Not done');
+  if (r.ok) { $('tlsnames').value = ''; loadSettings(); }
+}
+$('tlsgen').onclick = () => { if (confirm('Make a new certificate? The browser will warn once more, and devices that trusted the old one need the new one.')) tlsDo('/api/tls/generate', {names: $('tlsnames').value}, 'New certificate in use. Reload the page and accept it.'); };
+$('tlsup').onclick = () => tlsDo('/api/tls/upload', {cert: $('tlscert').value, key: $('tlskey').value}, 'Your certificate is in use. Reload the page.');
+$('tlsfile').onchange = async e => {
+  for (const f of e.target.files) {
+    const t = await f.text();
+    if (/PRIVATE KEY-----/.test(t)) $('tlskey').value = t; else if (/BEGIN CERTIFICATE/.test(t)) $('tlscert').value = ($('tlscert').value ? $('tlscert').value.trim() + '\n' : '') + t;
+  }
+};
 
 let wnets = [], wedit = null;
 async function loadWifi() {
@@ -302,17 +577,30 @@ async function loadWifi() {
     wnets = j.networks || [];
     $('wf').innerHTML = j.error ? `<div class="sub bad">${esc(j.error)}</div>` : wnets.map(n => `<div class="line" style="justify-content:space-between;border-top:1px solid var(--line);padding-top:6px">
       <span><span class="v" style="font-weight:700">${esc(n.ssid)}</span><br><span class="sub">${esc(n.label)} · ${n.on ? (n.hidden ? 'on, hidden' : 'on, visible') : 'off'}${n.secured ? '' : ' · open, no password'}</span></span>
-      <button class="key" type="button" data-w="${esc(n.id)}">Change</button></div>`).join('') || '<div class="sub">No networks found.</div>';
+      <span class="line" style="margin:0"><button class="key admin-only${n.hidden ? '' : ' on'}" type="button" data-vis="${esc(n.id)}" title="${n.hidden ? 'Hidden: phones must type the name to join. Tap to broadcast it.' : 'Visible: phones see it in their Wi-Fi list. Tap to hide it.'}">${n.hidden ? 'Hidden' : 'Visible'}</button>
+      <button class="key admin-only" type="button" data-w="${esc(n.id)}">Change</button></span></div>`).join('') || '<div class="sub">No networks found.</div>';
     const sv = j.save || {};
     $('wmsg').className = 'sub ' + (sv.state === 'error' ? 'bad' : sv.state === 'saving' ? 'warn' : 'good');
-    $('wmsg').textContent = sv.state === 'saving' ? `Saving ${sv.ssid}… Wi-Fi restarts now.` : sv.state === 'done' && Date.now() / 1000 - sv.t < 300 ? `Saved: ${sv.ssid}.` : sv.state === 'error' ? 'Not saved: ' + sv.error : '';
+    $('wmsg').textContent = sv.state === 'saving' ? `Saving ${sv.ssid}… Wi-Fi restarts now.` : sv.state === 'done' && Date.now() / 1000 - sv.t < 300 ? `Saved: ${sv.ssid} (${sv.hidden ? 'hidden' : 'visible'}).` : sv.state === 'error' ? 'Not saved: ' + sv.error : '';
   } catch (e) { $('wf').innerHTML = '<div class="sub">router not answering</div>'; }
 }
-$('wf').addEventListener('click', e => {
+$('wf').addEventListener('click', async e => {
+  const v = e.target.closest('[data-vis]');
+  if (v) {
+    const n = wnets.find(x => x.id === v.dataset.vis); if (!n) return;
+    const hide = !n.hidden;
+    if (!confirm(hide ? `Hide "${n.ssid}"?\n\nIt stops showing in Wi-Fi lists. Phones already joined stay joined; new ones must type the name. Wi-Fi restarts for a moment.`
+                      : `Make "${n.ssid}" visible?\n\nIt shows in everyone's Wi-Fi list again. Wi-Fi restarts for a moment.`)) return;
+    v.disabled = true;
+    const r = await post('/api/wifi', {id: n.id, hidden: hide}), j = await r.json().catch(() => ({}));
+    if (!r.ok) { $('wmsg').className = 'sub bad'; $('wmsg').textContent = j.error || 'Not saved'; }
+    setTimeout(loadWifi, 1500);
+    return;
+  }
   const b = e.target.closest('[data-w]'); if (!b) return;
   wedit = wnets.find(n => n.id === b.dataset.w); if (!wedit) return;
   $('wfor').textContent = 'Changing ' + wedit.label + (wedit.hidden ? ' (hidden network)' : '');
-  $('wssid').value = wedit.ssid || ''; $('wkey').value = ''; $('wadm').value = ''; $('werr').textContent = '';
+  $('wssid').value = wedit.ssid || ''; $('wkey').value = ''; $('werr').textContent = '';
   $('wkey').disabled = !wedit.secured; $('wkey').placeholder = wedit.secured ? 'leave blank to keep it' : 'open network: set a password in GL.iNet first';
   $('wform').hidden = false; $('wssid').focus();
 });
@@ -325,10 +613,10 @@ $('wform').onsubmit = async e => {
   if (!confirm(`Save "${ssid}"${key ? ' with the new password' : ''}?\n\nWi-Fi restarts. If this phone is on it, join "${ssid}" again${key ? ' with the new password' : ''}.`)) return;
   $('wsave').disabled = true; $('werr').textContent = '';
   try {
-    const r = await post('/api/wifi', {id: wedit.id, ssid, key, admin: $('wadm').value});
+    const r = await post('/api/wifi', {id: wedit.id, ssid, key});
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { $('werr').textContent = j.error || 'Not saved'; return; }
-    $('wform').hidden = true; wedit = null; $('wadm').value = ''; $('wkey').value = '';
+    $('wform').hidden = true; wedit = null; $('wkey').value = '';
     loadWifi();
   } finally { $('wsave').disabled = false; }
 };
@@ -380,8 +668,9 @@ let tab = 'port', span = 30, tools = null, typing = false;
 document.querySelectorAll('nav.tabs button').forEach(b => b.onclick = () => {
   tab = b.dataset.t;
   document.querySelectorAll('nav.tabs button').forEach(x => x.classList.toggle('on', x === b));
-  $('tab-port').hidden = tab !== 'port'; $('tab-tools').hidden = tab !== 'tools';
+  $('tab-port').hidden = tab !== 'port'; $('tab-tools').hidden = tab !== 'tools'; $('tab-settings').hidden = tab !== 'settings';
   if (tab === 'tools') loadTools();
+  if (tab === 'settings') loadSettings();
 });
 document.querySelectorAll('#spans button').forEach(b => b.onclick = () => {
   span = +b.dataset.s; document.querySelectorAll('#spans button').forEach(x => x.classList.toggle('on', x === b)); loadTools();
@@ -454,7 +743,8 @@ async function loadTools() {
   if (tab !== 'tools') return;
   try { renderTools(await (await fetch('/api/tools?span=' + span)).json()); } catch (e) {}
 }
-load(); setInterval(() => tab === 'port' ? load() : loadTools(), 2000);
-loadWifi(); setInterval(() => { if (tab === 'port' && $('wform').hidden) loadWifi(); }, 10000);
+whoami().then(ok => { if (ok) { load(); loadWifi(); } });
+setInterval(() => { if (!ME) return; tab === 'port' ? load() : tab === 'tools' ? loadTools() : null; }, 2000);
+setInterval(() => { if (ME && tab === 'port' && $('wform').hidden) loadWifi(); }, 10000);
 </script></body></html>
 """

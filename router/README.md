@@ -64,11 +64,31 @@ mode to its new position.
 - **The router's screen:** tap for the next page (Summary, Switch, Port, Layer 2, Ping, Mode), or
   swipe: right to left for the next page, left to right for the previous one. **Hold for 1.5 s** to
   hand the screen back to GL.iNet's own screen program (on the Mode page, hold 3 s to change mode).
-- **The phone page:** join the router's Wi-Fi and open **http://192.168.8.1:8088**. Everything above,
+- **The phone page:** join the router's Wi-Fi and open **https://192.168.8.1:8088** (see Login and HTTPS). Everything above,
   refreshed every 2 seconds, with **Re-check now**, and a **Screen: GL.iNet / PorkChopCheck** switch at
   the top. The choice is remembered across reboots. The tester keeps running with either screen.
 
 GL.iNet's firewall keeps port 8088 closed on the WAN side: only the router's Wi-Fi and LAN reach it.
+
+## Login and HTTPS
+
+The phone page is **https://192.168.8.1:8088**. In Access point mode it's at the address on the
+screen's Mode page. Plain `http://` on the same port is sent to `https://` automatically.
+
+- **Certificate:** the router makes a self-signed one on first start (with openssl). It names the
+  router, 192.168.8.1 and the WAN or Access point address. The browser warns once; to stop that,
+  download the certificate from **Settings** and install it on the phone or PC. Settings can also
+  make a new one with the names you give, or take **your own** certificate and key (PEM, for
+  example signed by your own CA). The files are `/etc/pcc-router/tls/cert.pem` and `key.pem`.
+- **Login:** the first visit makes the admin account. It asks for the router's own admin password
+  (the one for GL.iNet's admin page) to prove you own the router, so whoever opens the page first
+  can't claim it. After that, admins add users in **Settings** as admin or viewer. Viewers can look
+  and re-check the port but not change anything: mode, Wi-Fi, screen, tools, certificate or users.
+  Logins last a month. Ten wrong passwords in five minutes lock logins from that address for five
+  minutes.
+- **Locked out?** Over SSH:
+  `PYTHONPATH=/usr/share/pcc-router python3 -m pcc_router.auth passwd NAME` (also `add NAME admin`,
+  `del NAME`, `list`). Users are in `/etc/pcc-router/users.json`.
 
 ## Installing
 
