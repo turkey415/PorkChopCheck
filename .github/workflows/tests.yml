@@ -25,5 +25,3 @@ jobs:
       - run: python tests/test_launcher.py
       - run: python tests/test_version.py
       - run: bash -n install-linux.sh
-      - run: python tests/test_router.py
-      - run: sh -n router/install.sh

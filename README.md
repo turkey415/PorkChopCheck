@@ -47,9 +47,10 @@ On Linux the app reads link and IP details from `/sys`, `ip`, and NetworkManager
 
 ## On a GL.iNet router
 
-The same checks also run on a GL.iNet travel router (tried on the Slate 7, GL-BE3600): plug its WAN
-port into a jack and read the switch, VLAN, DHCP and link results on its screen or your phone. See
-[router/README.md](router/README.md).
+The same checks also run on a GL.iNet travel router (tried on the Slate 7, GL-BE3600) as
+[GL Probe](https://github.com/turkey415/gl-probe): plug its WAN port into a jack and read the switch,
+VLAN, DHCP and link results on its screen or its web page. It uses this app's `pc_net.py` and
+`pc_smart.py`. It started here as the `router/` folder and now has its own repo.
 
 ## Pages
 
